@@ -22,10 +22,13 @@ jobs:
           -t aarch64-apple-darwin \
           -r $SAPLING_VERSION \
           -o $(brew --repository lucasingels/sapling)/Formula/sapling.rb
+        cd $(brew --repository lucasingels/sapling)
+        git add Formula/sapling.rb
+        git commit -m "Add sapling formula"
     - name: Install and build Sapling bottle
       run: HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_FAIL_LOG_LINES=100 brew install --build-bottle lucasingels/sapling/sapling
     - name: Create Sapling bottle
-      run: HOMEBREW_NO_INSTALL_FROM_API=1 brew bottle sapling
+      run: HOMEBREW_NO_INSTALL_FROM_API=1 brew bottle lucasingels/sapling/sapling
     - name: Rename bottle
       run: mv sapling*.bottle.tar.gz sapling-${{ env.SAPLING_VERSION }}.arm64.bottle.tar.gz
     - name: Create pre-release
