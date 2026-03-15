@@ -7,11 +7,9 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -105,6 +103,7 @@ pub fn init_working_copy(
     Ok(())
 }
 
+#[cfg(feature = "eden")]
 #[derive(Debug, thiserror::Error)]
 pub enum EdenCloneError {
     #[error("Failed cloning eden checkout\n Stdout: '{0}'\n Stderr: '{1}'")]
@@ -113,8 +112,9 @@ pub enum EdenCloneError {
     MissingCommandConfig(),
 }
 
+#[cfg(feature = "eden")]
 #[tracing::instrument]
-fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
+fn run_eden_clone_command(clone_command: &mut std::process::Command) -> Result<()> {
     let output = clone_command.output().with_context(|| {
         let binary_path = PathBuf::from(clone_command.get_program());
         // On Windows, users frequently hit clone errors caused by EdenFS not being installed.
@@ -145,6 +145,7 @@ fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "eden")]
 #[instrument(err)]
 pub fn eden_clone(
     repo: &Repo,
@@ -153,6 +154,7 @@ pub fn eden_clone(
     filters: Option<HashSet<Text>>,
     enable_windows_symlinks: bool,
 ) -> Result<()> {
+    use std::ffi::OsStr;
     let config = repo.config();
 
     let mut clone_command = edenfs_client::build_eden_command(config)?;
@@ -197,6 +199,16 @@ pub fn eden_clone(
     }
 
     run_eden_clone_command(&mut clone_command).context("error performing eden clone")
+}
+
+#[cfg(not(feature = "eden"))]
+pub fn eden_clone(
+    _repo: &Repo,
+    _working_copy: &Path,
+    _target: Option<HgId>,
+    _filters: Option<HashSet<Text>>,
+) -> Result<()> {
+    panic!("cannot use EdenFS in a non-EdenFS build")
 }
 
 /// Get the tag to use for streaming clone from config.
