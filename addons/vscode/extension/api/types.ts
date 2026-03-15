@@ -63,6 +63,13 @@ export type SaplingRepositoryInfo = {
         callsign?: string;
       }
     | {
+        type: 'gerrit';
+        /** Raw paths.default — used to derive host, project, and web URL. */
+        remoteUrl: string;
+        /** Explicit web URL from gerrit.url config — takes priority over the URL derived from remoteUrl. */
+        webUrl?: string;
+      }
+    | {
         type: 'none';
       }
     | {

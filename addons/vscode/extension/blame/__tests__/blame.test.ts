@@ -8,6 +8,7 @@
 import type {Repository} from 'isl-server/src/Repository';
 import type {CommitInfo} from 'isl/src/types';
 
+import {GerritCodeReviewProvider} from 'isl-server/src/gerrit/gerritCodeReviewProvider';
 import {GitHubCodeReviewProvider} from 'isl-server/src/github/githubCodeReviewProvider';
 import {mockLogger} from 'shared/testUtils';
 import {getDiffBlameHoverMarkup} from '../blameHover';
@@ -103,6 +104,29 @@ added some stuff`,
 
 
 added some stuff in #1234`,
+      );
+    });
+
+    it('renders Gerrit Change-Id links', () => {
+      const gerritRepo = {
+        codeReviewProvider: new GerritCodeReviewProvider(
+          {
+            type: 'gerrit',
+            remoteUrl: 'https://code.example.com/my-repo',
+          },
+          mockLogger,
+          '/repo',
+        ),
+      } as unknown as Repository;
+      const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';
+      expect(
+        getDiffBlameHoverMarkup(gerritRepo, {
+          ...mockCommit,
+          description: `My change\n\nChange-Id: ${changeId}`,
+          diffId: changeId,
+        } as unknown as CommitInfo),
+      ).toEqual(
+        `**person** - [Iabc1234](https://code.example.com/q/${changeId}) (just now)\n\n**My cool PR**\n\n\nMy change\n\nChange-Id: ${changeId}`,
       );
     });
 
