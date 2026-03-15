@@ -80,6 +80,7 @@ import {
   setConfig,
 } from './commands';
 import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD, ErrorShortMessages} from './constants';
+import {GerritCodeReviewProvider, parseGerritRemote} from './gerrit/gerritCodeReviewProvider';
 import {GitHubCodeReviewProvider} from './github/githubCodeReviewProvider';
 import {isGithubEnterprise} from './github/queryGraphQL';
 import {
@@ -204,6 +205,14 @@ export class Repository {
         remote,
         this.initialConnectionContext,
         this.info.dotdir,
+      );
+    }
+
+    if (remote.type === 'gerrit') {
+      this.codeReviewProvider = new GerritCodeReviewProvider(
+        remote,
+        ctx.logger,
+        this.info.repoRoot,
       );
     }
 
