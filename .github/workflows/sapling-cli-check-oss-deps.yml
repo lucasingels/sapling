@@ -1,0 +1,17 @@
+name: Sapling CLI check OSS build doesn't have non oss dependencies
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: '0 0 * * *'
+
+jobs:
+    check-oss-deps:
+        runs-on: ubuntu-22.04
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@v6
+            - name: Grant Access
+              run: git config --global --add safe.directory "$PWD"
+            - name: Check for non-OSS dependencies
+              run: ./eden/scm/packaging/check_oss_deps.sh
