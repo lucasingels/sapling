@@ -14,7 +14,10 @@ jobs:
       run: git config --global --add safe.directory "$PWD"
     - name: set-env SAPLING_VERSION
       shell: bash
-      run: echo "SAPLING_VERSION=$(ci/tag-name.sh)" >> $GITHUB_ENV
+      run: |
+        VERSION=$(<SAPLING_VERSION)
+        COMMIT_INFO=$(git -c "core.abbrev=8" show -s "--format=%cd+%h" "--date=format:%Y%m%d-%H%M%S")
+        echo "SAPLING_VERSION=${VERSION}.${COMMIT_INFO}" >> $GITHUB_ENV
     - name: Create local tap
       run: |
         brew tap-new lucasingels/sapling
