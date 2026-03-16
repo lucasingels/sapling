@@ -17,6 +17,11 @@ const MOCK_GITHUB_REVIEW_SYSTEM: CodeReviewSystem = {
   owner: 'facebook',
 };
 
+const MOCK_GERRIT_REVIEW_SYSTEM: CodeReviewSystem = {
+  type: 'gerrit',
+  remoteUrl: 'https://code.example.com/my-repo',
+};
+
 describe('template parsing', () => {
   it('parses normal commits', () => {
     expect(
@@ -162,6 +167,86 @@ ${COMMIT_END_MARK}
         totalFileCount: 1,
         maxCommonPathPrefix: 'sapling/addons/isl/',
       },
+    ]);
+  });
+
+  it('extracts Change-Id from description for Gerrit repos', () => {
+    expect(
+      parseCommitInfoOutput(
+        mockLogger,
+        `\
+77fdcef8759fb65da46a7a6431310829f12cef5b
+Add new feature
+Author <author@example.com>
+2024-04-24 14:16:24 -0700
+draft
+
+
+3f41d88ab69446763404eccd0f3e579352ba2753\x00
+
+
+src/foo.ts
+1
+
+
+
+false
+|
+Add new feature
+
+Summary of the change
+
+Change-Id: Iabc1234567890abcdef1234567890abcdef12345
+${COMMIT_END_MARK}
+`,
+        MOCK_GERRIT_REVIEW_SYSTEM,
+        null,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        diffId: 'Iabc1234567890abcdef1234567890abcdef12345',
+        title: 'Add new feature',
+        description:
+          'Summary of the change\n\nChange-Id: Iabc1234567890abcdef1234567890abcdef12345',
+      }),
+    ]);
+  });
+
+  it('returns undefined diffId for Gerrit commits without a Change-Id', () => {
+    expect(
+      parseCommitInfoOutput(
+        mockLogger,
+        `\
+77fdcef8759fb65da46a7a6431310829f12cef5b
+WIP commit
+Author <author@example.com>
+2024-04-24 14:16:24 -0700
+draft
+
+
+3f41d88ab69446763404eccd0f3e579352ba2753\x00
+
+
+src/foo.ts
+1
+
+
+
+false
+|
+WIP commit
+
+No change-id yet
+${COMMIT_END_MARK}
+`,
+        MOCK_GERRIT_REVIEW_SYSTEM,
+        null,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        diffId: undefined,
+        title: 'WIP commit',
+      }),
     ]);
   });
 });
