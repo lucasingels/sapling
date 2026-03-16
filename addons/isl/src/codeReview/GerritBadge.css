@@ -1,0 +1,127 @@
+/**
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+.gerrit-diff-info {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--halfpad);
+}
+
+.gerrit-diff-status {
+  font-weight: bold;
+  border-radius: 10px;
+  padding: 3px 8px;
+  font-size: 70%;
+  white-space: nowrap;
+  color: white;
+}
+
+/* Open, no votes yet — Gerrit blue */
+.gerrit-diff-status-NEW {
+  background-color: #4285f4;
+}
+
+/* submittable (CR+2) — Gerrit green */
+.gerrit-diff-status-approved {
+  background-color: #1e8e3e;
+}
+
+
+/* Merged — Gerrit purple */
+.gerrit-diff-status-MERGED {
+  background-color: #7b1fa2;
+}
+
+/* Abandoned — neutral gray */
+.gerrit-diff-status-ABANDONED {
+  background-color: #757575;
+}
+
+.gerrit-diff-status .tooltip-creator {
+  align-items: center;
+}
+
+.gerrit-diff-badge-icon.codicon {
+  font-size: 100%;
+  margin-right: var(--halfpad);
+  font-weight: bold;
+}
+
+/* Top-bar setup button shown when Gerrit auth is missing */
+.gerrit-setup-button {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.gerrit-setup-button .codicon-warning {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+/* Credential setup form */
+.gerrit-credential-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pad);
+  padding: var(--pad);
+  min-width: 320px;
+}
+
+.gerrit-credential-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--halfpad);
+}
+
+.gerrit-credential-fields input {
+  width: 100%;
+  padding: var(--halfpad);
+  background: var(--input-background);
+  color: var(--input-foreground);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+}
+
+.gerrit-credential-error {
+  color: var(--errorForeground);
+  margin: 0;
+}
+
+.gerrit-credential-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--halfpad);
+}
+
+/* Review decision pill shown next to the main badge */
+.gerrit-review-decision {
+  border-radius: 10px;
+  padding: 3px 8px;
+  font-size: 70%;
+  white-space: nowrap;
+  color: white;
+  font-weight: bold;
+}
+
+.gerrit-review-decision-required {
+  background-color: #757575;
+}
+
+.gerrit-review-decision-approved {
+  background-color: #1e8e3e;
+}
+
+.gerrit-review-decision-recommended {
+  background-color: #c8920a;
+}
+
+.gerrit-review-decision-needs-work {
+  background-color: #b06000;
+}
+
+.gerrit-review-decision-rejected {
+  background-color: #d93025;
+}

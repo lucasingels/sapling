@@ -28,6 +28,7 @@ import {messageSyncingEnabledState} from '../messageSyncing';
 import {dagWithPreviews} from '../previews';
 import {commitByHash, repositoryInfo} from '../serverAPIState';
 import {registerCleanup, registerDisposable} from '../utils';
+import {GerritUICodeReviewProvider} from './GerritUICodeReviewProvider';
 import {GithubUICodeReviewProvider} from './github/github';
 
 export const codeReviewProvider = atom<UICodeReviewProvider | null>(get => {
@@ -51,22 +52,25 @@ function repoInfoToCodeReviewProvider(repoInfo?: ValidatedRepoInfo): UICodeRevie
   ) {
     return new Internal.PhabricatorUICodeReviewProvider(repoInfo.codeReviewSystem);
   }
+  if (repoInfo.codeReviewSystem.type === 'gerrit') {
+    return new GerritUICodeReviewProvider(repoInfo.codeReviewSystem);
+  }
   return null;
 }
 
 export const diffSummary = atomFamilyWeak((diffId: DiffId | undefined) =>
-  atom<Result<DiffSummary | undefined>>(get => {
+  atom<Result<DiffSummary | null | undefined>>(get => {
     if (diffId == null) {
       return {value: undefined};
     }
     const all = get(allDiffSummaries);
-    if (all == null) {
-      return {value: undefined};
-    }
     if (all.error) {
       return {error: all.error};
     }
-    return {value: all.value?.get(diffId)};
+    if (all.value == null) {
+      return {value: undefined}; // still loading
+    }
+    return {value: all.value.get(diffId) ?? null}; // null = loaded but not found
   }),
 );
 
