@@ -877,11 +877,13 @@ export type PlatformSpecificServerToClientMessages =
 
 export type CodeReviewProviderSpecificClientToServerMessages =
   | never
-  | InternalTypes['PhabricatorClientToServerMessages'];
+  | InternalTypes['PhabricatorClientToServerMessages']
+  | {type: 'gerritSetCredentials'; webUrl: string; username: string; password: string};
 
 export type CodeReviewProviderSpecificServerToClientMessages =
   | never
-  | InternalTypes['PhabricatorServerToClientMessages'];
+  | InternalTypes['PhabricatorServerToClientMessages']
+  | {type: 'gerritCredentialsResult'; success: boolean; error?: string};
 
 export type PageVisibility = 'focused' | 'visible' | 'hidden';
 

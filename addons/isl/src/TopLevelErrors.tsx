@@ -17,6 +17,7 @@ import {useThrottledEffect} from 'shared/hooks';
 import {Internal} from './Internal';
 import {tracker} from './analytics';
 import {allDiffSummaries} from './codeReview/CodeReviewInfo';
+import {GerritConfigureCredentialsButton} from './codeReview/GerritUICodeReviewProvider';
 import {t, T} from './i18n';
 import platform from './platform';
 import {reconnectingStatus, repositoryInfoOrError} from './serverAPIState';
@@ -98,6 +99,16 @@ function computeTopLevelError(
           trackErrorName: 'GhCliNotInstalled',
         };
       }
+    } else if (repoInfo?.type === 'success' && repoInfo.codeReviewSystem.type === 'gerrit') {
+      const webUrl = repoInfo.codeReviewSystem.webUrl ?? '';
+      return {
+        title: <T>Gerrit Authentication Required</T>,
+        error: new Error(
+          t('Configure your HTTP credentials to fetch change status from Gerrit.'),
+        ),
+        buttons: [<GerritConfigureCredentialsButton key="gerrit-creds" webUrl={webUrl} />],
+        trackErrorName: 'DiffFetchFailed',
+      };
     }
     return {
       title: <T>Failed to fetch Diffs</T>,

@@ -24,6 +24,7 @@ import {PullButton} from './PullButton';
 import {SettingsGearButton} from './SettingsTooltip';
 import {ShelvedChangesMenu} from './ShelvedChanges';
 import {tracker} from './analytics';
+import {GerritSetupButton} from './codeReview/GerritUICodeReviewProvider';
 import {DebugToolsButton} from './debug/DebugToolsButton';
 import {T} from './i18n';
 import {maybeRemoveForgottenOperation, useClearAllOptimisticState} from './operationsState';
@@ -49,6 +50,7 @@ export function TopBar() {
         <BulkActionsMenu />
         <BookmarksManagerMenu />
         {Internal.FullRepoBranchButton && <Internal.FullRepoBranchButton />}
+        <GerritSetupButton />
         <FetchingDataIndicator />
       </span>
       <span className="button-group">
