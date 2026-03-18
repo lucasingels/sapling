@@ -6,6 +6,28 @@ It aims to provide both user-friendly and powerful interfaces for users, as
 well as extreme scalability to deal with repositories containing many millions
 of files and many millions of commits.
 
+# Installing this fork (Experimental)
+
+## Sapling CLI
+
+In order to allow switching between this fork and the mainline CLI this fork names the binary `sld` instead of `sl`.
+
+### Install
+Currently this fork is only released for installation on MacOS via `homebrew`. To install run the following commands:
+
+`brew tap lucasingels/tap`
+`brew install lucasingels/tap/sapling-dev`
+
+## Sapling VS Code Extension
+
+### Install
+The VS Code extension is compatible with all platforms currently as it does not depend on any changes to the sl binary itself including the `sl web` command.
+
+`gh release download -R lucasingels/sapling --pattern 'sapling-scm-0.1.71.vsix'`
+`code --install-extension sapling-scm-0.1.71.vsix`
+
+Note: The VS code extension is in the sapling release 0.1.4 currently but will be split out if this fork needs to remain up for a while. The intention is to contribute this to the main repo.
+
 # Using Sapling
 To start using Sapling, see the [Getting Started](https://sapling-scm.com/docs/introduction/getting-started) page for how to clone your existing Git repositories. Checkout the [Overview](https://sapling-scm.com/docs/overview/intro) for a peek at the various features. Coming from Git? Checkout the [Git Cheat Sheet](http://sapling-scm.com/docs/introduction/git-cheat-sheet).
 
