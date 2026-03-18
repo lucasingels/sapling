@@ -19,6 +19,7 @@ class SaplingDev < Formula
   depends_on "openssl@3"
   depends_on "gh"
   depends_on "cmake" => :build
+  depends_on "rustup" => :build
   depends_on "yarn" => :build
 
   def install
