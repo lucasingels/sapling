@@ -8,6 +8,7 @@
 import type {TypeaheadResult} from 'isl-components/Types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
+import type {GerritDiffSummary} from 'isl-server/src/gerrit/gerritCodeReviewProvider';
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
 import type {Comparison} from 'shared/Comparison';
 import type {ParsedDiff} from 'shared/patch/types';
@@ -67,7 +68,10 @@ export type DiffId = string;
 /**
  * Short info about a Diff fetched in bulk for all diffs to render an overview
  */
-export type DiffSummary = GitHubDiffSummary | InternalTypes['PhabricatorDiffSummary'];
+export type DiffSummary =
+  | GitHubDiffSummary
+  | GerritDiffSummary
+  | InternalTypes['PhabricatorDiffSummary'];
 
 export type DiffCommentReaction = {
   name: string;
@@ -317,6 +321,13 @@ export type CodeReviewSystem =
     }
   | {
       type: 'none';
+    }
+  | {
+      type: 'gerrit';
+      /** Raw paths.default — used to derive host, project, and web URL. */
+      remoteUrl: string;
+      /** Explicit web URL from gerrit.url config — takes priority over the URL derived from remoteUrl. */
+      webUrl?: string;
     }
   | {
       type: 'unknown';

@@ -526,6 +526,7 @@ export class Repository {
         'github.pull_request_domain',
         'github.preferred_submit_command',
         'phrevset.callsign',
+        'gerrit.url',
       ]),
     ]);
     const pathsDefault = configs.get('paths.default') ?? '';
@@ -574,6 +575,14 @@ export class Repository {
           owner,
           repo,
           hostname,
+        };
+      } else if (isGerritRemote(pathsDefault, configs.get('gerrit.url'))) {
+        const gerritUrl = configs.get('gerrit.url');
+        const {webUrl: derivedWebUrl} = parseGerritRemote(pathsDefault);
+        codeReviewSystem = {
+          type: 'gerrit',
+          remoteUrl: pathsDefault,
+          webUrl: gerritUrl || derivedWebUrl,
         };
       } else {
         codeReviewSystem = {type: 'unknown', path: pathsDefault};
@@ -1778,4 +1787,21 @@ async function isEdenFsRepo(repoRoot: AbsolutePath): Promise<boolean> {
     return true;
   } catch {}
   return false;
+}
+
+/**
+ * Detect whether a remote URL points to a Gerrit server.
+ * Matches if gerrit.url is explicitly configured, or if the SSH URL uses
+ * Gerrit's default port (29418).
+ */
+function isGerritRemote(pathsDefault: string, gerritUrl: string | undefined): boolean {
+  if (gerritUrl != null && gerritUrl !== '') {
+    return true;
+  }
+  try {
+    const parsed = new URL(pathsDefault);
+    return parsed.protocol === 'ssh:' && parsed.port === '29418';
+  } catch {
+    return false;
+  }
 }
