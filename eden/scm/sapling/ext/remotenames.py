@@ -542,6 +542,11 @@ def extsetup(ui):
         ),
     ]
 
+    if ui.config("gerrit", "url"):
+        newopts.append([
+            (pushcmd, ("", "to-suffix", "", "append value to destination ref (Gerrit)")),
+        ])
+
     def afterload(loaded):
         if loaded:
             raise ValueError("nonexistent extension should not be loaded")
@@ -859,6 +864,9 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
             to = opts.get("to") or _guesspushtobookmark(repo, pushnode, remotename)
             if not to:
                 raise error.Abort(_("use '--to' to specify destination bookmark"))
+            to_suffix = opts.get("to_suffix")
+            if to_suffix:
+                to = to + to_suffix
         return git.push(repo, dest, [(pushnode, to)], force=force)
 
     # during the upgrade from old to new remotenames, tooling that uses --force

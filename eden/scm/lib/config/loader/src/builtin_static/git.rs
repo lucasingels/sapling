@@ -13,6 +13,7 @@ pub static GIT_CONFIG: StaticConfig = static_config!("builtin:git" => r#"
 [extensions]
 commitcloud=!
 github=
+gerrit=
 treemanifest=
 
 [commitcloud]
