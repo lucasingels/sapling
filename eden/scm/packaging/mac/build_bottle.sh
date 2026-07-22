@@ -42,7 +42,13 @@ BOTTLE_ROOT_URL="https://github.com/lucasingels/sapling/releases/download/v${VER
 brew bottle --json --no-rebuild --root-url "$BOTTLE_ROOT_URL" lucasingels/tap/sapling-dev
 brew bottle --merge --write --no-commit sapling-dev--*.bottle.json
 
-BOTTLE_FILE=$(ls "sapling-dev--$VERSION"*.bottle.tar.gz)
+# `brew bottle` writes the tarball with a double dash (sapling-dev--<version>…),
+# but Homebrew downloads bottles with a single dash (sapling-dev-<version>…).
+# Rename before uploading so the published asset matches the URL Homebrew derives
+# from the formula's root_url; the sha256 is unaffected by the rename.
+RAW_BOTTLE=$(ls "sapling-dev--$VERSION"*.bottle.tar.gz)
+BOTTLE_FILE=${RAW_BOTTLE/sapling-dev--/sapling-dev-}
+mv "$RAW_BOTTLE" "$BOTTLE_FILE"
 
 cd "$(brew --repository lucasingels/tap)"
 git add Formula/sapling-dev.rb
