@@ -149,6 +149,19 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return 'Publish';
   }
 
+  hasSubmittedDiff(
+    diffId: DiffId | undefined,
+    summary: DiffSummary | null | undefined,
+  ): boolean {
+    // Gerrit stamps a Change-Id (our diffId) onto every commit at creation time
+    // via the commit-msg hook, so a diffId alone does NOT mean the change has
+    // been pushed for review. Only treat it as submitted once the change is
+    // known to exist on the server (a non-null summary). `undefined` means the
+    // summaries are still loading, so err towards "submitted" to avoid flashing
+    // the inline button for changes that are actually already up for review.
+    return diffId != null && summary !== null;
+  }
+
   getSupportedStackActions(
     _hash: Hash,
     _dag: Dag,

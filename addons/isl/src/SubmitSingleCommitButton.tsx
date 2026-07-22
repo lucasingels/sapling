@@ -35,7 +35,9 @@ export function SubmitSingleCommitButton() {
 
   const draftAncestors = dag.ancestors(headCommit.hash, {within: dag.draft()});
   const isSingleCommit = draftAncestors.size === 1;
-  const hasDiff = headCommit.diffId !== undefined;
+  const hasDiff = provider.hasSubmittedDiff
+    ? provider.hasSubmittedDiff(headCommit.diffId, diff.value)
+    : headCommit.diffId !== undefined;
 
   if (!isSingleCommit || isClosed || hasDiff) {
     return null;
