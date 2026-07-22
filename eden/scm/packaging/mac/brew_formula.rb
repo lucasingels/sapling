@@ -5,7 +5,7 @@
 
 # This is an example brew formula. It will need to be updated to point to an
 # actual URL, with an actual sha256, license, and tests.
-class Sapling < Formula
+class SaplingDev < Formula
   desc "The Sapling source control client"
   homepage "https://sapling-scm.com"
   license "GPL-2.0-or-later"
@@ -19,7 +19,6 @@ class Sapling < Formula
   depends_on "openssl@3"
   depends_on "gh"
   depends_on "cmake" => :build
-  depends_on "rustup-init" => :build
   depends_on "yarn" => :build
 
   def install
@@ -34,6 +33,10 @@ class Sapling < Formula
     # The line below is necessary, since otherwise homebrew somehow injects
     # -march=... into clang
     ENV["HOMEBREW_OPTFLAGS"] = ""
+    # Some dependencies (e.g. smallvec's "specialization" feature) rely on
+    # unstable rustc features. RUSTC_BOOTSTRAP=1 lets the stable toolchain
+    # compile them, matching the getdeps build (fbcode_builder/getdeps/cargo.py).
+    ENV["RUSTC_BOOTSTRAP"] = "1"
 
     python = Formula["python@3.12"].opt_prefix/"bin/python3.12"
 
@@ -46,5 +49,13 @@ class Sapling < Formula
       bin.install "out/sl"
       lib.install "out/isl-dist.tar.xz"
     end
+
+    libexec.install "#{prefix}/bin/sl"
+    libexec.install "#{lib}/isl-dist.tar.xz"
+
+    (bin/"sld").write <<~EOS
+      #!/bin/bash
+      exec "#{opt_libexec}/sl" --config "web.isl-dist-path=#{opt_libexec}/isl-dist.tar.xz" "$@"
+    EOS
   end
 end

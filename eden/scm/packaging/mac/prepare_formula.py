@@ -55,6 +55,15 @@ parser.add_argument(
     required=False,
 )
 
+parser.add_argument(
+    "-b",
+    "--binary-name",
+    default="sl",
+    type=str,
+    help="Name of the installed binary (e.g. sl, sld)",
+    required=False,
+)
+
 
 def run_cmd(cmd: List[str]) -> str:
     return subprocess.check_output(cmd).decode("utf-8").rstrip()
@@ -75,7 +84,7 @@ def create_repo_tarball(dotdir):
     )
 
 
-def fill_in_formula_template(target, version, tmpdir, filled_formula_dir):
+def fill_in_formula_template(target, version, binary_name, tmpdir, filled_formula_dir):
     brew_formula_rb = os.path.join(os.path.dirname(__file__), "brew_formula.rb")
     with open(brew_formula_rb, "r") as f:
         formula = f.read()
@@ -90,6 +99,7 @@ def fill_in_formula_template(target, version, tmpdir, filled_formula_dir):
     formula = formula.replace("%TMPDIR%", tmpdir)
     formula = formula.replace("%TARGET%", target)
     formula = formula.replace("%CACHEDIR%", cachedir)
+    formula = formula.replace("%BINARY_NAME%", binary_name)
     with open(filled_formula_dir, "w") as f:
         f.write(formula)
 
@@ -99,5 +109,5 @@ if __name__ == "__main__":
     tmpdir = tempfile.mkdtemp()
     create_repo_tarball(args.dotdir)
     fill_in_formula_template(
-        args.target, args.release_version, tmpdir, args.formula_out
+        args.target, args.release_version, args.binary_name, tmpdir, args.formula_out
     )
