@@ -31,7 +31,7 @@ jobs:
         sysctl -n machdep.cpu.brand_string
         sysctl -n hw.memsize | awk '{print "Memory: " $1/1073741824 " GB"}'
 
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Set up sccache
       uses: mozilla-actions/sccache-action@v0.0.10
@@ -161,7 +161,7 @@ jobs:
 
     - name: Copy artifacts
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fixup-dyn-deps --src-dir=. mononoke _artifacts/mac --project-install-prefix mononoke:/usr/local --final-install-prefix /usr/local
-    - uses: actions/upload-artifact@v6
+    - uses: actions/upload-artifact@v7
       with:
         name: mononoke
         path: _artifacts
