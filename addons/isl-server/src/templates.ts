@@ -58,6 +58,8 @@ export const mainFetchTemplateFields = (codeReviewSystem: CodeReviewSystem) => (
       : codeReviewSystem.type === 'github'
         ? '{github_pull_request_number}'
         : '',
+  // For Gerrit, diffId (the Change-Id) is extracted from the description in
+  // parseCommitInfoOutput — no Sapling extension or template keyword required.
   isFollower: '{sapling_pr_follower|json}',
   stableCommitMetadata: Internal.stableCommitConfig?.template ?? '',
   // Description must be last
@@ -116,7 +118,16 @@ export function parseCommitInfoOutput(
           .slice(index.description + 1 /* first field of description is title; skip it */)
           .join('\n')
           .trim(),
-        diffId: lines[index.diffId] != '' ? lines[index.diffId] : undefined,
+        diffId: (() => {
+          // For Gerrit repos, extract the Change-Id trailer from the description
+          // since no template keyword or extension is available to provide it.
+          if (reviewSystem.type === 'gerrit') {
+            const desc = lines.slice(index.description + 1).join('\n');
+            const match = desc.match(/^Change-Id:\s*(I[0-9a-f]+)$/m);
+            return match?.[1] ?? undefined;
+          }
+          return lines[index.diffId] != '' ? lines[index.diffId] : undefined;
+        })(),
         isFollower: JSON.parse(lines[index.isFollower]) as boolean,
         stableCommitMetadata:
           lines[index.stableCommitMetadata] != ''
