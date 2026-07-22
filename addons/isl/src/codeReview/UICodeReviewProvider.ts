@@ -30,7 +30,7 @@ export interface UICodeReviewProvider {
   }): JSX.Element | null;
   /** If this provider is capable of landing from the UI, this component renders the land button */
   DiffLandButtonContent?(props: {diff?: DiffSummary; commit: CommitInfo}): JSX.Element | null;
-  formatDiffNumber(diffId: DiffId): string;
+  formatDiffNumber(diffId: DiffId, summary?: DiffSummary): string;
   isSplitSuggestionSupported(): boolean;
   submitOperation(
     commits: Array<CommitInfo>,
