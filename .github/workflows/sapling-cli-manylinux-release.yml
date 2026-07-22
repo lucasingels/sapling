@@ -15,7 +15,7 @@ jobs:
       image: ${{ format('ghcr.io/{0}/manylinux_2_34:latest', github.repository) }}
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
     - name: Configure Git
       run: git config --global --add safe.directory "$PWD"
     - name: rustup
@@ -30,7 +30,7 @@ jobs:
       working-directory: ./eden/scm
       run: ${{ format('mv sl-manylinux.tar.xz sapling-{0}-linux-{1}.tar.xz', env.SAPLING_VERSION, matrix.arch) }}
     - name: Upload Artifact
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: sapling-linux-${{ matrix.arch }}
         path: ./eden/scm/sapling*.tar.xz
@@ -39,11 +39,11 @@ jobs:
     needs: build
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
     - name: Grant Access
       run: git config --global --add safe.directory "$PWD"
     - name: Download Artifacts
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         pattern: sapling-linux-*
         merge-multiple: true
