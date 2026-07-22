@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.71
+
+### 16 March 2026
+
+- Add gerrit as a code review provider
+
 ## 0.1.70
 
 - Reduced fetching frequency for better performance
