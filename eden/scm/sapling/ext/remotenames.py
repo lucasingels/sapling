@@ -540,7 +540,8 @@ def extsetup(ui):
     ]
 
     if ui.config("gerrit", "url"):
-        newopts.append([
+        newopts.extend([
+            (pushcmd, ("", "to-prefix", "", "prepend value to destination ref (Gerrit)")),
             (pushcmd, ("", "to-suffix", "", "append value to destination ref (Gerrit)")),
         ])
 
@@ -872,6 +873,9 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
             to = opts.get("to") or _guesspushtobookmark(repo, pushnode, remotename)
             if not to:
                 raise error.Abort(_("use '--to' to specify destination bookmark"))
+            to_prefix = opts.get("to_prefix")
+            if to_prefix and not to.startswith("refs/"):
+                to = to_prefix + to
             to_suffix = opts.get("to_suffix")
             if to_suffix:
                 to = to + to_suffix

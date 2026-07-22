@@ -62,10 +62,15 @@ fn run_publish(ctx: ReqCtx<GerritOpts>, repo: &Repo) -> Result<u8> {
     let config = repo.config();
     let is_wip = ctx.opts.wip || ctx.opts.draft;
 
-    // Build push args, delegating branch resolution to sl push.
+    // Build push args, delegating branch resolution to sl push. The
+    // `--to-prefix refs/for/` turns the guessed bookmark (e.g. `master`)
+    // into a Gerrit review ref (`refs/for/master`) rather than a direct
+    // branch push.
     let mut args = vec![
         identity::cli_name().to_string(),
         "push".to_string(),
+        "--to-prefix".to_string(),
+        "refs/for/".to_string(),
     ];
 
     // Collect Gerrit push options as %key or %key=value suffixes.
@@ -135,9 +140,10 @@ pub fn doc() -> &'static str {
       publish [OPTIONS]   Push commits to Gerrit for review
 
     The ``publish`` subcommand pushes the current commit to Gerrit for
-    code review. Branch resolution and refspec construction are handled
-    by ``sl push`` — the user's push path config should include
-    ``refs/for/`` as appropriate.
+    code review. Branch resolution is delegated to ``sl push``; the
+    destination is rewritten to ``refs/for/<branch>`` via ``--to-prefix``
+    so the change lands in Gerrit's review queue rather than being
+    pushed directly to the branch.
 
     Gerrit push options are appended as ``%key`` or ``%key=value`` suffixes
     to the destination ref via ``--to-suffix``.
