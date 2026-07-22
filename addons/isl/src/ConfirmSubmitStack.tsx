@@ -22,6 +22,7 @@ import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
 import {publishWhenReady, PublishWhenReadyCheckbox} from './codeReview/PublishWhenReadyCheckbox';
 import {t, T} from './i18n';
+import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {configBackedAtom, readAtom} from './jotaiUtils';
 import {CommitPreview} from './previews';
 import {useModal} from './useModal';
@@ -159,7 +160,7 @@ function ConfirmModalContent({
               publishWhenReady: shouldPublishWhenReady,
             })
           }>
-          <T>Submit</T>
+          {submitButtonVerb(provider)}
         </Button>
       </div>
     </div>

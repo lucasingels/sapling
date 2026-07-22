@@ -13,7 +13,8 @@ import {tracker} from './analytics';
 import {codeReviewProvider, diffSummary} from './codeReview/CodeReviewInfo';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
 import {publishWhenReady} from './codeReview/PublishWhenReadyCheckbox';
-import {t, T} from './i18n';
+import {t} from './i18n';
+import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {readAtom} from './jotaiUtils';
 import {useRunOperation} from './operationsState';
 import {dagWithPreviews} from './previews';
@@ -61,7 +62,7 @@ export function SubmitSingleCommitButton() {
         icon
         data-testid="submit-button">
         <Icon icon="cloud-upload" slot="start" />
-        <T>Submit</T>
+        {submitButtonVerb(provider)}
       </Button>
     </Tooltip>
   );

@@ -9,6 +9,8 @@ import type {ReactNode} from 'react';
 import type {CommitInfo, DiffId, DiffSummary} from '../types';
 import type {UICodeReviewProvider} from './UICodeReviewProvider';
 
+import {submitButtonVerb} from './UICodeReviewProvider';
+
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {Tooltip} from 'isl-components/Tooltip';
@@ -268,7 +270,7 @@ function ResubmitSyncButton({
           );
         }}>
         <Icon icon="cloud-upload" slot="start" />
-        <T>Submit</T>
+        {submitButtonVerb(provider)}
       </Button>
     </Tooltip>
   );
