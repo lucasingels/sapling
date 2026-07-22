@@ -45,6 +45,7 @@ external_commands![
     cmdclone,
     cmdconfig,
     cmdconfigfile,
+    cmdgerrit,
     cmdgoto,
     cmdgrep,
     cmdroot,
