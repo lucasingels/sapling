@@ -75,6 +75,7 @@ export type TrackEventName =
   | 'GetFullFocusedBranch'
   | 'AcceptSuggestedReviewer'
   | 'AcceptSuggestedTag'
+  | 'GerritPublishOperation'
   | 'GhStackSubmitOperation'
   | 'GotoOperation'
   | 'GoBackToOldISL'
