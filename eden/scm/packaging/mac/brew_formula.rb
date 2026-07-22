@@ -54,7 +54,7 @@ class SaplingDev < Formula
     libexec.install "#{prefix}/bin/sl"
     libexec.install "#{lib}/isl-dist.tar.xz"
 
-    (bin/"sld").write <<~EOS
+    (bin/"sl").write <<~EOS
       #!/bin/bash
       exec "#{opt_libexec}/sl" --config "web.isl-dist-path=#{opt_libexec}/isl-dist.tar.xz" "$@"
     EOS
