@@ -132,8 +132,11 @@ function DiffInfoInner({
   if (diffInfoResult.error) {
     return <DiffLoadError number={provider.formatDiffNumber(diffId)} provider={provider} />;
   }
-  if (diffInfoResult?.value == null) {
+  if (diffInfoResult.value === undefined) {
     return <DiffSpinner diffId={diffId} provider={provider} />;
+  }
+  if (diffInfoResult.value === null) {
+    return null; // summaries loaded but diffId not found — not yet pushed
   }
   const info = diffInfoResult.value;
   const shouldHideActions = hideActions || provider.isDiffClosed(info);
@@ -179,7 +182,7 @@ function DiffInfoInner({
         )}
       <DiffComments diffId={diffId} diff={info} />
       <DiffNumber url={info.url} versionLabel={Internal.getDiffVersionLabel?.(info, commit.hash)}>
-        {provider.formatDiffNumber(diffId)}
+        {provider.formatDiffNumber(diffId, info)}
       </DiffNumber>
       {shouldHideActions ? null : syncStatus === SyncStatus.RemoteIsNewer ? (
         <DownloadNewVersionButton diffId={diffId} provider={provider} />
