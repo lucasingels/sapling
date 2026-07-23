@@ -68,8 +68,8 @@ const GERRIT_CHANGE_RESPONSE = (changeId: string, number: number) =>
       status: 'NEW',
       submittable: true,
       labels: {
-        'Code-Review': {all: [{value: 2}, {value: 1}]},
-        Verified: {all: [{value: 1}]},
+        'Code-Review': {approved: {name: 'Bob'}, all: [{value: 2}, {value: 1}]},
+        Verified: {approved: {name: 'CI'}, all: [{value: 1}]},
       },
     },
   ]);
@@ -86,7 +86,12 @@ describe('GerritCodeReviewProvider', () => {
     provider.dispose();
   });
 
-  it('emits an empty map when no diffs are provided', async () => {
+  it('still fetches when no diffs are provided, since it fetches all owned changes regardless', async () => {
+    // Matches the GitHub provider's approach: fetch all of the user's changes so
+    // badges populate even before any smartlog commit has a known Change-Id.
+    const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';
+    mockHttpsResponse(GERRIT_CHANGE_RESPONSE(changeId, 142));
+
     const results: Array<Map<string, unknown>> = [];
     provider.onChangeDiffSummaries(r => {
       if (r.value) {
@@ -94,13 +99,12 @@ describe('GerritCodeReviewProvider', () => {
       }
     });
 
-    await (provider.triggerDiffSummariesFetch as unknown as {flush: () => Promise<void>}).flush?.();
     provider.triggerDiffSummariesFetch([]);
 
     // Wait for async debounce
-    await new Promise(r => setTimeout(r, 0));
-    expect(results[0]).toEqual(new Map());
-    expect(https.get).not.toHaveBeenCalled();
+    await new Promise(r => setTimeout(r, 50));
+    expect(https.get).toHaveBeenCalledTimes(1);
+    expect(results[0]?.has(changeId)).toBe(true);
   });
 
   it('fetches from REST API and emits summaries keyed by Change-Id', async () => {
@@ -114,6 +118,8 @@ describe('GerritCodeReviewProvider', () => {
       }
     });
 
+    // The diffs argument is intentionally ignored (see triggerDiffSummariesFetch's
+    // docstring) — the query is scoped by owner+project, not by Change-Id.
     provider.triggerDiffSummariesFetch([changeId]);
     await new Promise(r => setTimeout(r, 50));
 
@@ -121,7 +127,7 @@ describe('GerritCodeReviewProvider', () => {
     const [[url]] = (https.get as jest.Mock).mock.calls;
     expect(url).toMatchObject({
       hostname: 'code.example.com',
-      path: expect.stringContaining(changeId),
+      path: '/changes/?q=project:my-repo&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS',
     });
 
     expect(results).toHaveLength(1);
@@ -134,12 +140,13 @@ describe('GerritCodeReviewProvider', () => {
       number: '142',
       url: 'https://code.example.com/c/my-repo/+/142',
       branchName: undefined,
-      codeReview: 2,
-      verified: 1,
+      codeReview: 'approved',
       signalSummary: 'pass',
       commentCount: 0,
       anyUnresolvedComments: false,
       submittable: true,
+      isWorkInProgress: false,
+      isPrivate: false,
     });
   });
 
@@ -364,5 +371,42 @@ describe('GerritCodeReviewProvider', () => {
 
     expect((results[0].get(merged) as {state: string}).state).toBe('MERGED');
     expect((results[0].get(abandoned) as {state: string}).state).toBe('ABANDONED');
+  });
+
+  it('does not restrict the changes query to status:open, so merged/abandoned changes keep updating', async () => {
+    mockHttpsResponse(`)]}'\n` + JSON.stringify([]));
+    provider.triggerDiffSummariesFetch(['Iabc123']);
+    await new Promise(r => setTimeout(r, 50));
+
+    const [[url]] = (https.get as jest.Mock).mock.calls;
+    expect(url.path).not.toContain('status:open');
+  });
+
+  it('parses work_in_progress and is_private flags off the Gerrit change', async () => {
+    const wip = 'Iwip00000000000000000000000000000000000000';
+    const priv = 'Iprivate000000000000000000000000000000000';
+    const plain = 'Iplain0000000000000000000000000000000000000';
+    mockHttpsResponse(
+      `)]}'\n` +
+        JSON.stringify([
+          {change_id: wip, _number: 1, subject: 'W', status: 'NEW', labels: {}, work_in_progress: true},
+          {change_id: priv, _number: 2, subject: 'P', status: 'NEW', labels: {}, is_private: true},
+          {change_id: plain, _number: 3, subject: 'N', status: 'NEW', labels: {}},
+        ]),
+    );
+
+    const results: Array<Map<string, unknown>> = [];
+    provider.onChangeDiffSummaries(r => {
+      if (r.value) {
+        results.push(r.value);
+      }
+    });
+
+    provider.triggerDiffSummariesFetch([wip, priv, plain]);
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(results[0].get(wip)).toMatchObject({isWorkInProgress: true, isPrivate: false});
+    expect(results[0].get(priv)).toMatchObject({isWorkInProgress: false, isPrivate: true});
+    expect(results[0].get(plain)).toMatchObject({isWorkInProgress: false, isPrivate: false});
   });
 });

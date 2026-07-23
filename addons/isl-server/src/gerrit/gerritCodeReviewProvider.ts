@@ -67,6 +67,10 @@ export type GerritDiffSummary = {
   submittable: boolean;
   /** Vote description of the dominant Code-Review vote (e.g. "Looks good to me, approved"). */
   codeReviewAttribution?: string;
+  /** Whether the change is marked work-in-progress on Gerrit. */
+  isWorkInProgress: boolean;
+  /** Whether the change is marked private on Gerrit. */
+  isPrivate: boolean;
 };
 
 type GerritCodeReviewSystem = CodeReviewSystem & {
@@ -333,11 +337,14 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
 
         const credentials = await getCredentials(webUrl);
 
-        // Fetch all open changes owned by the authenticated user for this project,
-        // matching the GitHub provider's approach of fetching author:@me PRs.
+        // Fetch all changes owned by the authenticated user for this project (any
+        // status), matching the GitHub provider's approach of fetching all author:@me
+        // PRs rather than just open ones — otherwise a change that merges or is
+        // abandoned would simply drop out of `summaries` instead of updating to
+        // reflect its new state.
         const query = credentials
-          ? `owner:self+project:${encodeURIComponent(project)}+status:open`
-          : `project:${encodeURIComponent(project)}+status:open`;
+          ? `owner:self+project:${encodeURIComponent(project)}`
+          : `project:${encodeURIComponent(project)}`;
         // Use /a/ prefix when credentials are available — Gerrit authenticates Basic auth
         // only on the /a/ path; requests to /changes/ are treated as anonymous even with
         // an Authorization header.
@@ -407,6 +414,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
               ? change.unresolved_comment_count
               : 0;
           const branchName = typeof change.branch === 'string' ? change.branch : undefined;
+          const isWorkInProgress = Boolean(change.work_in_progress);
+          const isPrivate = Boolean(change.is_private);
 
           summaries.set(changeId, {
             type: 'gerrit',
@@ -416,6 +425,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
             number,
             url: this.changeUrl(Number(number), project),
             branchName,
+            isWorkInProgress,
+            isPrivate,
             codeReview,
             codeReviewAttribution,
             signalSummary,

@@ -8,6 +8,7 @@
 import type {DiffId, DiffSummary} from '../types';
 
 import {act, render, screen, within} from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import App from '../App';
 import {
   COMMIT,
@@ -50,11 +51,12 @@ function gerritSummary(
       number: '142',
       url: 'https://code.example.com/c/my-repo/+/142',
       branchName: 'main',
-      codeReview: 0,
-      verified: 0,
+      codeReview: null,
       commentCount: 0,
       anyUnresolvedComments: false,
       submittable: false,
+      isWorkInProgress: false,
+      isPrivate: false,
       ...overrides,
     } as DiffSummary,
   ];
@@ -108,7 +110,12 @@ describe('GerritBadge', () => {
             type: 'fetchedDiffSummaries',
             summaries: {
               value: new Map<DiffId, DiffSummary>([
-                gerritSummary(CHANGE_ID_A, {state: 'NEW', codeReview: 2, verified: 1, submittable: true}),
+                gerritSummary(CHANGE_ID_A, {
+                  state: 'NEW',
+                  codeReview: 'approved',
+                  signalSummary: 'pass',
+                  submittable: true,
+                }),
                 gerritSummary(CHANGE_ID_B, {state: 'MERGED', number: '143'}),
               ]),
             },
@@ -136,10 +143,11 @@ describe('GerritBadge', () => {
         ).toBeInTheDocument();
       });
 
-      it('shows score badges for non-zero CR and Verified votes', () => {
+      it('shows the Approved decision label and passing CI signal', () => {
         const badgeA = within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info');
-        expect(within(badgeA).queryByText('CR+2')).toBeInTheDocument();
-        expect(within(badgeA).queryByText('V+1')).toBeInTheDocument();
+        expect(badgeA.querySelector('.gerrit-review-decision-approved')).not.toBeNull();
+        expect(within(badgeA).queryByText('Approved')).toBeInTheDocument();
+        expect(badgeA.querySelector('.diff-signal-pass')).not.toBeNull();
       });
 
       it('shows nothing for commits whose Change-Id is not in the loaded summaries', () => {
@@ -165,8 +173,14 @@ describe('GerritBadge', () => {
       });
 
       it('shows error state for commits with Change-Ids', () => {
-        expect(screen.queryAllByTestId('gerrit-error')).toHaveLength(2);
-        expect(screen.queryByText('Gerrit auth failed')).toBeInTheDocument();
+        const errorBadges = screen.queryAllByTestId('gerrit-error');
+        expect(errorBadges).toHaveLength(2);
+        // The outer badge is itself wrapped in a "click to open" tooltip, so take the
+        // innermost .tooltip-creator — the one directly wrapping the error icon.
+        const tooltipCreators = errorBadges[0].querySelectorAll('.tooltip-creator');
+        const tooltipTrigger = tooltipCreators[tooltipCreators.length - 1] as HTMLElement;
+        userEvent.hover(tooltipTrigger);
+        expect(screen.getByText('Gerrit auth failed')).toBeInTheDocument();
       });
     });
 
@@ -194,6 +208,86 @@ describe('GerritBadge', () => {
       });
     });
 
+    describe('work-in-progress and private state', () => {
+      it('shows Draft for a work-in-progress change', () => {
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedDiffSummaries',
+            summaries: {
+              value: new Map<DiffId, DiffSummary>([
+                gerritSummary(CHANGE_ID_A, {isWorkInProgress: true}),
+                gerritSummary(CHANGE_ID_B, {state: 'NEW'}),
+              ]),
+            },
+          });
+        });
+        expect(
+          within(within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info')).queryByText(
+            'Draft',
+          ),
+        ).toBeInTheDocument();
+      });
+
+      it('shows Private for a private change', () => {
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedDiffSummaries',
+            summaries: {
+              value: new Map<DiffId, DiffSummary>([
+                gerritSummary(CHANGE_ID_A, {isPrivate: true}),
+                gerritSummary(CHANGE_ID_B, {state: 'NEW'}),
+              ]),
+            },
+          });
+        });
+        expect(
+          within(within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info')).queryByText(
+            'Private',
+          ),
+        ).toBeInTheDocument();
+      });
+
+      it('prefers Private over Draft when a change is both private and work-in-progress', () => {
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedDiffSummaries',
+            summaries: {
+              value: new Map<DiffId, DiffSummary>([
+                gerritSummary(CHANGE_ID_A, {isPrivate: true, isWorkInProgress: true}),
+                gerritSummary(CHANGE_ID_B, {state: 'NEW'}),
+              ]),
+            },
+          });
+        });
+        const badgeA = within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info');
+        expect(within(badgeA).queryByText('Private')).toBeInTheDocument();
+        expect(within(badgeA).queryByText('Draft')).not.toBeInTheDocument();
+      });
+
+      it('still shows Merged even if a merged change retained work-in-progress/private flags', () => {
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedDiffSummaries',
+            summaries: {
+              value: new Map<DiffId, DiffSummary>([
+                gerritSummary(CHANGE_ID_A, {
+                  state: 'MERGED',
+                  isPrivate: true,
+                  isWorkInProgress: true,
+                }),
+                gerritSummary(CHANGE_ID_B, {state: 'NEW'}),
+              ]),
+            },
+          });
+        });
+        expect(
+          within(within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info')).queryByText(
+            'Merged',
+          ),
+        ).toBeInTheDocument();
+      });
+    });
+
     describe('negative votes', () => {
       beforeEach(() => {
         act(() => {
@@ -201,7 +295,7 @@ describe('GerritBadge', () => {
             type: 'fetchedDiffSummaries',
             summaries: {
               value: new Map<DiffId, DiffSummary>([
-                gerritSummary(CHANGE_ID_A, {codeReview: -1, verified: -1}),
+                gerritSummary(CHANGE_ID_A, {codeReview: 'rejected', signalSummary: 'failed'}),
                 gerritSummary(CHANGE_ID_B, {state: 'NEW'}),
               ]),
             },
@@ -209,10 +303,11 @@ describe('GerritBadge', () => {
         });
       });
 
-      it('shows negative score badges', () => {
+      it('shows the Rejected decision label and failing CI signal', () => {
         const badgeA = within(screen.getByTestId('commit-a')).getByTestId('gerrit-diff-info');
-        expect(within(badgeA).queryByText('CR-1')).toBeInTheDocument();
-        expect(within(badgeA).queryByText('V-1')).toBeInTheDocument();
+        expect(badgeA.querySelector('.gerrit-review-decision-rejected')).not.toBeNull();
+        expect(within(badgeA).queryByText('Rejected')).toBeInTheDocument();
+        expect(badgeA.querySelector('.diff-signal-failed')).not.toBeNull();
       });
     });
   });
