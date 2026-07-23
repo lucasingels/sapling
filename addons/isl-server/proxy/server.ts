@@ -14,7 +14,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
-import urlModule from 'node:url';
 import WebSocket from 'ws';
 import {repositoryCache} from '../src/RepositoryCache';
 import {CLOSED_AND_SHOULD_NOT_RECONNECT_CODE} from '../src/constants';
@@ -120,7 +119,8 @@ export function startServer({
       if (req.url) {
         // Only the websocket is sensitive and requires the token.
         // Normal resource requests don't need to check the token.
-        const {pathname} = urlModule.parse(req.url);
+        // req.url is path-only (no scheme/host), so URL needs a dummy base to parse it.
+        const {pathname} = new URL(req.url, 'http://localhost');
         // eslint-disable-next-line no-prototype-builtins
         if (pathname != null && requestUrlToResource.hasOwnProperty(pathname)) {
           const relativePath = requestUrlToResource[pathname];
@@ -182,8 +182,7 @@ export function startServer({
       let platform: string | undefined;
       let sessionId: string | undefined;
       if (connectionRequest.url) {
-        const rawSearch = urlModule.parse(connectionRequest.url).search ?? '';
-        const searchParams = new URLSearchParams(rawSearch);
+        const {searchParams} = new URL(connectionRequest.url, 'http://localhost');
         providedToken = searchParams.get('token') ?? undefined;
         const cwdParam = searchParams.get('cwd');
         platform = searchParams.get('platform') ?? undefined;
@@ -297,14 +296,8 @@ function checkIfServerShouldCleanItselfUp() {
   }
 }
 
-function getSearchParams(url: string): Map<string, string> {
-  const searchParamsArray = urlModule
-    .parse(url)
-    .search?.replace(/^\?/, '')
-    .split('&')
-    .map((pair: string): [string, string] => pair.split('=') as [string, string]);
-
-  return new Map(searchParamsArray);
+function getSearchParams(url: string): URLSearchParams {
+  return new URL(url, 'http://localhost').searchParams;
 }
 
 const extensionToMIMEType: {[key: string]: string} = {
