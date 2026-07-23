@@ -36,7 +36,14 @@ function escapeHtml(text: string): string {
 }
 
 /** File paths that are Gerrit meta-files, not real source files. */
-const GERRIT_META_FILES = new Set(['/COMMIT_MSG', '/MERGE_LIST', '/PATCHSET_LEVEL']);
+const GERRIT_META_FILES = new Set(['/COMMIT_MSG', '/MERGE_LIST']);
+
+/**
+ * Gerrit's synthetic path for general (patchset-level) comments that aren't
+ * attached to any specific file — e.g. a plain "LGTM" reply. These are real,
+ * user-authored comments (unlike GERRIT_META_FILES) and must still be shown.
+ */
+const GERRIT_PATCHSET_LEVEL_FILE = '/PATCHSET_LEVEL';
 
 export type GerritDiffSummary = {
   type: 'gerrit';
@@ -463,6 +470,7 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
       if (GERRIT_META_FILES.has(filename)) {
         continue;
       }
+      const isGeneralComment = filename === GERRIT_PATCHSET_LEVEL_FILE;
       for (const c of fileComments as Array<RawComment>) {
         comments.push({
           id: c.id,
@@ -470,8 +478,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
           html: escapeHtml(c.message ?? ''),
           content: c.message,
           created: c.updated ? new Date(c.updated) : new Date(0),
-          filename,
-          line: c.line,
+          filename: isGeneralComment ? undefined : filename,
+          line: isGeneralComment ? undefined : c.line,
           reactions: [],
           replies: [],
           // Gerrit REST: unresolved=true means still open, unresolved=false means resolved
