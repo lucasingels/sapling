@@ -5,7 +5,7 @@
 
 # This is an example brew formula. It will need to be updated to point to an
 # actual URL, with an actual sha256, license, and tests.
-class SaplingDev < Formula
+class Sapling < Formula
   desc "The Sapling source control client"
   homepage "https://sapling-scm.com"
   license "GPL-2.0-or-later"

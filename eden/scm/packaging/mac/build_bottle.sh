@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds a Homebrew bottle for sapling-dev (binary: sl)
+# Builds a Homebrew bottle for sapling (binary: sl)
 # Usage: build_bottle.sh [version]
 #   version defaults to the contents of the SAPLING_VERSION file at the repo
 #   root; pass an argument to override it.
@@ -24,35 +24,41 @@ brew tap lucasingels/tap "https://x-access-token:${GH_TOKEN}@github.com/lucasing
   -t aarch64-apple-darwin \
   -r "$VERSION" \
   -b sl \
-  -o "$(brew --repository lucasingels/tap)/Formula/sapling-dev.rb"
+  -o "$(brew --repository lucasingels/tap)/Formula/sapling.rb"
 
 cd "$(brew --repository lucasingels/tap)"
-git add Formula/sapling-dev.rb
-git commit -m "Add sapling-dev formula" 2>/dev/null || true
+git add Formula/sapling.rb
+git commit -m "Add sapling formula" 2>/dev/null || true
 
 cd "$REPO_ROOT"
 HOMEBREW_NO_INSTALL_FROM_API=1 HOMEBREW_FAIL_LOG_LINES=100 \
-  brew install --build-bottle lucasingels/tap/sapling-dev || \
-  brew link --overwrite lucasingels/tap/sapling-dev
+  brew install --build-bottle lucasingels/tap/sapling || \
+  brew link --overwrite lucasingels/tap/sapling
 
 BOTTLE_ROOT_URL="https://github.com/lucasingels/sapling/releases/download/v${VERSION}"
 # Modern Homebrew splits bottling into two steps: first build the bottle tarball
 # plus its JSON metadata, then merge the generated bottle block into the formula.
 # (`--write` is only valid together with `--merge`, which takes the JSON file.)
-brew bottle --json --no-rebuild --root-url "$BOTTLE_ROOT_URL" lucasingels/tap/sapling-dev
-brew bottle --merge --write --no-commit sapling-dev-*.bottle.json
+brew bottle --json --no-rebuild --root-url "$BOTTLE_ROOT_URL" lucasingels/tap/sapling
+brew bottle --merge --write --no-commit sapling--*.bottle.json
 
-BOTTLE_FILE=$(ls "sapling-dev-$VERSION"*.bottle.tar.gz)
+# `brew bottle` writes the tarball with a double dash (sapling--<version>…), but
+# Homebrew downloads bottles with a single dash (sapling-<version>…). Rename
+# before uploading so the published asset matches the URL Homebrew derives from
+# the formula's root_url; the sha256 is unaffected by the rename.
+RAW_BOTTLE=$(ls "sapling--$VERSION"*.bottle.tar.gz)
+BOTTLE_FILE=${RAW_BOTTLE/sapling--/sapling-}
+mv "$RAW_BOTTLE" "$BOTTLE_FILE"
 
 cd "$(brew --repository lucasingels/tap)"
-git add Formula/sapling-dev.rb
-git commit -m "sapling-dev $VERSION"
+git add Formula/sapling.rb
+git commit -m "sapling $VERSION"
 git push
 
 cd "$REPO_ROOT"
 gh release create "v${VERSION}" \
   --repo lucasingels/sapling \
-  --title "Sapling Dev v${VERSION}" \
+  --title "Sapling v${VERSION}" \
   --generate-notes \
   "$BOTTLE_FILE" \
   2>/dev/null || \

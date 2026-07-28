@@ -14,7 +14,7 @@ of files and many millions of commits.
 Currently this fork is only released for installation on MacOS via `homebrew`. To install run the following commands:
 
 `brew tap lucasingels/tap`
-`brew install lucasingels/tap/sapling-dev`
+`brew install lucasingels/tap/sapling`
 
 ## Sapling VS Code Extension
 
