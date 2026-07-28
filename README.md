@@ -20,7 +20,7 @@ brew tap lucasingels/tap && brew install lucasingels/tap/sapling
 ## Sapling VS Code Extension
 
 ### Install
-The VS Code extension is compatible with all platforms currently as it does not depend on any changes to the sl binary itself including the `sl web` command.
+The VS Code extension is compatible only with this repo's sl
 
 ```bash
 gh release download --repo lucasingels/sapling extension-v0.2.3
