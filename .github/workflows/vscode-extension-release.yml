@@ -1,0 +1,50 @@
+name: Release - VS Code Extension
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (defaults to addons/vscode/package.json)'
+        required: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Releasing to this same repo, so the default token is enough (no PAT).
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+    - name: Enable Corepack (yarn)
+      run: corepack enable
+    - name: Resolve version
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        if [ -z "$VERSION" ]; then
+          VERSION=$(node -p "require('./addons/vscode/package.json').version")
+        fi
+        echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+        echo "TAG=extension-v${VERSION}" >> "$GITHUB_ENV"
+        echo "VSIX=sapling-scm-${VERSION}.vsix" >> "$GITHUB_ENV"
+    - name: Install dependencies
+      working-directory: ./addons
+      run: yarn install --frozen-lockfile
+    - name: Package extension (.vsix)
+      # vsce runs the `vscode:prepublish` script (buildForPublish.js), which does
+      # the production extension + webview build. --no-dependencies because the
+      # bundle is self-contained (node_modules is excluded via .vscodeignore).
+      working-directory: ./addons/vscode
+      run: npx --yes @vscode/vsce package --no-dependencies -o "$VSIX"
+    - name: Publish to its own GitHub release
+      working-directory: ./addons/vscode
+      run: |
+        gh release create "$TAG" \
+          --repo lucasingels/sapling \
+          --title "Sapling ISL VS Code Extension v${VERSION}" \
+          --notes "Sapling ISL VS Code extension v${VERSION}. Download the .vsix below and install with: code --install-extension ${VSIX}" \
+          "$VSIX" 2>/dev/null || \
+        gh release upload "$TAG" --repo lucasingels/sapling --clobber "$VSIX"
