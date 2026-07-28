@@ -1,10 +1,6 @@
 name: Release - Linux (x64, arm64)
 on:
   workflow_dispatch: null
-  push:
-    tags:
-    - v*
-    - test-release-*
 jobs:
   build:
     strategy:
