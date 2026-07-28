@@ -192,10 +192,19 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
   }
 
   getSubmittableDiffs(
-    _commits: Array<CommitInfo>,
-    _allDiffSummaries: Map<string, DiffSummary>,
+    commits: Array<CommitInfo>,
+    allDiffSummaries: Map<string, DiffSummary>,
   ): CommitInfo[] {
-    return [];
+    // A commit is submittable if it's never been pushed (no summary on the server
+    // yet — including still-loading, to avoid hiding the button on uncertainty),
+    // or if it has but the change is still open (so re-submitting sends an update).
+    return commits.filter(commit => {
+      if (commit.diffId == null) {
+        return true;
+      }
+      const summary = allDiffSummaries.get(commit.diffId) as GerritDiffSummary | undefined;
+      return summary == null || (summary.state !== 'MERGED' && summary.state !== 'ABANDONED');
+    });
   }
 
   isDiffClosed(summary: DiffSummary): boolean {
