@@ -28,7 +28,7 @@ jobs:
         cat /proc/cpuinfo | grep 'model name' | head -1
         free -h
 
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Set up sccache
       uses: mozilla-actions/sccache-action@v0.0.10
@@ -188,7 +188,7 @@ jobs:
 
     - name: Copy artifacts
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fixup-dyn-deps --strip --src-dir=. sapling _artifacts/linux --project-install-prefix sapling:/ --final-install-prefix /usr/local
-    - uses: actions/upload-artifact@v6
+    - uses: actions/upload-artifact@v7
       with:
         name: sapling
         path: _artifacts
