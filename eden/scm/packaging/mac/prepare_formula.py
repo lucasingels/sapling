@@ -60,7 +60,7 @@ parser.add_argument(
     "--binary-name",
     default="sl",
     type=str,
-    help="Name of the installed binary (e.g. sl, sld)",
+    help="Name of the installed binary (e.g. sl)",
     required=False,
 )
 
