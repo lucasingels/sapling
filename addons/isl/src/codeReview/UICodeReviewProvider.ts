@@ -12,6 +12,16 @@ import type {Dag} from '../previews';
 import type {CodeReviewSystem, CommitInfo, DiffId, DiffSummary, Hash} from '../types';
 import type {SyncStatus} from './syncStatus';
 
+import {t} from '../i18n';
+
+/**
+ * The verb to show on submit/CTA buttons for a provider (e.g. "Submit", "Publish").
+ * Falls back to a translated "Submit" for providers that don't override it.
+ */
+export function submitButtonVerb(provider: UICodeReviewProvider | null | undefined): string {
+  return provider?.submitButtonLabel?.() ?? t('Submit');
+}
+
 /**
  * API to interact with Code Review for Repositories, e.g. GitHub and Phabricator.
  */
@@ -47,6 +57,12 @@ export interface UICodeReviewProvider {
   ): Operation;
 
   submitCommandName(): string;
+
+  /**
+   * Verb shown on submit/CTA buttons for this provider (e.g. "Submit", "Publish").
+   * Defaults to "Submit" when not implemented.
+   */
+  submitButtonLabel?(): string;
 
   /** If provided, any form of submitting for code review is currently disabled for this provider for the given reason */
   submitDisabledReason?: () => string | undefined;

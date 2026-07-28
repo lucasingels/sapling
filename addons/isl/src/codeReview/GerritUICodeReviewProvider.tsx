@@ -145,6 +145,10 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return 'gerrit publish';
   }
 
+  submitButtonLabel(): string {
+    return 'Publish';
+  }
+
   getSupportedStackActions(
     _hash: Hash,
     _dag: Dag,

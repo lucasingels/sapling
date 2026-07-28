@@ -8,6 +8,8 @@
 import type {JSX, ReactNode} from 'react';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
+
+import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import type {DagCommitInfo} from './dag/dag';
 import type {CommitInfo, SuccessorInfo} from './types';
 import {succeedableRevset, WarningCheckResult} from './types';
@@ -322,9 +324,11 @@ export const Commit = memo(
             items.push({
               label:
                 submittable.length > 1 ? (
-                  <T replace={{$count: submittable.length}}>Submit $count Commits</T>
+                  <T replace={{$count: submittable.length, $verb: submitButtonVerb(provider)}}>
+                    $verb $count Commits
+                  </T>
                 ) : (
-                  <T>Submit Commit</T>
+                  <T replace={{$verb: submitButtonVerb(provider)}}>$verb Commit</T>
                 ),
               onClick: () => {
                 runOperation(

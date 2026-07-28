@@ -48,6 +48,7 @@ import {confirmNoBlockingDiagnostics} from '../Diagnostics';
 import {FoldButton, useRunFoldPreview} from '../fold';
 import {getCachedGeneratedFileStatuses, useGeneratedFileStatuses} from '../GeneratedFile';
 import {t, T} from '../i18n';
+import {submitButtonVerb} from '../codeReview/UICodeReviewProvider';
 import {IrrelevantCwdIcon} from '../icons/IrrelevantCwdIcon';
 import {numPendingImageUploads} from '../ImageUpload';
 import {readAtom, writeAtom} from '../jotaiUtils';
@@ -1165,12 +1166,12 @@ function SubmitButton({
           runOperation={getApplicableOperations}>
           {commit.isDot && anythingToCommit ? (
             isCommitMode ? (
-              <T>Commit and Submit</T>
+              <T replace={{$verb: submitButtonVerb(provider)}}>Commit and $verb</T>
             ) : (
-              <T>Amend and Submit</T>
+              <T replace={{$verb: submitButtonVerb(provider)}}>Amend and $verb</T>
             )
           ) : (
-            <T>Submit</T>
+            submitButtonVerb(provider)
           )}
         </OperationDisabledButton>
       )}

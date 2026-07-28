@@ -23,6 +23,7 @@ import {showSuggestedRebaseForStack, SuggestedRebaseButton} from './SuggestedReb
 import {allDiffSummaries, codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
 import {T, t} from './i18n';
+import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {IconStack} from './icons/IconStack';
 import {useRunOperation} from './operationsState';
 import {useUncommittedSelection} from './partialSelection';
@@ -160,7 +161,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
             <HighlightCommitsWhileHovering key="submit-entire-stack" toHighlight={submittableStack}>
               <Row>
                 <Icon icon="cloud-upload" slot="start" />
-                <T>Submit entire stack</T>
+                <T replace={{$verb: submitButtonVerb(reviewProvider)}}>$verb entire stack</T>
               </Row>
             </HighlightCommitsWhileHovering>
           ),
@@ -217,7 +218,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
                   publishWhenReady: confirmation.publishWhenReady,
                 });
               }}>
-              <T>Submit stack</T>
+              <T replace={{$verb: submitButtonVerb(reviewProvider)}}>$verb stack</T>
             </OperationDisabledButton>
           </HighlightCommitsWhileHovering>
         </Tooltip>,
