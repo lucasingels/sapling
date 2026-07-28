@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+### 23 July 2026
+
+- Fix a Node deprecation warning (`url.parse()`) shown on every ISL server start
+
 ## 0.2.2
 
 ### 23 July 2026
