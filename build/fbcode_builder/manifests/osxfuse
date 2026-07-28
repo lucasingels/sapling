@@ -3,10 +3,13 @@ name = osxfuse
 
 [download]
 url = https://github.com/osxfuse/osxfuse/archive/osxfuse-3.8.3.tar.gz
-sha256 = 93bab6731bdfe8dc1ef069483437270ce7fe5a370f933d40d8d0ef09ba846c0c
+sha256 = ad9db4328f7c13cb6627381549819745ba2b144221305a45c2ae5acfe150b113
 
 [build]
 builder = nop
 
 [install.files]
-osxfuse-osxfuse-3.8.3/common = include
+# The osxfuse repo was renamed to macfuse, so GitHub's generated archive now has a
+# "macfuse-" top-level directory. That also changed the tarball bytes, hence the
+# sha256 above. Contents are unchanged: common/ still holds the five fuse_*.h headers.
+macfuse-osxfuse-3.8.3/common = include

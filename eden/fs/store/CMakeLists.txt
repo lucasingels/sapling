@@ -42,7 +42,10 @@ target_link_libraries(
     edencommon::edencommon_utils
 )
 
-add_subdirectory(hg)
+# The hg/ directory was renamed to sl/ (it holds SaplingBackingStore) but this
+# add_subdirectory call was not updated, breaking the CMake build. The library
+# target inside is still named eden_store_hg.
+add_subdirectory(sl)
 add_subdirectory(filter)
 
 if("${EDEN_HAVE_GIT}")
