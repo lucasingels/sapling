@@ -64,6 +64,18 @@ export interface UICodeReviewProvider {
    */
   submitButtonLabel?(): string;
 
+  /**
+   * Whether a commit carrying `diffId` should be treated as already having a
+   * submitted review (used to hide the inline "first submit" affordance).
+   * Defaults to `diffId != null`. Providers whose diffId exists locally before
+   * submission (e.g. Gerrit's Change-Id, stamped by the commit-msg hook) can
+   * override to additionally require the change to exist on the server.
+   */
+  hasSubmittedDiff?(
+    diffId: DiffId | undefined,
+    summary: DiffSummary | null | undefined,
+  ): boolean;
+
   /** If provided, any form of submitting for code review is currently disabled for this provider for the given reason */
   submitDisabledReason?: () => string | undefined;
 
