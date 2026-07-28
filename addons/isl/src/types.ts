@@ -903,10 +903,14 @@ export type PlatformSpecificServerToClientMessages =
     };
 
 export type CodeReviewProviderSpecificClientToServerMessages =
-  never | InternalTypes['PhabricatorClientToServerMessages'];
+  | never
+  | InternalTypes['PhabricatorClientToServerMessages']
+  | {type: 'gerritSetCredentials'; webUrl: string; username: string; password: string};
 
 export type CodeReviewProviderSpecificServerToClientMessages =
-  never | InternalTypes['PhabricatorServerToClientMessages'];
+  | never
+  | InternalTypes['PhabricatorServerToClientMessages']
+  | {type: 'gerritCredentialsResult'; success: boolean; error?: string};
 
 export type PageVisibility = 'focused' | 'visible' | 'hidden';
 
