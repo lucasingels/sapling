@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+### 23 July 2026
+
+- Fix Gerrit general/patchset-level comments (including resolved ones) not showing up
+- Show Draft and Private status for Gerrit changes, and keep Merged status updating after a change merges
+
 ## 0.1.71
 
 ### 16 March 2026
