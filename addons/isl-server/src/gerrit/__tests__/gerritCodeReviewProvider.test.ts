@@ -250,6 +250,47 @@ describe('GerritCodeReviewProvider', () => {
       expect(comments.every(c => c.filename !== '/COMMIT_MSG')).toBe(true);
     });
 
+    it('includes general (patchset-level) comments, both resolved and unresolved', async () => {
+      mockHttpsResponse(
+        `)]}'\n` +
+          JSON.stringify({
+            '/PATCHSET_LEVEL': [
+              {
+                id: 'g1',
+                author: {name: 'Alice', email: 'alice@example.com'},
+                message: 'Please split this into two changes',
+                updated: '2024-01-01 10:00:00.000000000',
+                unresolved: true,
+              },
+              {
+                id: 'g2',
+                author: {name: 'Bob', email: 'bob@example.com'},
+                message: 'LGTM',
+                updated: '2024-01-02 10:00:00.000000000',
+                unresolved: false,
+              },
+            ],
+          }),
+      );
+      const comments = await provider.fetchComments(changeId);
+
+      expect(comments).toHaveLength(2);
+      expect(comments[0]).toMatchObject({
+        id: 'g1',
+        author: 'Alice',
+        filename: undefined,
+        line: undefined,
+        isResolved: false,
+      });
+      expect(comments[1]).toMatchObject({
+        id: 'g2',
+        author: 'Bob',
+        filename: undefined,
+        line: undefined,
+        isResolved: true,
+      });
+    });
+
     it('HTML-escapes plain text comment content', async () => {
       mockHttpsResponse(
         `)]}'\n` +
