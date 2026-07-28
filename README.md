@@ -13,16 +13,19 @@ of files and many millions of commits.
 ### Install
 Currently this fork is only released for installation on MacOS via `homebrew`. To install run the following commands:
 
-`brew tap lucasingels/tap`
-`brew install lucasingels/tap/sapling`
+```bash
+brew tap lucasingels/tap && brew install lucasingels/tap/sapling
+```
 
 ## Sapling VS Code Extension
 
 ### Install
 The VS Code extension is compatible with all platforms currently as it does not depend on any changes to the sl binary itself including the `sl web` command.
 
-`gh release download -R lucasingels/sapling --pattern 'sapling-scm-0.2.1.vsix'`
-`code --install-extension sapling-scm-0.2.1.vsix`
+```bash
+gh release download --repo lucasingels/sapling extension-v0.2.2
+code --install-extension sapling-scm-0.2.2.vsix
+```
 
 # Using Sapling
 To start using Sapling, see the [Getting Started](https://sapling-scm.com/docs/introduction/getting-started) page for how to clone your existing Git repositories. Checkout the [Overview](https://sapling-scm.com/docs/overview/intro) for a peek at the various features. Coming from Git? Checkout the [Git Cheat Sheet](http://sapling-scm.com/docs/introduction/git-cheat-sheet).
