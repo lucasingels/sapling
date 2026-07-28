@@ -42,6 +42,16 @@
   background-color: #757575;
 }
 
+/* Work-in-progress — muted blue-gray, distinct from Abandoned's neutral gray */
+.gerrit-diff-status-DRAFT {
+  background-color: #5f6368;
+}
+
+/* Private — stands out from the other muted statuses */
+.gerrit-diff-status-PRIVATE {
+  background-color: #ad1457;
+}
+
 .gerrit-diff-status .tooltip-creator {
   align-items: center;
 }

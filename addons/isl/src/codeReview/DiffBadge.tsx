@@ -132,7 +132,13 @@ function DiffInfoInner({
   const startTestsEnabled = useFeatureFlagSync(Internal.featureFlags?.StartTestsButton);
   const isInMergeConflicts = useAtomValue(inMergeConflicts);
   if (diffInfoResult.error) {
-    return <DiffLoadError number={provider.formatDiffNumber(diffId)} provider={provider} />;
+    return (
+      <DiffLoadError
+        number={provider.formatDiffNumber(diffId)}
+        provider={provider}
+        error={diffInfoResult.error}
+      />
+    );
   }
   if (diffInfoResult.value === undefined) {
     return <DiffSpinner diffId={diffId} provider={provider} />;
@@ -501,6 +507,7 @@ export class DiffErrorBoundary extends Component<
         <DiffLoadError
           provider={this.props.provider}
           number={this.props.provider.formatDiffNumber(this.props.diffId)}
+          error={this.state.error ?? undefined}
         />
       );
     }
@@ -508,11 +515,21 @@ export class DiffErrorBoundary extends Component<
   }
 }
 
-function DiffLoadError({number, provider}: {number: string; provider: UICodeReviewProvider}) {
+function DiffLoadError({
+  number,
+  provider,
+  error,
+}: {
+  number: string;
+  provider: UICodeReviewProvider;
+  error?: Error;
+}) {
   return (
     <span className="diff-error diff-info" data-testid={`${provider.name}-error`}>
       <DiffBadge provider={provider}>
-        <Icon icon="error" />
+        <Tooltip title={error?.message ?? t('Failed to load diff info')}>
+          <Icon icon="error" />
+        </Tooltip>
       </DiffBadge>{' '}
       {number}
     </span>

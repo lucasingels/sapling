@@ -27,36 +27,57 @@ import {showModal} from '../useModal';
 import {allDiffSummaries, codeReviewProvider} from './CodeReviewInfo';
 import './GerritBadge.css';
 
-type GerritState = GerritDiffSummary['state'];
+/**
+ * Effective display status for a Gerrit change. `state` (MERGED/ABANDONED) is a
+ * terminal Gerrit outcome and always wins; otherwise, for changes still open,
+ * Private takes precedence over Work-In-Progress since it's the more restrictive
+ * (and more surprising, if missed) of the two.
+ */
+type DisplayStatus = 'MERGED' | 'ABANDONED' | 'PRIVATE' | 'DRAFT' | 'NEW';
 
-function iconForState(state: GerritState): string {
-  if (state === 'MERGED') {
-    return 'git-merge';
+function displayStatusForSummary(summary: GerritDiffSummary): DisplayStatus {
+  if (summary.state === 'MERGED' || summary.state === 'ABANDONED') {
+    return summary.state;
   }
-  if (state === 'ABANDONED') {
-    return 'git-pull-request-closed';
+  if (summary.isPrivate) {
+    return 'PRIVATE';
   }
-  return 'git-pull-request';
+  if (summary.isWorkInProgress) {
+    return 'DRAFT';
+  }
+  return 'NEW';
 }
 
-function badgeClass(state: GerritState): string {
-  if (state === 'MERGED') {
-    return 'gerrit-diff-status-MERGED';
+function iconForStatus(status: DisplayStatus): string {
+  switch (status) {
+    case 'MERGED':
+      return 'git-merge';
+    case 'ABANDONED':
+      return 'git-pull-request-closed';
+    case 'PRIVATE':
+      return 'lock';
+    default:
+      return 'git-pull-request';
   }
-  if (state === 'ABANDONED') {
-    return 'gerrit-diff-status-ABANDONED';
-  }
-  return 'gerrit-diff-status-NEW';
+}
+
+function badgeClass(status: DisplayStatus): string {
+  return `gerrit-diff-status-${status}`;
 }
 
 function tooltipForSummary(summary: GerritDiffSummary): string {
-  if (summary.state === 'MERGED') {
-    return t('Merged on Gerrit');
+  switch (displayStatusForSummary(summary)) {
+    case 'MERGED':
+      return t('Merged on Gerrit');
+    case 'ABANDONED':
+      return t('Abandoned on Gerrit');
+    case 'PRIVATE':
+      return t('Private on Gerrit');
+    case 'DRAFT':
+      return t('Work-in-progress on Gerrit');
+    default:
+      return t('Open on Gerrit');
   }
-  if (summary.state === 'ABANDONED') {
-    return t('Abandoned on Gerrit');
-  }
-  return t('Open on Gerrit');
 }
 
 export class GerritUICodeReviewProvider implements UICodeReviewProvider {
@@ -77,7 +98,7 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
       return null;
     }
     const summary = diff as GerritDiffSummary | undefined;
-    const className = summary ? badgeClass(summary.state) : 'gerrit-diff-status-NEW';
+    const className = summary ? badgeClass(displayStatusForSummary(summary)) : 'gerrit-diff-status-NEW';
     const tooltip = summary ? tooltipForSummary(summary) : t('Click to open change in Gerrit');
     return (
       <div className="gerrit-diff-info">
@@ -86,7 +107,7 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
             {summary && (
               <Icon
                 className="gerrit-diff-badge-icon"
-                icon={iconForState(summary.state)}
+                icon={iconForStatus(displayStatusForSummary(summary))}
               />
             )}
             {summary && <GerritStateLabel summary={summary} />}
@@ -234,11 +255,15 @@ function GerritReviewDecision({summary}: {summary: GerritDiffSummary}) {
 }
 
 function GerritStateLabel({summary}: {summary: GerritDiffSummary}) {
-  switch (summary.state) {
+  switch (displayStatusForSummary(summary)) {
     case 'MERGED':
       return <T>Merged</T>;
     case 'ABANDONED':
       return <T>Abandoned</T>;
+    case 'PRIVATE':
+      return <T>Private</T>;
+    case 'DRAFT':
+      return <T>Draft</T>;
     default:
       return <T>Open</T>;
   }
