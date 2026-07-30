@@ -36,13 +36,14 @@ list(
   ${CMAKE_CURRENT_SOURCE_DIR}/PrettyPrinters.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/PrivHelperMain.cpp
 )
-add_library(
-  eden_service_thrift_util STATIC
-  PrettyPrinters.cpp
-)
+# PrettyPrinters is header-only: PrettyPrinters.cpp was deleted in "avoid
+# allocation in PrettyPrinter formatters", and BUCK agrees (cpp_library
+# "pretty_printers" declares headers with no srcs). ThriftUtil.cpp, despite this
+# target's name, is already compiled into eden_service via the SERVICE_SRCS glob.
+add_library(eden_service_thrift_util INTERFACE)
 target_link_libraries(
   eden_service_thrift_util
-  PUBLIC
+  INTERFACE
     eden_model
     Folly::folly
 )
@@ -77,6 +78,11 @@ target_link_libraries(
     cpptoml
     edencommon::edencommon_utils
 )
+
+if (EDEN_HAVE_RUST_THRIFT_CLIENTS)
+  target_link_libraries(eden_service PUBLIC redirect_ffi)
+  target_compile_definitions(eden_service PUBLIC EDEN_HAVE_REDIRECT_FFI)
+endif()
 
 if (NOT WIN32)
   target_link_libraries(

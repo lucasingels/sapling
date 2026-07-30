@@ -5,7 +5,7 @@
 
 # Due to some tools changing '-' to '_' when building,
 # this library/crate is named using an '_' so that it can link successfully.
-rust_static_library(rust_edenfs_ffi CRATE edenfs_ffi USE_CXX_INCLUDE)
+rust_static_library(rust_edenfs_ffi CRATE edenfs_ffi PACKAGE sapling-edenfs_ffi USE_CXX_INCLUDE)
 
 install_rust_static_library(
   rust_edenfs_ffi
@@ -68,6 +68,17 @@ else()
     edenfs_ffi
     PRIVATE
       CURL::libcurl
+  )
+endif()
+
+# The whoami crate calls SCDynamicStoreCopyComputerName and the vendored curl
+# calls SCDynamicStoreCopyProxies; PUBLIC because the framework must reach the
+# final binaries that link this static library.
+if (APPLE)
+  target_link_libraries(
+    edenfs_ffi
+    PUBLIC
+    "-framework SystemConfiguration"
   )
 endif()
 

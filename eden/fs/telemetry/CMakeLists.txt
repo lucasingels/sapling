@@ -5,7 +5,6 @@
 
 file(GLOB TELEMETRY_SRCS "*.cpp")
 
-
 add_library(
   eden_telemetry STATIC
     ${TELEMETRY_SRCS}

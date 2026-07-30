@@ -15,6 +15,11 @@
 
 namespace sapling {
 
+std::unique_ptr<folly::IOBuf> sapling_iobuf_from_bytes(
+    rust::Slice<const uint8_t> bytes) {
+  return folly::IOBuf::copyBuffer(bytes.data(), bytes.size());
+}
+
 void sapling_backingstore_get_tree_batch_handler(
     std::shared_ptr<GetTreeBatchResolver> resolver,
     size_t index,

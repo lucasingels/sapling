@@ -15,6 +15,10 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 anyhow = "1.0.103"
+# Direct dep only to force the "pure" (Rust-only) implementation via feature
+# unification: the crate's vendored C objects otherwise duplicate the
+# libblake3.a symbols when both are linked into edenfs.
+blake3 = { version = "1.8.2", features = ["pure"] }
 arc-swap = { version = "1.9.2", features = ["weak"] }
 blob = { version = "0.1.0", path = "../blob" }
 cxx = "1.0.194"
@@ -35,7 +39,7 @@ sapling-manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
 sapling-metrics = { version = "0.1.0", path = "../metrics" }
 sapling-pathmatcher = { version = "0.1.0", path = "../pathmatcher" }
 sapling-progress-model = { version = "0.1.0", path = "../progress/model" }
-sapling-repo = { version = "0.1.0", path = "../repo" }
+sapling-repo = { version = "0.1.0", path = "../repo", features = ["wdir"] }
 sapling-revisionstore = { version = "0.1.0", path = "../revisionstore" }
 sapling-storemodel = { version = "0.1.0", path = "../storemodel" }
 sapling-testutil = { version = "0.1.0", path = "../util/testutil" }

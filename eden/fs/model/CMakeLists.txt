@@ -18,4 +18,6 @@ target_link_libraries(
 )
 
 add_subdirectory(git)
-add_subdirectory(test)
+if(BUILD_TESTS)
+  add_subdirectory(test)
+endif()

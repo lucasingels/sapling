@@ -161,13 +161,18 @@ pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("eden/scm/lib/backingstore/include/ffi.h");
 
+        // Opaque here rather than `= iobuf::IOBuf`: the Rust iobuf crate
+        // (folly bindings) lives in fbsource and is not in the OSS export.
+        // The IOBuf is built C++-side via sapling_iobuf_from_bytes instead.
         #[namespace = "folly"]
-        type IOBuf = iobuf::IOBuf;
+        type IOBuf;
 
         type GetTreeBatchResolver;
         type GetTreeAuxBatchResolver;
         type GetBlobBatchResolver;
         type GetFileAuxBatchResolver;
+
+        fn sapling_iobuf_from_bytes(bytes: &[u8]) -> UniquePtr<IOBuf>;
 
         unsafe fn sapling_backingstore_get_tree_batch_handler(
             resolve_state: SharedPtr<GetTreeBatchResolver>,
@@ -769,7 +774,7 @@ pub fn sapling_backingstore_get_blob(
         FetchContext::new_with_mode_and_cause(FetchMode::from(fetch_mode), FetchCause::EdenUnknown),
         node,
     );
-    let (data, error) = resolve_result!(res, transform_some: |blob: blob::Blob| blob.into_iobuf().into(), replace_none: UniquePtr::null());
+    let (data, error) = resolve_result!(res, transform_some: |blob: blob::Blob| ffi::sapling_iobuf_from_bytes(&blob.into_vec()), replace_none: UniquePtr::null());
     ffi::GetBlobResult { data, error }
 }
 
@@ -808,7 +813,10 @@ pub fn sapling_backingstore_get_blob_batch(
                         )
                     }
                 }
-                Some(blob) => (UniquePtr::null(), blob.into_iobuf().into()),
+                Some(blob) => (
+                    UniquePtr::null(),
+                    ffi::sapling_iobuf_from_bytes(&blob.into_vec()),
+                ),
             },
             Err(error) => (into_backingstore_err(error), UniquePtr::null()),
         };

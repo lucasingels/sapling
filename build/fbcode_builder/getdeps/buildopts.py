@@ -327,9 +327,14 @@ class BuildOptions:
             brew_packages = manifest.resolved_system_packages.get("homebrew", [])
             for p in brew_packages:
                 found = self.add_homebrew_package_to_env(p, env)
-                # Try extra hard to find openssl, needed with homebrew on macOS
+                # Try extra hard to find openssl, needed with homebrew on macOS.
+                # `brew --prefix` resolves the alias to the current keg
+                # (e.g. openssl -> openssl@3); openssl@1.1 is kept as a
+                # fallback for hosts that still have only the old keg.
                 if found and p.startswith("openssl"):
-                    candidate = homebrew_package_prefix("openssl@1.1")
+                    candidate = homebrew_package_prefix(p) or homebrew_package_prefix(
+                        "openssl@1.1"
+                    )
                     # pyre-fixme[6]: For 1st argument expected
                     #  `Union[PathLike[bytes], PathLike[str], bytes, int, str]` but got
                     #  `Optional[str]`.

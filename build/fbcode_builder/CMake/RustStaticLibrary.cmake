@@ -105,12 +105,19 @@ set_property(GLOBAL APPEND PROPERTY JOB_POOLS rust_job_pool=1)
 # headers with the interface library.
 #
 function(rust_static_library TARGET)
-  fb_cmake_parse_args(ARG "USE_CXX_INCLUDE" "CRATE;FEATURES" "" "${ARGN}")
+  fb_cmake_parse_args(ARG "USE_CXX_INCLUDE" "CRATE;PACKAGE;FEATURES" "" "${ARGN}")
 
   if(DEFINED ARG_CRATE)
     set(crate_name "${ARG_CRATE}")
   else()
     set(crate_name "${TARGET}")
+  endif()
+  # The cargo package name (`-p`) can differ from the library/artifact name
+  # (`[lib] name`), e.g. package sapling-backingstore builds libbackingstore.a.
+  if(DEFINED ARG_PACKAGE)
+    set(package_name "${ARG_PACKAGE}")
+  else()
+    set(package_name "${crate_name}")
   endif()
   if(DEFINED ARG_FEATURES)
     set(features --features ${ARG_FEATURES})
@@ -124,9 +131,9 @@ function(rust_static_library TARGET)
   set(rust_staticlib "${CMAKE_CURRENT_BINARY_DIR}/${target_dir}/${staticlib_name}")
 
   if(DEFINED ARG_FEATURES)
-    set(cargo_flags build $<IF:$<CONFIG:Debug>,,--release> -p ${crate_name} --features ${ARG_FEATURES} --config fbcode_build=false)
+    set(cargo_flags build $<IF:$<CONFIG:Debug>,,--release> -p ${package_name} --features ${ARG_FEATURES} --config fbcode_build=false)
   else()
-    set(cargo_flags build $<IF:$<CONFIG:Debug>,,--release> -p ${crate_name} --config fbcode_build=false)
+    set(cargo_flags build $<IF:$<CONFIG:Debug>,,--release> -p ${package_name} --config fbcode_build=false)
   endif()
   if(USE_CARGO_VENDOR)
     set(extra_cargo_env "CARGO_HOME=${RUST_CARGO_HOME}")

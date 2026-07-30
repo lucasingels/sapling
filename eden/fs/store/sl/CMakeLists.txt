@@ -22,5 +22,7 @@ target_link_libraries(
 )
 
 if (NOT WIN32)
- add_subdirectory(test)
+ if(BUILD_TESTS)
+   add_subdirectory(test)
+ endif()
 endif()

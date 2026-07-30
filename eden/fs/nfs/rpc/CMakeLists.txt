@@ -34,4 +34,8 @@ target_link_libraries(
     eden_utils
 )
 
-add_subdirectory(test)
+if(BUILD_TESTS)
+
+  add_subdirectory(test)
+
+endif()

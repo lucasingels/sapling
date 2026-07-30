@@ -10,6 +10,7 @@
 #include <folly/Range.h>
 #include <folly/container/FBVector.h>
 #include <folly/futures/Future.h>
+#include <folly/io/IOBuf.h>
 #include <rust/cxx.h>
 #include <cstdint>
 #include <optional>
@@ -36,6 +37,14 @@ struct TreeAuxData;
 struct Blob;
 struct FileAuxData;
 class TreeBuilder;
+
+/**
+ * OSS substitute for the fbsource-internal Rust iobuf crate: the cxx bridge
+ * keeps its folly::IOBuf-typed signatures, but the buffer is built on the
+ * C++ side (one copy) instead of via Rust folly bindings.
+ */
+std::unique_ptr<folly::IOBuf> sapling_iobuf_from_bytes(
+    rust::Slice<const uint8_t> bytes);
 
 /**
  * Resolver used in the processing of getTreeBatch requests.

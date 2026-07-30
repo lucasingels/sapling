@@ -15,6 +15,10 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 anyhow = "1.0.103"
+# Direct dep only to force the "pure" (Rust-only) implementation via feature
+# unification: the crate's vendored C objects otherwise duplicate the
+# libblake3.a symbols when both are linked into edenfs.
+blake3 = { version = "1.8.2", features = ["pure"] }
 cxx = "1.0.194"
 cxxerror = { version = "0.1.0", path = "cxxerror" }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }

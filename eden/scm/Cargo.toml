@@ -1,5 +1,11 @@
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
+# Cargo.lock already resolves wezterm-dynamic to this git rev, but nothing declared
+# it, so any cargo invocation that re-resolves (e.g. the edenfs_ffi cxx bridge driven
+# by RustStaticLibrary.cmake) falls back to crates.io 0.2.1, which lacks the "std"
+# feature that lib/io, lib/io/term/style, lib/progress/render, streampager and
+# pytermwiz all request. Make the lock's choice explicit.
+wezterm-dynamic = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
 
 [workspace]
 members = [

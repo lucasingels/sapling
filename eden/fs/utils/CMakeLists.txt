@@ -30,6 +30,10 @@ target_link_libraries(
     eden_service_thrift_cpp
     Folly::folly
     edencommon::edencommon_utils
+    # EdenError.h includes backingstore's SaplingBackingStoreError.h, which
+    # needs the rust/cxx.h header that the backingstore cxxbridge target
+    # generates and exports (BUCK: //eden/scm/lib/backingstore:backingstore).
+    backingstore
 )
 
 if (WIN32)
@@ -42,4 +46,8 @@ if (WIN32)
   )
 endif()
 
-add_subdirectory(test)
+if(BUILD_TESTS)
+
+  add_subdirectory(test)
+
+endif()
