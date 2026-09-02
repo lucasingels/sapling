@@ -41,13 +41,16 @@ macro(fb_find_thrift_python_runtime)
     # fbthrift-python, not in Apache Thrift, so it's an unambiguous check.
     # If not available, auto-install the wheel from getdeps build output.
     execute_process(
-      COMMAND "${Python3_EXECUTABLE}" -c
-        "import thrift.python.types; import thrift, os; print(os.path.dirname(os.path.dirname(thrift.__file__)))"
+      COMMAND "${Python3_EXECUTABLE}" -I -c
+        "import thrift.python.types, thrift.python, os; p = list(thrift.python.__path__)[0]; print(os.path.dirname(os.path.dirname(p)))"
       OUTPUT_VARIABLE THRIFT_PYTHON_SITE_PACKAGES
       OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET
+      ERROR_VARIABLE _thrift_err
       RESULT_VARIABLE _thrift_result
     )
+    if(NOT _thrift_result EQUAL 0)
+      message(STATUS "thrift-python probe failed (${_thrift_result}): ${_thrift_err}")
+    endif()
     if(NOT _thrift_result EQUAL 0 OR NOT THRIFT_PYTHON_SITE_PACKAGES)
       # Not pip-installed yet — auto-install from getdeps build output
       file(GLOB _fbthrift_wheels
@@ -62,8 +65,8 @@ macro(fb_find_thrift_python_runtime)
         )
         if(_pip_result EQUAL 0)
           execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c
-              "import thrift.python.types; import thrift, os; print(os.path.dirname(os.path.dirname(thrift.__file__)))"
+            COMMAND "${Python3_EXECUTABLE}" -I -c
+              "import thrift.python.types, thrift.python, os; p = list(thrift.python.__path__)[0]; print(os.path.dirname(os.path.dirname(p)))"
             OUTPUT_VARIABLE THRIFT_PYTHON_SITE_PACKAGES
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET
@@ -87,7 +90,7 @@ macro(fb_find_thrift_python_runtime)
     # folly-python doesn't produce a wheel; it installs directly to
     # a site-packages directory under its getdeps prefix.
     execute_process(
-      COMMAND "${Python3_EXECUTABLE}" -c
+      COMMAND "${Python3_EXECUTABLE}" -I -c
         "import folly, os; print(os.path.dirname(os.path.dirname(folly.__file__)))"
       OUTPUT_VARIABLE FOLLY_PYTHON_SITE_PACKAGES
       OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -139,7 +142,7 @@ endmacro()
 function(add_fbthrift_python_library LIB_NAME THRIFT_FILE)
   # Parse the arguments
   set(one_value_args NAMESPACE THRIFT_INCLUDE_DIR)
-  set(multi_value_args SERVICES DEPENDS OPTIONS)
+  set(multi_value_args SERVICES DEPENDS OPTIONS EXTRA_INCLUDE_DIRS)
   fb_cmake_parse_args(
     ARG "" "${one_value_args}" "${multi_value_args}" "${ARGN}"
   )
@@ -148,6 +151,12 @@ function(add_fbthrift_python_library LIB_NAME THRIFT_FILE)
     set(ARG_THRIFT_INCLUDE_DIR "include/thrift-files")
   endif()
 
+  # Allow absolute thrift paths (e.g. installed dependency thrift files)
+  if(IS_ABSOLUTE "${THRIFT_FILE}")
+    set(_thrift_file_path "${THRIFT_FILE}")
+  else()
+    set(_thrift_file_path "${CMAKE_CURRENT_SOURCE_DIR}/${THRIFT_FILE}")
+  endif()
   get_filename_component(base ${THRIFT_FILE} NAME_WE)
   set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/${THRIFT_FILE}-python")
 
@@ -192,6 +201,11 @@ function(add_fbthrift_python_library LIB_NAME THRIFT_FILE)
       "$<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>"
       "$<INSTALL_INTERFACE:${ARG_THRIFT_INCLUDE_DIR}>"
   )
+  foreach(inc_dir IN LISTS ARG_EXTRA_INCLUDE_DIRS)
+    target_include_directories(
+      "${LIB_NAME}.thrift_includes" INTERFACE "$<BUILD_INTERFACE:${inc_dir}>"
+    )
+  endforeach()
   foreach(dep IN LISTS ARG_DEPENDS)
     target_link_libraries(
       "${LIB_NAME}.thrift_includes"
@@ -229,11 +243,11 @@ function(add_fbthrift_python_library LIB_NAME THRIFT_FILE)
       "${thrift_include_options}"
       -I "${FBTHRIFT_INCLUDE_DIR}"
       -o "${output_dir}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/${THRIFT_FILE}"
+      "${_thrift_file_path}"
     WORKING_DIRECTORY
       "${CMAKE_BINARY_DIR}"
     MAIN_DEPENDENCY
-      "${THRIFT_FILE}"
+      "${_thrift_file_path}"
     DEPENDS
       "${FBTHRIFT_COMPILER}"
   )
@@ -306,6 +320,10 @@ function(add_fb_thrift_python_executable TARGET)
       COMMAND ${CMAKE_COMMAND} -E create_symlink
         "${THRIFT_PYTHON_SITE_PACKAGES}/thrift/python"
         "${target_dir}/thrift/python"
+      # thrift.python.client.async_client imports thrift.py3 at module init
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+        "${THRIFT_PYTHON_SITE_PACKAGES}/thrift/py3"
+        "${target_dir}/thrift/py3"
       COMMENT "Symlinking thrift.python C extensions into ${TARGET}"
     )
   else()

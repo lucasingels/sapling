@@ -11,7 +11,9 @@ repo_url = https://github.com/facebook/folly.git
 builder = cmake
 job_weight_mib = 1024
 
-[build.not(os=linux)]
+# The python-extensions build was Linux-only upstream; darwin enabled for
+# this fork so edenfsctl.real's thrift-python runtime can exist on macOS.
+[build.os=windows]
 builder = nop
 
 [dependencies]
@@ -64,7 +66,7 @@ fbcode/folly = folly
 ^fbcode/folly/folly-config\.h$
 ^fbcode/folly/public_tld/build/facebook_.*
 
-[cmake.defines.os=linux]
+[cmake.defines.any(os=linux,os=darwin)]
 PYTHON_EXTENSIONS=ON
 BUILD_SHARED_LIBS=ON
 

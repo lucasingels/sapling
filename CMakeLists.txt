@@ -121,6 +121,7 @@ include(EdenCompilerSettings)
 include(EdenConfigChecks)
 include(FBPythonBinary)
 include(FBThriftLibrary)
+include(FBThriftPythonLibrary)
 include(RustStaticLibrary)
 
 include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR})

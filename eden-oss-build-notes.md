@@ -321,6 +321,79 @@ Runtime note: `edenfs` links lmdb as a shared library that getdeps names
 - **Blob hashing in the Rust bridges uses blake3's Rust implementation**
   instead of the C/asm one (still NEON on arm64).
 
+## The thrift-python runtime port (for edenfsctl.real)
+
+The Python CLI needs the thrift-python runtime (`thrift.python.*` +
+`folly.iobuf` C extensions), which upstream only ever built on Linux
+(`builder = nop` elsewhere in the fbthrift-python/folly-python manifests).
+Ported to macOS over ~34 iterations; status: **the runtime imports and works**
+with the plain wheel plus one shared dylib path:
+
+- Working proof:
+  `DYLD_LIBRARY_PATH=<installed>/folly-python/lib:<build>/fbthrift-python/lib`
+  `PYTHONPATH=<thrift-wheel-target>:<folly-python build lib.macosx dir>`
+  → `import folly.iobuf, thrift.python.types` succeeds.
+- **Do NOT use the delocated/self-contained wheel**: vendored copies of
+  gflags/folly inside the wheel dual-register against the folly package's
+  copies (and delocate also vendored libpython itself → segfault). One shared
+  set of dylibs, no vendoring, is the only sound layout here.
+- Environment (all machine-local): brew cython (CLI) + a cp310 site dir at
+  scratchpad/cython310 with Cython/setuptools/pip/delocate injected via
+  PYTHONPATH; `Python3_EXECUTABLE` pinned to brew python@3.10;
+  `-DGLOG_USE_GLOG_EXPORT` in CMAKE_C/CXX_FLAGS; brew python@3.10's broken
+  pyexpat repointed at brew expat (bottle bug: system libexpat lacks
+  `XML_SetAllocTrackerActivationThreshold`, silently breaking
+  `platform.mac_ver()`).
+- Manifest fixes (committed-able, in our repo): fbthrift-python deps gained
+  libevent-python; libevent-python builds from source on darwin (brew libevent
+  has no CMake config); both wheel manifests enabled on darwin.
+- Fetched-checkout patches (folly + fbthrift, all upstreamable):
+  - folly: real source root BEFORE cybld staging dir (case-insensitive FS
+    resolves `folly/Executor.h` to folly-python's `executor.h`).
+  - fbthrift: pxd hint for `<prefix>/include`; streaming api-header OUTPUT
+    paths + degenerate self-symlink mappings fixed (self-link destroyed the
+    generated header → ELOOP masquerading as file-not-found); sink.pyx output
+    renamed (case-collision with handwritten Sink.cpp, which is itself renamed
+    SinkImpl.cpp for the build_ext pass); api step made rerun-safe; Libiberty
+    optional (mac libiberty lacks the demanglers); whole-archive linking via
+    `$<LINK_LIBRARY:WHOLE_ARCHIVE,...>` with rpcmetadata/thriftmetadata
+    demoted to on-demand (duplicate generated symbols);
+    `-undefined dynamic_lookup` + `-headerpad_max_install_names`; libpython
+    suffix handling (.dylib); aio/unwind Linux-only in setup.py; auditwheel →
+    delocate on darwin.
+- Cython 3.2 idempotency bug patched in our vendored copy (refuses to
+  overwrite its own api headers).
+
+**DONE (2026-07-30 evening): `edenfsctl.real --version` and `--help` work.**
+The wiring that finished the job:
+
+- `add_fbthrift_python_library` calls for eden.thrift (NAMESPACE
+  eden.fs.service, SERVICES EdenService), eden_config.thrift, overlay.thrift
+  (NAMESPACE facebook.eden), and fb303_core.thrift (absolute path from the
+  installed fb303; module extended to accept absolute thrift files and extra
+  include dirs). The CLI needs exactly two thrift-python modules:
+  eden.fs.service.eden and facebook.eden.overlay.
+- `edenfsctl.real` switched to `add_fb_thrift_python_executable` (dir-type;
+  C extensions cannot load from zipapps); the bundler now also symlinks
+  thrift/py3 (async_client imports it at init).
+- FBPythonBinary.cmake honors `Python3_EXECUTABLE` from the environment:
+  CMP0074 is OLD here so `Python3_ROOT_DIR` env is ignored, FindPython3
+  otherwise prefers the newest python (3.14) over the pinned 3.10, and
+  getdeps deletes CMakeCache.txt on reconfigure so cache pinning cannot work.
+- The runtime discovery probes in FBThriftPythonLibrary.cmake run `python -I`
+  (getdeps puts a legacy thrift package on PYTHONPATH, and the build dir cwd
+  contains a `thrift/` directory — both shadow the wheel) and derive
+  site-packages from `thrift.python.__path__` (the wheel's `thrift` is a
+  namespace package; `thrift.__file__` is None).
+- Machine state the runtime relies on (redo after scratch wipes):
+  the plain wheel pip-installed into brew python@3.10; folly's python package
+  copied to `installed/folly-python/lib/python3.10/site-packages` with a
+  `folly-python.pth` in brew 3.10's site-packages pointing at it; runtime
+  dylibs (folly-python + fbthrift-python lib/) symlinked into
+  `/opt/homebrew/lib` (dyld resolves @rpath references via python's own
+  rpath; the extensions were linked without headerpad so their load commands
+  cannot be rewritten).
+
 ## Loose ends
 
 - All working-tree changes above are **uncommitted**; commit once the build is

@@ -10,6 +10,14 @@ add_fbthrift_library(
   PY_NAMESPACE facebook.eden.overlay
 )
 
+# thrift-python (mstch_python) codegen for the modern CLI imports
+# (facebook.eden.overlay.thrift_types).
+add_fbthrift_python_library(
+  eden_overlay_thrift_python
+  overlay.thrift
+  NAMESPACE facebook.eden
+)
+
 add_library(
   eden_overlay_checker
   STATIC

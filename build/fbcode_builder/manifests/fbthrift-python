@@ -17,7 +17,9 @@ fbthrift = thrift/lib/rust
 builder = cmake
 job_weight_mib = 2048
 
-[build.not(os=linux)]
+# The thrift-python wheel build was Linux-only upstream; darwin enabled for
+# this fork so edenfsctl.real's thrift-python runtime can exist on macOS.
+[build.os=windows]
 builder = nop
 
 [cmake.defines.all(not(os=windows),test=on)]
@@ -26,7 +28,7 @@ enable_tests=ON
 [cmake.defines.any(os=windows,test=off)]
 enable_tests=OFF
 
-[cmake.defines.os=linux]
+[cmake.defines.any(os=linux,os=darwin)]
 thrift_python=ON
 
 [dependencies]
@@ -35,6 +37,7 @@ fizz-python
 fmt-python
 folly-python
 googletest
+libevent-python
 libsodium
 wangle-python
 zstd-python

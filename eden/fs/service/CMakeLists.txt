@@ -24,6 +24,33 @@ add_fbthrift_library(
     eden_service_thrift
 )
 
+# thrift-python (mstch_python) codegen for the modern CLI imports
+# (eden.fs.service.eden.thrift_types / thrift_clients). eden.thrift includes
+# fb303_core.thrift, whose python module must exist too; its thrift file
+# comes from the installed fb303 dependency.
+find_path(FB303_THRIFT_INCLUDE_DIR
+  NAMES fb303/thrift/fb303_core.thrift
+  PATH_SUFFIXES include/thrift-files
+)
+if(FB303_THRIFT_INCLUDE_DIR)
+  add_fbthrift_python_library(
+    fb303_core_thrift_python
+    "${FB303_THRIFT_INCLUDE_DIR}/fb303/thrift/fb303_core.thrift"
+    SERVICES BaseService
+    EXTRA_INCLUDE_DIRS "${FB303_THRIFT_INCLUDE_DIR}"
+  )
+  add_fbthrift_python_library(
+    eden_service_thrift_python
+    eden.thrift
+    NAMESPACE eden.fs.service
+    SERVICES EdenService
+    DEPENDS
+      eden_config_thrift_python
+      fb303_core_thrift_python
+    EXTRA_INCLUDE_DIRS "${FB303_THRIFT_INCLUDE_DIR}"
+  )
+endif()
+
 file(GLOB SERVICE_SRCS "*.cpp")
 
 # A couple utility files our split out into a separate lower-level library
