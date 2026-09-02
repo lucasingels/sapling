@@ -392,17 +392,125 @@ The wiring that finished the job:
   dylibs (folly-python + fbthrift-python lib/) symlinked into
   `/opt/homebrew/lib` (dyld resolves @rpath references via python's own
   rpath; the extensions were linked without headerpad so their load commands
-  cannot be rewritten).
+  cannot be rewritten). **Superseded 2026-09-02**: the extensions now carry
+  rpaths into the scratch and `mise run install-eden-python-runtime` does the
+  install — see the dated subsection below.
+
+### 2026-09-02: the patches are patch files now (re-derived after the scratch purge)
+
+The July fetched-checkout edits only existed inside `$TMPDIR` and were lost with it; they were re-derived from the prose above and now live in the repo, applied by getdeps itself:
+
+- `build/fbcode_builder/patches/folly-python-darwin.patch` (wired via `patchfile =` in `manifests/folly-python`) and `build/fbcode_builder/patches/fbthrift-python-darwin.patch` (`manifests/fbthrift-python`). Both start with a header block that explains every hunk; `git apply` ignores the preamble. getdeps applies a patch from the checkout root once per checkout (`.getdeps_patched` sentinel), and since `folly`/`folly-python` (and `fbthrift`/`fbthrift-python`) share a checkout the patchfile hangs off the `-python` manifests. Proven: checkouts reset to clean, sentinels removed, `build/` + `installed/` for both projects deleted, `mise run build-eden-python` → `Patching folly-python with folly-python-darwin.patch ...`, `Patching fbthrift-python with fbthrift-python-darwin.patch ...`, exit 0 (the whole `-python` chain rebuilt in ~4 minutes thanks to sccache).
+- Everything darwin-specific is behind `if(APPLE)` / `sys.platform == "darwin"`; the remaining hunks (interpreter pinning, include order, Sink staging rename, rerun-safety, `Extension` hashability) are no-ops or plain bug fixes on Linux, so both patches are upstream candidates as they stand.
+- Also enabled on darwin: `fizz-python`, `mvfst-python`, `wangle-python` (static PIC, they end up inside `libthrift_python_cpp.dylib`). The July prose did not mention them, but they are `builder = nop` off Linux upstream and fbthrift's CMake does `find_package(mvfst CONFIG REQUIRED)`; brew has no mvfst, and brew's fizz/wangle kegs are built against brew's folly, so linking them against our shared folly-python would be an ABI gamble. Cost: ~10 minutes of extra build the first time.
+
+What differed from the July prose, per project:
+
+- folly (`folly/python/CMakeLists.txt`): the include-order fix (real folly root BEFORE cybld, case-insensitive `folly/Executor.h` vs `executor.h`) is the one item the notes described and it is still needed. New: setup.py is run with `${Python3_EXECUTABLE}` instead of PATH's `python3`, and on APPLE the build_ext/bdist_wheel passes get `LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-rpath,<prefix>/lib` so `folly.iobuf`/`folly.executor` find `@rpath/libfolly*.dylib` without any environment. Upstream folly meanwhile grew a wheel + `pip install --prefix` install step, so `installed/folly-python/lib/python3.10/site-packages/folly` now appears by itself; the July hand copy and `folly-python.pth` are obsolete.
+- fbthrift (`thrift/lib/python/CMakeLists.txt`, `thrift/lib/python/test/CMakeLists.txt`, `thrift/lib/setup.py`): pxd hint for `<prefix>/include`, Libiberty optional (APPLE: none), `Sink.cpp` staged as `SinkImpl.cpp` (and `Sink.h` as `SinkImpl.h` — `sink.pyx` has a `cdef public api` function so Cython emits `sink.h` too), `$<LINK_LIBRARY:WHOLE_ARCHIVE,...>` per archive with `rpcmetadata`/`thriftmetadata` on demand, `-undefined dynamic_lookup` + `-headerpad_max_install_names` for both the dylib and the extensions, `.dylib`-aware `--libpython` parsing (and no libpython link on darwin at all), `aio`/`unwind` Linux-only: all as described. Differences: (1) no delocate — the APPLE branch installs the PLAIN wheel from `dist/` to `share/thrift/wheels` and skips auditwheel; `test/CMakeLists.txt` (built unconditionally, even with tests off) globbed `dist_self_contained/` and is pointed at `dist/` on APPLE. (2) The "streaming api-header OUTPUT paths + self-symlink mappings" item is gone: the Jul 27 fbthrift rev already has correct paths. (3) New, twice: the wheel step copies folly's python package (with `executor.h`, `iobuf.h`, ...) into `cybld/folly`, so on the second `ninja` run `<folly/Executor.h>` resolved to `cybld/folly/executor.h` — for `thrift_python_cpp` both cybld and `FOLLY_INCLUDE_DIR` are now SYSTEM includes with folly BEFORE (the compiler searches every `-I` before any `-isystem`, and folly's dir is already `-isystem` via the imported target, so a plain `-I` could never win), and `CYTHON_INCLUDE_PATH` lists `FOLLY_INCLUDE_DIR` first while setup.py moves `"."` last on darwin. (4) `setup.py`: recent setuptools makes `Extension` unhashable; the test-extension filter used sets (TypeError on every platform). (5) The extension link `-Wl,-rpath` entries are `<prefix>/lib` and `<folly prefix>/lib`; the extensions link only `libthrift_python_cpp` directly, whose own rpaths come from fbthrift's `CMAKE_INSTALL_RPATH_USE_LINK_PATH`.
+
+Cython: `py310-tools` had Cython 3.3.0, which crashes on `thrift/py3/converter.pyx` (`TypeError: sequence item 0: expected str instance, NoneType found` in `ExprNodes.generate_sequence_as_array_code`). Downgraded to 3.2.9 (`pip install --target py310-tools --upgrade Cython==3.2.9`, then delete the stale `cython-3.3.0.dist-info`). The "idempotency bug" is real in 3.2.9 and the code is identical in 3.3.0: for modules whose api header pulls in utility code, the file starts with `/* EnumClassDecl.proto */` instead of `/* Generated by Cython x.y.z */`, and the next run refuses to overwrite it ("The output file already exists and does not look like it was generated by Cython: python_async_processor_api.h"). Instead of patching Cython, `setup.py` now removes such stale `*_api.h` files (only regular files that lack the marker) before both the `--api-only` and the `cythonize` pass, and the `--api-only` pass finally fails loudly on Cython errors instead of leaving stale headers behind. Verified by deleting one api header and re-running the `thrift_python_types_bindings` target with the non-marker headers in place.
+
+Runtime install, replacing the July `/opt/homebrew/lib` symlinks and `.pth`: `mise run install-eden-python-runtime` → `build/fbcode_builder/darwin-thrift-python-runtime.sh`. It pip-installs the plain wheel (which bundles `folly.iobuf`/`folly.executor` — upstream copies folly's package into the wheel now) into brew python@3.10's site-packages with `--force-reinstall`, removes the stale July `folly/` dir and `folly-python.pth`, and probes `python3.10 -I -c 'import folly.iobuf, thrift.python.types'`. Nothing else is needed: the extension modules carry `LC_RPATH` entries for `$GETDEPS_SCRATCH/installed/fbthrift-python/lib` and `.../folly-python/lib`, `libthrift_python_cpp.dylib` has the same two, and every other dependency resolves by absolute brew path. Consequence: the runtime is bound to the scratch path; move the scratch and re-run `build-eden-python` + `install-eden-python-runtime`. (The `/opt/homebrew/lib/libfolly*`/`libthrift*` symlinks found on this machine are brew's own `folly`/`fbthrift` kegs, not July leftovers; nothing dangling was left to remove.)
+
+Verification (2026-09-02):
+
+```
+$ /opt/homebrew/opt/python@3.10/bin/python3.10 -I -c 'import folly.iobuf, thrift.python.types; print("ok")'
+ok
+$ mise run build-eden-python        # clean checkouts, build/ + installed/ of both projects deleted first
+Patching folly-python with folly-python-darwin.patch in .../repos/github.com-facebook-folly.git
+Patching fbthrift-python with fbthrift-python-darwin.patch in .../repos/github.com-facebook-fbthrift.git
+exit=0
+$ mise run install-eden-python-runtime
+installing thrift-0.0.1-cp310-cp310-macosx_26_0_arm64.whl into /opt/homebrew/lib/python3.10/site-packages
+thrift-python runtime ok: /opt/homebrew/lib/python3.10/site-packages/thrift
+folly: /opt/homebrew/lib/python3.10/site-packages/folly
+$ mise run build-eden                # exit 0; CMake log:
+-- Found thrift-python runtime: /opt/homebrew/lib/python3.10/site-packages
+-- Found folly-python runtime: /opt/homebrew/lib/python3.10/site-packages
+$ $GETDEPS_SCRATCH/build/eden/eden/fs/cli/edenfsctl.real/__main__.py --version
+Installed: 20260902-131848
+Running:   Unknown (EdenFS does not appear to be running)
+$ $GETDEPS_SCRATCH/build/eden/eden/fs/cli/edenfsctl.real/__main__.py --help
+usage: edenfsctl [-h] [--config-dir CONFIG_DIR] [--etc-eden-dir ETC_EDEN_DIR]
+                 [--home-dir HOME_DIR] [--version] [--debug]
+                 COMMAND ...
+```
+
+Note on getdeps logs: getdeps' own `Building X...` lines are block-buffered when stdout is a file and appear at the very end of the log, after all subprocess output — the log is not out of order, python is.
+
+## Scratch relocation (2026-09-02)
+
+The July build lived in the getdeps default scratch, `$TMPDIR/fbcode_builder_getdeps-<munged>` (`getdeps/buildopts.py`: no `mkscratch` → `tempfile.gettempdir()`). macOS purges files under `$TMPDIR` after ~3 idle days, and by 2026-09-02 the whole scratch was gone: eden-enabled `sl`, `edenfsctl.real`, the thrift-python wheels, and the folly/fbthrift fetched-checkout patches (which only ever existed as edits inside those checkouts — see "Loose ends"). Survivors: `built-eden/` (daemon + privhelper + apfs helper + dylibs via `fixup-eden`), the sccache, and the mise tasks.
+
+Every getdeps task now passes `--scratch-path "$GETDEPS_SCRATCH"` with `GETDEPS_SCRATCH=~/.local/share/getdeps/sapling` (set in `mise.local.toml`). Side benefits: the path has no symlinked components (`/var` → `/private/var` did), which matters because `PrivHelperImpl.cpp` refuses to start edenfs when `executablePath() != realpath(executablePath())`. Python build tooling for the wheel builds (Cython, setuptools, pip, wheel, delocate; brew python@3.10 ships without pip) lives in `$GETDEPS_SCRATCH/py310-tools` and is put on `PYTHONPATH` by `build-eden-python`.
+
+getdeps keys git checkouts by URL (`<scratch>/repos/github.com-facebook-folly.git`), so `folly`/`folly-python` and `fbthrift`/`fbthrift-python` share one checkout and one `.getdeps_patched` sentinel. A manifest `patchfile = <name>.patch` (applied with `git apply --ignore-space-change` from `build/fbcode_builder/patches/`, `builder.py _apply_patchfile`) is the durable way to carry the darwin python patches; attach them to the `-python` manifests.
+
+Note also: the `eden` manifest lists `sapling` only under `[dependencies.test=on]`, so with `--no-tests` the eden build does NOT produce `sl`. `mise run build-sl-eden` builds it separately into the same scratch (`make getdepsbuild` → `build.py` with getdeps features `eden sl_oss`).
+
+## EdenFS bring-up on macOS from the OSS build (recipe, from source reading 2026-09-02)
+
+All file references are in this repo. Nothing below was run yet.
+
+**Binary discovery.** The Python CLI's defaults are Meta's install layout, so set: `EDENFS_SERVER_PATH=<eden-prefix>/bin/edenfs` (`eden/fs/cli/daemon_util.py` `find_daemon_binary`, else tries `../libexec/eden/edenfs`, buck-out paths, `../edenfs`), `EDENFS_PRIVHELPER_PATH=<eden-prefix>/bin/edenfs_privhelper` (`daemon.py` hardcodes `/usr/local/libexec/eden/edenfs_privhelper` and always passes `--privhelper_path`, bypassing the daemon's sane sibling lookup), `EDENFS_CLI_PATH=<wrapper>` (the daemon runs `<edenfsctl> redirect fixup --mount <p>` on every mount, `EdenMount.cpp`; failure is non-fatal but noisy; default is a sibling `edenfsctl` next to `edenfsctl.real`), and `EDEN_HG_BINARY=<sapling-prefix>/bin/sl` (the CLI resolves clone revisions and runs `hg debugedenrunpostupdatehook`; the daemon itself never shells out to sl). `EDEN*` env vars pass through the daemon env whitelist; `DYLD_LIBRARY_PATH` does not (use `fixup-dyn-deps` or `eden start --preserved-vars DYLD_LIBRARY_PATH`). The daemon replaces PATH with `/opt/facebook/hg/bin:/usr/local/bin:/bin:/usr/bin`.
+
+**edenfsctl.real install quirk.** `add_fb_thrift_python_executable` is `TYPE dir`; `install_fb_python_executable` installs only `__main__.py` into `<prefix>/bin`, so run the build-tree directory: `<scratch>/build/eden/eden/fs/cli/edenfsctl.real/__main__.py`. Wrap it in `~/bin/edenfsctl`.
+
+**Privilege.** `daemon.py prepare_edenfs_privileges`: if the privhelper is root-owned with setuid, the daemon runs as the user and the privhelper self-elevates; otherwise the whole `edenfs` command is wrapped in `/usr/bin/sudo`. `PrivHelperImpl.cpp` additionally refuses symlinked edenfs/privhelper paths and non-root-owned privhelpers unless owned by the same uid as edenfs. Recipe: `sudo chown root:wheel edenfs_privhelper && sudo chmod 4755 edenfs_privhelper` on a non-`nosuid` filesystem. `eden start --foreground` gives the best error messages.
+
+**Mount protocol.** NFS: `eden clone --nfs` defaults to true on Apple Silicon (`main.py is_apple_silicon`), `experimental:enable-nfs-server` defaults to true on Apple (`EdenConfig.h`). The privhelper calls `mount("nfs", ...)` directly with hardcoded XDR args (`PrivHelperServer.cpp`, `args_version = 88`, may drift with macOS releases); no rpcbind/mountd needed by default. FUSE would need real macFUSE (`/Library/Filesystems/macfuse.fs/.../mount_macfuse`); the getdeps `osxfuse` manifest is headers-only. `eden_apfs_mount_helper` is only for APFS bind redirections (must be setuid at `/usr/local/libexec/eden/eden_apfs_mount_helper`, `redirect.py`); dmg/symlink redirections need Meta's `mkscratch`. Simplest: no redirections; set `[redirections] darwin-redirection-type = "symlink"`.
+
+**Config.** CLI: `~/.edenrc`, `/etc/eden/edenfs.rc`, `/etc/eden/config.d/*.toml` (daemon does NOT read `config.d`). State dir: CLI default `~/local/.eden` (passed as `--edenDir`, wins over the daemon's `~/.eden`). No `hg.binary`-style key exists. Sapling side (`~/Library/Preferences/sapling/sapling.conf`): `[edenfs] command = <edenfsctl>` and `legacy_command = <edenfsctl>` — no defaults, `edenfs_client::build_eden_command_type` aborts without them; `eden_clone` uses `legacy_command`, `eden remove` uses `command` (with `EDENFSCTL_ONLY_RUST=1`, ignored by the Python CLI).
+
+**Cloning.** `sl clone --eden` aborts with `--git` (`cmdclone/src/lib.rs`) and only handles mononoke/eager URLs, so: (1) `sl clone --git <url> <backing>` → native `.sl` repo with `.sl/store` (required: `util.get_hg_repo` sniffs `.hg`/`.sl` + `store`; a dotgit repo is classified `git` → `GitBackingStore` → "support for Git was not enabled"); (2) `eden clone --nfs <backing> <mount>` (auto-starts the daemon; `.sl/requires` of the mount gains `eden`); (3) inside the mount, `sl worktree add <dest>` — `cmdworktree` aborts unless requirements contain `eden`, then calls `clone::eden_clone` = `<legacy_command> clone <backing> <dest> [-r hex | --allow-empty-repo]`.
+
+**Ordered sequence**
+```sh
+EDEN_INST=$GETDEPS_SCRATCH/installed/eden; SL_INST=$GETDEPS_SCRATCH/installed/sapling
+EDEN_BUILD=$GETDEPS_SCRATCH/build/eden
+sudo chown root:wheel $EDEN_INST/bin/edenfs_privhelper && sudo chmod 4755 $EDEN_INST/bin/edenfs_privhelper
+printf '#!/bin/sh\nexec %s/eden/fs/cli/edenfsctl.real/__main__.py "$@"\n' "$EDEN_BUILD" > ~/bin/edenfsctl && chmod +x ~/bin/edenfsctl
+export EDENFS_SERVER_PATH=$EDEN_INST/bin/edenfs EDENFS_PRIVHELPER_PATH=$EDEN_INST/bin/edenfs_privhelper \
+       EDENFS_CLI_PATH=~/bin/edenfsctl EDEN_HG_BINARY=$SL_INST/bin/sl
+# ~/.edenrc: [clone] default-mount-protocol = "NFS"; [redirections] darwin-redirection-type = "symlink"
+# sapling.conf: [edenfs] command = ~/bin/edenfsctl ; legacy_command = ~/bin/edenfsctl
+edenfsctl start --foreground   # first run; then: edenfsctl start && edenfsctl doctor
+$SL_INST/bin/sl clone --git <url> ~/repos/<name>-backing && ls -d ~/repos/<name>-backing/.sl/store
+edenfsctl clone --nfs ~/repos/<name>-backing ~/work/<name> && grep eden ~/work/<name>/.sl/requires
+cd ~/work/<name> && $SL_INST/bin/sl worktree add ~/work/<name>-wt2
+```
+
+**Unverified:** whether `hg debugedenrunpostupdatehook` exists in the OSS `sl`; NFS XDR `args_version` vs. current macOS; whether the daemon accepts `~/.local/share/...` for the privhelper setuid bit (`nosuid` check: `mount | grep " on / "`); overlay type `legacy` behaviour at scale (`lmdb`/`sqlite` are alternatives).
+
+## The 5-7 s Thrift reply latency (2026-09-02): fbthrift reply queue vs. libevent
+
+First real daemon run on macOS. `eden start` worked (privhelper setuid root, NFS default) but `eden status` said "Thrift server does not appear to be running" because the CLI's 3 s health check timed out: **every** Thrift request took 5-7.5 s, over Rocket, Header, and the legacy py client alike, while `eden=DBG9` logging showed the handler starting 8 ms after the request and finishing in 1.6 ms. Pipelining a second request on the same connection flushed the first reply instantly, so replies were parked on the IO thread waiting for *any* wakeup.
+
+Cause (reproduced with folly alone, `<scratch>/futex-test/latency5..8.cpp`): fbthrift's per-IO-thread reply queue (`IOWorkerContext::init`) is an `EventBaseAtomicNotificationQueue` started with `startConsumingInternal`, i.e. its pipe is an `EVLIST_INTERNAL` libevent event. Stock libevent (2.1.12/2.1.13 and master) only ends an `EVLOOP_ONCE` iteration after a *non-internal* callback ran (`event_process_active_single_queue` skips internal callbacks when counting), so after the pipe fires libevent runs the callback and goes straight back to `kevent()`; `folly::EventBase::loopMain` never regains control, `runLoopCallbacks()` never runs, the queue is never re-armed (`runLoopCallback` → `arm()`), producers then get `push() == false` and stop writing the pipe, and the reply waits for an unrelated event on that IO thread (here a ~5 s jittered timer). folly's own queue is immune because `applyLoopKeepAlive` re-registers it as a normal event under `loopForever`; on busy servers the next incoming request masks it, which is why nobody notices upstream. Not fork-, nice-, resource-pool- or Rocket-related (all bisected out).
+
+Fix: `build/fbcode_builder/patches/fbthrift-darwin.patch` section (A) changes `IOWorkerContext::init` to `startConsuming(&evb)`. The patch also carries the thrift-python darwin build fixes (B) and is referenced from **both** `manifests/fbthrift` and `manifests/fbthrift-python`, because they share one checkout and one `.getdeps_patched` sentinel (only one patchfile can ever apply per checkout, so it has to be the same file on both). Upstreamable as a folly fix too (make `EventBaseAtomicNotificationQueue::execute` re-arm immediately) or a libevent fix; the fbthrift one-liner is the smallest.
+
+Also learned on the way: `edenfs_privhelper` runs setuid and dyld refuses `@executable_path`/`@loader_path` in setuid binaries ("security policy does not allow @ path expansion"), so `fixup-eden` now writes absolute paths into `built-eden/lib` for every bundled dylib and keeps an existing root-owned privhelper across refreshes; the CLI's `check_health` swallows `TransportError` into the lockfile fallback, which is why the symptom looked like "thrift not running".
+
+## First working `sl worktree` on macOS (2026-09-02, evening)
+
+After the reply-latency fix, `eden clone ~/code/core-backing ~/code/core-eden` still failed twice before working:
+
+1. **"Manifest node could not be found for commitId"** — the daemon's embedded Sapling backing store could not read the git-backed backing repo. `eden/scm/lib/backingstore/Cargo.toml` depended on `sapling-constructors` with `default-features = false`, and the constructors crate's default `git` feature is what registers the git commit-graph (`sapling-commits-git`) and git object store (`sapling-gitstore`) constructors; `lib/commands` (the `sl` binary) enables it explicitly, the backing store did not, so `factory::call_constructor` fell back to the hg store. Fixed by adding `features = ["git"]`. The vendored libgit2 this pulls in needs `-liconv` on macOS (`git_fs_path_iconv` undefined at link), added in `eden/scm/lib/backingstore/CMakeLists.txt` under `if(APPLE)`.
+2. **`sl debugedenrunpostupdatehook` → "repository not found"** — the mount worked (NFS, `Nfsd3`), but the CLI created a `.hg` dot dir: `EdenCheckout.hg_dot_path` sniffs the (not yet existing) checkout path and defaults to `.hg`, while our `sl` is built with `sl_oss` and only knows `.sl`. `hg_util.sniff_dot_dir` honours `SL_REPO_IDENTITY`/`HGIDENTITY`, so `~/bin/edenfsctl` exports both as `sl`. (A CLI-side fix — default a new checkout's dot dir to the backing repo's — would be the upstreamable version.)
+
+Then: `sl worktree add ~/code/core-eden-wt1 --label agent-test` (needs `[worktree] enabled = true`, set in `~/Library/Preferences/sapling/sapling.conf`) created a linked worktree in ~1 s; `sl worktree list` shows main + linked, `eden list` shows both mounts, `sl status`/`sl log` work in both. `[nfs] allow-apple-double = false` in `~/.edenrc` hides the `._*` files macOS writes over NFS (they showed up as untracked).
+
+Runtime layout that is now live: daemon + privhelper from `built-eden/` (privhelper root-owned setuid, absolute dylib paths), CLI = `~/bin/edenfsctl` (wrapper around `<scratch>/build/eden/eden/fs/cli/edenfsctl.real/__main__.py` pinning `EDENFS_SERVER_PATH`, `EDENFS_PRIVHELPER_PATH`, `EDENFS_CLI_PATH`, `EDEN_HG_BINARY`, `SL_REPO_IDENTITY`, `HGIDENTITY`), eden-enabled `sl` at `<scratch>/installed/sapling/bin/sl`, backing repo `~/code/core-backing` (native `.sl`, default path = Gerrit), state in `~/local/.eden`.
 
 ## Loose ends
 
-- All working-tree changes above are **uncommitted**; commit once the build is
-  green (getdeps fixes, CMake fixes, and Cargo changes are natural upstream
-  candidates — upstream `main` cannot pass its own OSS eden build today).
-- Capture the invocation as a mise task (`mise run build-eden`).
-- Consider enabling `edenfs_linux.yml` (and a macOS variant) on push/cron on
-  the fork so the CMake path stops rotting silently.
-- Cargo.lock rev pins should eventually be mirrored by rev pins in the getdeps
-  manifests so a fresh fetch can't reintroduce skew.
-- getdeps scratch lives under `$TMPDIR/fbcode_builder_getdeps-*` (path-keyed
-  to this checkout); sccache cache is global (`~/Library/Caches/Mozilla.sccache`).
+- Commit the 2026-09-02 changes (fbthrift-darwin.patch + manifests, backingstore git feature + iconv, thrift-python wheel patches/runtime script, notes). Upstream candidates: the fbthrift reply-queue fix (or a folly `EventBaseAtomicNotificationQueue::execute` re-arm), the backingstore `git` feature + iconv, a CLI fix so a new checkout's dot dir follows the backing repo.
+- The Homebrew `sl` (0.3.3) has no `eden` feature and therefore no `sl worktree`; ISL's `WorktreeSection` gates on `isEdenFs`. Decide whether the fork's release should ship the eden-enabled `sl` (and how to distribute edenfs + privhelper, which needs root at install time).
+- `mise run fixup-eden` re-creates `built-eden/`; it now preserves a root-owned privhelper, but a *changed* privhelper still needs `sudo chown root:wheel && chmod 4755` once. A stray root-owned copy sits at `/tmp/edenfs_privhelper.keep` (sudo rm).
+- py310-tools (Cython 3.2.9 pin, pip, setuptools, wheel) and the thrift wheel rpaths are bound to `$GETDEPS_SCRATCH`; re-run `build-eden-python` + `install-eden-python-runtime` after moving the scratch.
+- `sapling` is only a `test=on` dependency of the `eden` manifest; `mise run build-sl-eden` builds the eden-enabled `sl` separately.
+- Consider enabling `edenfs_linux.yml` (and a macOS variant) on push/cron on the fork so the CMake path stops rotting silently; mirror Cargo.lock rev pins in the getdeps manifests.
+- `eden start` inherits the launching shell's nice level; started from an automation shell the daemon ran at nice 5-10 and its `setpriority` calls fail (harmless warnings).

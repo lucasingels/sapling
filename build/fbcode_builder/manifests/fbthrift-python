@@ -15,6 +15,9 @@ fbthrift = thrift/lib/rust
 
 [build]
 builder = cmake
+# darwin fixes for thrift/lib/python + thrift/lib/setup.py (see the patch header). Shared checkout with
+# the fbthrift manifest, so getdeps applies it once per checkout.
+patchfile = fbthrift-darwin.patch
 job_weight_mib = 2048
 
 # The thrift-python wheel build was Linux-only upstream; darwin enabled for

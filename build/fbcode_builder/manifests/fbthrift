@@ -15,6 +15,10 @@ fbthrift = thrift/lib/rust
 
 [build]
 builder = cmake
+# Shared checkout (and .getdeps_patched sentinel) with manifests/fbthrift-python;
+# both reference the same patch so whichever builds first applies it. See the
+# patch header: reply-queue latency fix + darwin thrift-python build fixes.
+patchfile = fbthrift-darwin.patch
 job_weight_mib = 2048
 
 [cmake.defines.all(not(os=windows),test=on)]

@@ -93,3 +93,10 @@ install(
   LIBRARY DESTINATION lib
   PUBLIC_HEADER DESTINATION eden/scm/lib/backingstore/include
 )
+
+if(APPLE)
+  # The "git" constructors feature vendors libgit2 into the Rust crate, and
+  # libgit2's path code (fs_path.c) calls iconv_open/iconv/iconv_close for
+  # filename normalization on macOS.
+  target_link_libraries(backingstore PUBLIC iconv)
+endif()

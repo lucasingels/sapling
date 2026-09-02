@@ -9,6 +9,9 @@ repo_url = https://github.com/facebook/folly.git
 
 [build]
 builder = cmake
+# darwin fixes for folly/python (see the patch header). Shared checkout with
+# the folly manifest, so getdeps applies it once per checkout.
+patchfile = folly-python-darwin.patch
 job_weight_mib = 1024
 
 # The python-extensions build was Linux-only upstream; darwin enabled for

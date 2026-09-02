@@ -16,3 +16,4 @@ target/
 /eden/mononoke/tests/integration/getdeps_build.log
 /build/Testing/Temporary/LastTest.log
 /built-eden/
+/.privhelper-keep/

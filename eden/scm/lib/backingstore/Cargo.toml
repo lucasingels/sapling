@@ -28,7 +28,11 @@ flume = "0.11.1"
 log = { version = "0.4.33", features = ["kv_unstable", "kv_unstable_std"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-configloader = { version = "0.1.0", path = "../config/loader" }
-sapling-constructors = { version = "0.1.0", path = "../constructors", default-features = false }
+# "git" registers the git commit-graph and git object-store constructors, which
+# EdenFS needs to serve a `sl clone --git` (git-store) backing repo; without it
+# factory::call_constructor falls back to the hg store and every commit is
+# "cannot be found". The sl binary enables the same feature via lib/commands.
+sapling-constructors = { version = "0.1.0", path = "../constructors", default-features = false, features = ["git"] }
 sapling-eagerepo = { version = "0.1.0", path = "../eagerepo" }
 sapling-edenapi = { version = "0.1.0", path = "../edenapi" }
 sapling-http-client = { version = "0.1.0", path = "../http-client" }
