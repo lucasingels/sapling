@@ -19,6 +19,7 @@ import eden.dirstate
 from eden.fs.cli.util import (
     create_legacy_filter_id,
     get_environment_suitable_for_subprocess,
+    get_hg_binary,
     print_stderr,
 )
 
@@ -59,7 +60,7 @@ def get_filter_warning(
     backing_repo_path: Path,
 ) -> str:
     args = [
-        os.environ.get("EDEN_HG_BINARY", "hg"),
+        get_hg_binary(),
         "config",
         "sparse.filter-warning",
         "-Tjson",
@@ -88,7 +89,7 @@ def get_filter_id(
 ) -> Optional[bytes]:
     # TODO: Add a helper for determining whether "hg" or "sl" should be used
     args = [
-        os.environ.get("EDEN_HG_BINARY", "hg"),
+        get_hg_binary(),
         "debugfilterid",
         "-r",
         commit_id,
@@ -267,7 +268,7 @@ def config_file_for_dot_dir(dot_dir: str) -> str:
     return _dot_dir_config_file.get(dot_dir, "hgrc")
 
 
-def sniff_dot_dir(repo_root: Path) -> str:
+def sniff_dot_dir(repo_root: Path, fallback_root: Optional[Path] = None) -> str:
     for dot_dir in _possible_dot_dirs:
         if (repo_root / dot_dir).exists():
             return dot_dir
@@ -281,5 +282,14 @@ def sniff_dot_dir(repo_root: Path) -> str:
     env_ident = os.environ.get("HGIDENTITY") or os.environ.get("SL_IDENTITY")
     if env_ident in {"hg", "sl"}:
         return "." + env_ident
+
+    # repo_root doesn't exist yet (e.g. we're computing the dot dir for a
+    # checkout that is still being created) and no env var forced a flavor.
+    # Fall back to whatever flavor the backing repo uses, rather than always
+    # defaulting to .hg.
+    if fallback_root is not None:
+        for dot_dir in _possible_dot_dirs:
+            if (fallback_root / dot_dir).exists():
+                return dot_dir
 
     return _possible_dot_dirs[0]

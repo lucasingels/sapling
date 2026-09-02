@@ -64,9 +64,30 @@ impl EdenCmdType {
     }
 }
 
+/// Look for the `eden` CLI wrapper in the same self-contained install
+/// prefix as the running `sl` binary (release/package layout: `bin/eden`
+/// lives at `<prefix>/bin/eden`, while `sl` itself may run from a few
+/// directories below the prefix, e.g. `<prefix>/libexec/sl`). Walks upward
+/// from `sl`'s own location rather than hardcoding the exact nesting depth.
+/// Returns `None` if `sl`'s own location can't be determined or no such
+/// wrapper is found.
+fn find_sibling_eden_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) { "eden.exe" } else { "eden" };
+    let mut ancestor = exe.parent()?;
+    for _ in 0..5 {
+        ancestor = ancestor.parent()?;
+        let candidate = ancestor.join("bin").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 pub fn build_eden_command_type(config: &dyn Config, cmd_type: EdenCmdType) -> Result<Command> {
     let eden_command = config.get_opt::<String>("edenfs", cmd_type.config_key())?;
-    let mut cmd = match eden_command {
+    let mut cmd = match eden_command.map(PathBuf::from).or_else(find_sibling_eden_binary) {
         Some(cmd) => Command::new(cmd),
         None => anyhow::bail!("edenfs.{} config is not set", cmd_type.config_key()),
     };

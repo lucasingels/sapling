@@ -23,7 +23,7 @@ from typing import Dict, Iterable, Optional, Set
 
 from thrift.python.exceptions import ApplicationError, ApplicationErrorType
 
-from . import cmd_util, configutil, mtab, subcmd as subcmd_mod, tabulate
+from . import cmd_util, configutil, daemon_util, mtab, subcmd as subcmd_mod, tabulate
 from .config import CheckoutConfig, EdenCheckout, EdenInstance, load_toml_config
 from .prompt import prompt_confirmation
 from .subcmd import Subcmd
@@ -41,7 +41,16 @@ log: logging.Logger = logging.getLogger(__name__)
 USER_REDIRECTION_SOURCE = ".eden/client/config.toml:redirections"
 REPO_SOURCE = ".eden-redirections"
 PLEASE_RESTART = "Please run `eden restart` to pick up the new redirections feature set"
-APFS_HELPER = "/usr/local/libexec/eden/eden_apfs_mount_helper"
+
+
+def _find_apfs_helper_path() -> str:
+    sibling = daemon_util.find_libexec_eden_sibling("eden_apfs_mount_helper")
+    if sibling is not None:
+        return sibling
+    return "/usr/local/libexec/eden/eden_apfs_mount_helper"
+
+
+APFS_HELPER = _find_apfs_helper_path()
 WINDOWS_SCRATCH_DIR = Path("c:\\open\\scratch")
 
 

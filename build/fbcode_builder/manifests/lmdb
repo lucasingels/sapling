@@ -1,6 +1,9 @@
 [manifest]
 name = lmdb
 
+[homebrew]
+lmdb
+
 [build]
 builder = make
 subdir = lmdb-LMDB_0.9.31/libraries/liblmdb

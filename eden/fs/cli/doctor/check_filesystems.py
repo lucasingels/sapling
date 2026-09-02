@@ -31,6 +31,7 @@ from eden.fs.cli.doctor.problem import (
 from eden.fs.cli.doctor.util import CheckoutInfo, get_mount_inode_info
 from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
+from eden.fs.cli.util import get_hg_binary
 from eden.fs.service.eden.thrift_types import (
     DebugInvalidateRequest,
     DebugInvalidateResponse,
@@ -1040,7 +1041,7 @@ def get_modified_files(instance: EdenInstance, checkout: EdenCheckout) -> List[P
 
 
 def get_hg_diff(checkout: EdenCheckout) -> Set[Path]:
-    hg = os.environ.get("EDEN_HG_BINARY", "hg")
+    hg = get_hg_binary()
     json_diff = subprocess.run(
         # --no-binary is important for performance with large binary file changes.
         [hg, "diff", "--per-file-stat-json", "--no-binary", "--reason=eden-doctor"],

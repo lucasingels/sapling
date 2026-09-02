@@ -31,6 +31,22 @@ class SystemdStartDaemonError(Exception):
     pass
 
 
+def find_libexec_eden_sibling(name: str) -> Optional[str]:
+    """Look for a helper binary installed as a sibling of edenfsctl.real, as
+    produced by a self-contained release/package layout (edenfs,
+    edenfs_privhelper, eden_apfs_mount_helper, eden_fsck, eden_trace_stream,
+    and the edenfsctl.real/ directory are all direct children of the same
+    directory, e.g. <prefix>/libexec/eden/bin/ -- see
+    eden/scm/packaging/mac/assemble_eden_prefix.sh). Returns None if not
+    found there.
+    """
+    cli_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    candidate = os.path.normpath(os.path.join(cli_dir, "..", name))
+    if os.access(candidate, os.R_OK | os.X_OK):
+        return candidate
+    return None
+
+
 def find_daemon_binary(explicit_daemon_binary: Optional[str]) -> str:
     if explicit_daemon_binary is not None:
         return explicit_daemon_binary

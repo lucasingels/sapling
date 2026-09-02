@@ -892,7 +892,7 @@ Do you want to run `eden mount %s` instead?"""
 
             subprocess.check_call(
                 [
-                    os.environ.get("EDEN_HG_BINARY", "hg"),
+                    util.get_hg_binary(),
                     "debugedenrunpostupdatehook",
                     "-R",
                     str(checkout.path),
@@ -908,7 +908,7 @@ Do you want to run `eden mount %s` instead?"""
                 args = [f"{k}={v}" for k, v in configs.items()]
                 subprocess.check_call(
                     [
-                        os.environ.get("EDEN_HG_BINARY", "hg"),
+                        util.get_hg_binary(),
                         "config",
                         "--local",
                         *args,
@@ -1539,7 +1539,12 @@ class EdenCheckout:
     def hg_dot_path(self) -> Path:
         from . import hg_util
 
-        return self.path / hg_util.sniff_dot_dir(self.path)
+        fallback_root = None
+        try:
+            fallback_root = self.get_config().backing_repo
+        except Exception:
+            pass
+        return self.path / hg_util.sniff_dot_dir(self.path, fallback_root)
 
     def _config_path(self) -> Path:
         return self.state_dir / MOUNT_CONFIG

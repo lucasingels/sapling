@@ -443,6 +443,27 @@ class Repo(abc.ABC):
         pass
 
 
+def get_hg_binary() -> str:
+    """Return the path to the sl/hg binary to run.
+
+    Honors EDEN_HG_BINARY (set by integration tests and some callers). In a
+    self-contained release/package layout, defaults to the `sl` binary
+    shipped as libexec/sl in the same install prefix as the running CLI.
+    Walks upward from the CLI's own location rather than hardcoding the exact
+    nesting depth. Falls back to searching PATH for 'hg'.
+    """
+    env = os.environ.get("EDEN_HG_BINARY")
+    if env:
+        return env
+    ancestor = os.path.dirname(os.path.abspath(sys.argv[0]))
+    for _ in range(5):
+        ancestor = os.path.dirname(ancestor)
+        candidate = os.path.join(ancestor, "libexec", "sl")
+        if os.access(candidate, os.R_OK | os.X_OK):
+            return candidate
+    return "hg"
+
+
 class HgRepo(Repo):
     HEAD = "."
 
@@ -471,7 +492,7 @@ class HgRepo(Repo):
         # Eden's integration tests.  Just find 'hg' from the path when it is
         # not set.
         # pyre-fixme[4]: Attribute must be annotated.
-        self._hg_binary = os.environ.get("EDEN_HG_BINARY", "hg")
+        self._hg_binary = get_hg_binary()
 
     def __repr__(self) -> str:
         return f"HgRepo(source={self.source!r}, working_dir={self.working_dir!r})"

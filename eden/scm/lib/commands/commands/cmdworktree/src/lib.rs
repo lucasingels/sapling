@@ -50,7 +50,10 @@ define_flags! {
 }
 
 pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
-    if !repo.config().get_or("worktree", "enabled", || false)? {
+    // This command only exists when sl is built with the `eden` feature, so
+    // defaulting to enabled here (users can still opt out with
+    // --config worktree.enabled=false) is safe.
+    if !repo.config().get_or("worktree", "enabled", || true)? {
         abort!("worktree command requires --config worktree.enabled=true");
     }
 
