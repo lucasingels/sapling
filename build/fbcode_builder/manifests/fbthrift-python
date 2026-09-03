@@ -6,6 +6,9 @@ shipit_fbcode_builder = true
 
 [git]
 repo_url = https://github.com/facebook/fbthrift.git
+# Same repo/checkout as manifests/fbthrift (shares its .getdeps_patched
+# sentinel) -- keep this pin identical to that one's.
+rev = 1f7c13e5f691d94738dec845d0ae9504074a6cd9
 
 [cargo]
 cargo_config_file =  source/thrift/lib/rust/.cargo/config.toml

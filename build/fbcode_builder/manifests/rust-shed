@@ -6,6 +6,9 @@ shipit_fbcode_builder = true
 
 [git]
 repo_url = https://github.com/facebookexperimental/rust-shed.git
+# Pinned to match eden/scm/Cargo.lock (gitignored -- see the fbthrift
+# manifest's comment for why this needs to live here too).
+rev = 049c30f489148be3f0b055a9b028e33caf23e730
 
 [build]
 builder = cargo

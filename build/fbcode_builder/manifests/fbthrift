@@ -6,6 +6,12 @@ shipit_fbcode_builder = true
 
 [git]
 repo_url = https://github.com/facebook/fbthrift.git
+# Pinned to match eden/scm/Cargo.lock (which is gitignored, so this is the
+# only durable record of the pin -- see the commit message for why: a fresh
+# fetch of main reintroduces the E0405 ThriftStruct skew this fork already
+# fixed once, and fbthrift-darwin.patch's hunks assume this exact revision's
+# file layout).
+rev = 1f7c13e5f691d94738dec845d0ae9504074a6cd9
 
 [cargo]
 cargo_config_file =  source/thrift/lib/rust/.cargo/config.toml
