@@ -80,6 +80,17 @@ if (APPLE)
     PUBLIC
     "-framework SystemConfiguration"
   )
+
+  # See the matching comment in eden/scm/lib/backingstore/CMakeLists.txt:
+  # CURL::libcurl (CMake's builtin FindCURL) doesn't know curl needs nghttp2
+  # too when statically linked, and macOS's linker (unlike Linux's) requires
+  # every symbol resolved at link time.
+  find_library(NGHTTP2_LIBRARY NAMES nghttp2 REQUIRED)
+  target_link_libraries(
+    edenfs_ffi
+    PRIVATE
+    ${NGHTTP2_LIBRARY}
+  )
 endif()
 
 install(

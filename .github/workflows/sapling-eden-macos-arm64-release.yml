@@ -89,9 +89,26 @@ jobs:
           rustup-init -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache getdeps scratch
+      # Split restore/save (rather than the combined actions/cache) because
+      # getdeps.py itself is what makes a warm cache useful: each project it
+      # builds gets a .built-by-getdeps marker under
+      # $GETDEPS_SCRATCH/installed/<project>, and it skips rebuilding any
+      # project whose marker still matches. fbthrift-python and eden share
+      # most of that dependency graph (folly, fbthrift, fb303, wangle,
+      # fizz, mvfst, ...), so restoring it lets *both* "Build fbthrift-python"
+      # and "Build eden" skip everything already built, no matter which one
+      # (if either) fails partway. The combined actions/cache action only
+      # saves in its own post-step, and on this workflow's first two runs
+      # that post-step did not run when a later step failed -- observed
+      # directly as "Post Cache ..." showing skipped, not completed, on both
+      # failed runs -- so two consecutive cold builds redid the ~1h
+      # fbthrift-python step from zero for no reason. save-with-always()
+      # below is the actual fix: it runs during job cleanup regardless of
+      # what failed, so the *next* retry after any failure starts from
+      # wherever this one got to, not from scratch again.
+      - name: Restore getdeps scratch cache
         if: env.SKIP_BUILD != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ${{ env.GETDEPS_SCRATCH }}/installed
@@ -99,9 +116,9 @@ jobs:
             ${{ env.GETDEPS_SCRATCH }}/py310-tools
           key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
 
-      - name: Cache sccache
+      - name: Restore sccache
         if: env.SKIP_BUILD != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/Library/Caches/Mozilla.sccache
           key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
@@ -203,3 +220,27 @@ jobs:
         if: env.SKIP_BUILD != 'true'
         run: |
           echo "Published $ASSET and lucasingels/tap/sapling-eden ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+
+      # if: always() is the actual point of the restore/save split above: run
+      # these even when an earlier step failed, so whatever getdeps finished
+      # building survives into the next retry instead of starting cold again.
+      # A cache entry is immutable once saved under a given key, so once one
+      # of these succeeds, later runs with the same manifests/patches hash
+      # just restore it (save silently no-ops on an existing key) -- this
+      # only matters for the run that gets further than any previous one.
+      - name: Save getdeps scratch cache
+        if: always() && env.SKIP_BUILD != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.GETDEPS_SCRATCH }}/installed
+            ${{ env.GETDEPS_SCRATCH }}/downloads
+            ${{ env.GETDEPS_SCRATCH }}/py310-tools
+          key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
+
+      - name: Save sccache
+        if: always() && env.SKIP_BUILD != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/Library/Caches/Mozilla.sccache
+          key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
