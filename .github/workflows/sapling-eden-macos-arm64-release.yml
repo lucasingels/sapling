@@ -12,7 +12,7 @@ on:
   push:
     tags:
       - v*
-      - test-release-*
+      - eden-test-*
 
 env:
   GETDEPS_SCRATCH: ${{ github.workspace }}/../getdeps-scratch
