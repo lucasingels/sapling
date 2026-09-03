@@ -74,8 +74,8 @@ New workflow `.github/workflows/sapling-eden-macos-arm64-release.yml`, same trig
 `Formula/sapling-eden.rb` in `lucasingels/homebrew-tap` (templated from a new `eden/scm/packaging/mac/brew_formula_eden.rb`):
 
 - `url`/`sha256` of the tarball, `version`, `conflicts_with "sapling"` (both install `bin/sl`).
-- `depends_on` the runtime kegs from Phase 2 step 1 (build tools excluded), `depends_on "python@3.12"`, `depends_on "node"` for ISL.
-- `install`: `libexec.install Dir["*"]`-style copy of the prebuilt tree, then write `bin/sl` and `bin/eden` wrappers with `opt_libexec` paths so they survive upgrades.
+- `depends_on` the runtime kegs from Phase 2 step 1 (build tools excluded). Implemented 2026-09-03 as `boost fmt gflags glog icu4c@78 libevent libsodium lmdb lz4 openssl@3 python@3.10 python@3.12 re2 snappy xxhash xz zlib zstd`, read off `otool -L` on the actual shipped binaries (edenfs, edenfs_privhelper, sl, and the thrift-python/folly-python extensions) rather than assumed from the toolchain list — notably both python@3.10 (the pinned thrift-python runtime) *and* python@3.12 (sl's own interpreter pick) are needed until decision #4 is actually done. No `depends_on "node"`/ISL yet: `assemble_eden_prefix.sh` doesn't assemble `isl-dist.tar.xz`, so `sl web` doesn't work from this formula for now -- follow-up, not done.
+- `install`: `libexec.install Dir["libexec/*"]`-style copy of the prebuilt tree (not `Dir["*"]` -- the tarball's root also has its own standalone-use `bin/`, which install deliberately ignores), then write `bin/sl` and `bin/eden` wrappers with `opt_libexec` paths so they survive upgrades.
 - `caveats`: the setuid command, the note that it is needed after each upgrade, and the daemon lifecycle (`eden start` is not a login item; `brew services` is deliberately not offered because the daemon must not run as root).
 - `test do`: `sl --version`, `eden --version`, and `sl worktree --help`.
 - `post_install` is not used for the setuid step: Homebrew runs it as the user.

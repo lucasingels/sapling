@@ -57,8 +57,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../../../.." && pwd)
 GETDEPS_SCRATCH=${GETDEPS_SCRATCH:-$HOME/.local/share/getdeps/sapling}
 # Must match whatever brew python the thrift-python runtime wheel was
 # installed into (mise run install-eden-python-runtime). Pinned to 3.10 here
