@@ -18,10 +18,17 @@ env:
   GETDEPS_SCRATCH: ${{ github.workspace }}/../getdeps-scratch
   GETDEPS_JOBS: 3
   PYTHON310: /opt/homebrew/opt/python@3.10/bin/python3.10
-  # Parity with the proven-working local recipe (mise.local.toml); untested
-  # on a fresh runner image, so may need iteration on the first real run
-  # (see the "Budget"/cold-build risk note in the plan).
-  OPENSSL_DIR: /opt/homebrew/Cellar/openssl@3
+  # The Rust openssl crate needs OPENSSL_DIR specifically (docs.rs/openssl);
+  # getdeps only sets OPENSSL_ROOT_DIR (for CMake's find_package(OpenSSL),
+  # which is why eden's own CMake build finds system openssl fine without
+  # any of this). Must be the opt/ prefix symlink, which actually has
+  # include/ and lib/ directly inside it -- mise.local.toml's
+  # Cellar/openssl@3 (no version) is just the parent of version-numbered
+  # subdirectories, not a real install root, so openssl-sys correctly
+  # rejects it and falls back to (and on this runner, fails at) vendoring
+  # OpenSSL from source. Matches eden/scm/packaging/mac/brew_formula.rb's
+  # already-proven `Formula["openssl@3"].opt_prefix`.
+  OPENSSL_DIR: /opt/homebrew/opt/openssl@3
 
 jobs:
   build-and-publish:
