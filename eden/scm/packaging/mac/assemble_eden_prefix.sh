@@ -10,7 +10,8 @@
 #   libexec/eden/bin/edenfs_privhelper
 #   libexec/eden/bin/eden_apfs_mount_helper
 #   libexec/eden/bin/edenfsctl.real/   (dir; TYPE-dir python executable)
-#   libexec/eden/lib/*.dylib        runtime deps fixup-dyn-deps bundles
+#   libexec/eden/lib/*.dylib        edenfs/edenfsctl's own deps fixup-dyn-deps bundles
+#   libexec/eden/python/lib/*.dylib libthrift_python_cpp/libfolly_python_cpp/libfolly (private, no brew formula)
 #
 # (edenfs/edenfsctl.real/etc. sit under libexec/eden/bin/, not directly under
 # libexec/eden/, because `getdeps.py fixup-dyn-deps` always writes a bin/+lib/
@@ -28,15 +29,22 @@
 #   mise run build-eden && mise run build-sl-eden
 #   mise run build-eden-python && mise run install-eden-python-runtime
 #
-# Known gap (tracked in eden-homebrew-packaging-plan.md): the thrift-python C
-# extensions backing edenfsctl.real still carry LC_RPATH entries into
-# $GETDEPS_SCRATCH/installed/{fbthrift,folly}-python/lib (see
-# darwin-thrift-python-runtime.sh) rather than into this prefix, and the
-# runtime dylibs under libexec/eden/lib/ are bundled wholesale rather than
-# declared as Homebrew depends_on. So the assembled tree is not yet fully
-# relocatable off this machine's getdeps scratch -- that's Phase 2/3 work,
-# not this script's job. This script's job is proving out the *path
-# discovery* defaults (Phase 1) end to end.
+# edenfsctl.real ships its folly/thrift.python/thrift.py3 bindings as
+# symlinks into brew python's site-packages (where `mise run
+# install-eden-python-runtime` put them) rather than bundling them, and every
+# compiled extension under there -- plus the ones already bundled inside
+# edenfsctl.real/thrift/python/ -- carries an LC_RPATH into
+# $GETDEPS_SCRATCH/installed/{fbthrift,folly}-python/lib. Both are
+# machine-local and would break on any other machine (a CI runner, an end
+# user's Mac). This script dereferences those symlinks into real copies,
+# bundles just the 3 private runtime libraries those extensions need
+# (libthrift_python_cpp.dylib, libfolly_python_cpp.dylib, libfolly.dylib --
+# see the "bundling the private thrift-python/folly-python runtime libs"
+# step below for why NOT fixup-dyn-deps here), and rewrites every
+# extension's rpath to point at that bundle. Every *other* (Homebrew-backed)
+# dependency is deliberately left as the absolute /opt/homebrew/... path
+# these files already carry (plan decision #3: those are depends_on, not
+# bundled).
 #
 # lib/isl-dist.tar.xz (ISL) is intentionally not assembled here; that's
 # unchanged from the existing sapling formula and out of scope for this
@@ -89,6 +97,67 @@ echo "==> eden binaries + runtime dylibs (fixup-dyn-deps)"
 echo "==> edenfsctl.real (build-tree dir; TYPE dir only installs __main__.py)"
 rm -rf "$PREFIX/libexec/eden/bin/edenfsctl.real"
 cp -R "$EDEN_BUILD/eden/fs/cli/edenfsctl.real" "$PREFIX/libexec/eden/bin/edenfsctl.real"
+
+echo "==> dereferencing folly/thrift.python/thrift.py3 symlinks into real copies"
+for rel in folly thrift/python thrift/py3; do
+  link="$PREFIX/libexec/eden/bin/edenfsctl.real/$rel"
+  if [ -L "$link" ]; then
+    target=$(readlink "$link")
+    rm "$link"
+    cp -R "$target" "$link"
+  fi
+done
+find "$PREFIX/libexec/eden/bin/edenfsctl.real" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+echo "==> bundling the private thrift-python/folly-python runtime libs"
+# libthrift_python_cpp.dylib, libfolly_python_cpp.dylib and libfolly.dylib
+# are getdeps-private build products with no Homebrew formula of their own,
+# so (unlike edenfs/sl's own deps, which stay as absolute /opt/homebrew/...
+# references satisfied by the formula's depends_on -- plan decision #3) they
+# have to be bundled somewhere. Deliberately NOT using fixup-dyn-deps here:
+# it would also bundle every *Homebrew* library these 3 pull in (glog,
+# openssl, icu, ...), producing a second copy of each that lives at a
+# different path than the one the thrift.python/folly extension .so files
+# below still reference directly -- two distinct files backing "the same"
+# library loaded into one process, which made glog/gflags abort on duplicate
+# flag registration when this was tried. Copying just these 3 and adding a
+# self-referential @loader_path rpath (so they can still find each other)
+# leaves every Homebrew dependency resolving to the one, single absolute
+# keg path every other component already uses.
+PY_LIB_DIR="$PREFIX/libexec/eden/python/lib"
+mkdir -p "$PY_LIB_DIR"
+copy_runtime_lib() {
+  local dir="$1" name="$2" real
+  real=$(readlink "$dir/$name.dylib")
+  cp -P "$dir/$name.dylib" "$dir/$real" "$PY_LIB_DIR/"
+}
+copy_runtime_lib "$GETDEPS_SCRATCH/installed/fbthrift-python/lib" libthrift_python_cpp
+copy_runtime_lib "$GETDEPS_SCRATCH/installed/folly-python/lib" libfolly_python_cpp
+copy_runtime_lib "$GETDEPS_SCRATCH/installed/folly-python/lib" libfolly
+chmod u+w "$PY_LIB_DIR"/*.dylib
+for lib in "$PY_LIB_DIR"/*.dylib; do
+  [ -L "$lib" ] && continue
+  install_name_tool -add_rpath "@loader_path" "$lib" 2>/dev/null || true
+  codesign -s - -f "$lib" 2>/dev/null || true
+done
+
+echo "==> relocating the thrift-python/folly-python extensions (rpaths)"
+# A file may carry either or both of these two old rpaths. dyld hard-errors
+# ("duplicate LC_RPATH") on two identical entries, so convert at most one to
+# the new value and delete the other rather than rewriting both to it.
+FBTHRIFT_PY_LIB="$GETDEPS_SCRATCH/installed/fbthrift-python/lib"
+FOLLY_PY_LIB="$GETDEPS_SCRATCH/installed/folly-python/lib"
+find "$PREFIX/libexec/eden/bin/edenfsctl.real" -name "*.so" -print0 |
+  while IFS= read -r -d '' so; do
+    reldir=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+      "$PY_LIB_DIR" "$(dirname "$so")")
+    if install_name_tool -rpath "$FBTHRIFT_PY_LIB" "@loader_path/$reldir" "$so" 2>/dev/null; then
+      install_name_tool -delete_rpath "$FOLLY_PY_LIB" "$so" 2>/dev/null || true
+    else
+      install_name_tool -rpath "$FOLLY_PY_LIB" "@loader_path/$reldir" "$so" 2>/dev/null || true
+    fi
+    codesign -s - -f "$so" 2>/dev/null || true
+  done
 
 echo "==> sl"
 cp "$SL_INSTALLED/bin/sl" "$PREFIX/libexec/sl"
