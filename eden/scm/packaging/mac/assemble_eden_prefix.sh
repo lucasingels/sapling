@@ -1,31 +1,36 @@
 #!/bin/bash
 # Assembles a self-contained EdenFS + eden-enabled `sl` install prefix from a
-# getdeps build, in (most of) the layout eden-homebrew-packaging-plan.md
-# describes:
+# getdeps build, in the layout eden-homebrew-packaging-plan.md describes:
 #
 #   bin/sl                          wrapper -> libexec/sl
-#   bin/eden                        wrapper -> python3 libexec/eden/bin/edenfsctl.real/__main__.py
+#   bin/eden                        wrapper -> python3 libexec/eden/edenfsctl.real/__main__.py
 #   libexec/sl                      eden-enabled sl (features: eden, sl_oss)
-#   libexec/eden/bin/edenfs
-#   libexec/eden/bin/edenfs_privhelper
-#   libexec/eden/bin/eden_apfs_mount_helper
-#   libexec/eden/bin/edenfsctl.real/   (dir; TYPE-dir python executable)
-#   libexec/eden/lib/*.dylib        edenfs/edenfsctl's own deps fixup-dyn-deps bundles
+#   libexec/eden/edenfs
+#   libexec/eden/edenfs_privhelper
+#   libexec/eden/eden_apfs_mount_helper
+#   libexec/eden/edenfsctl.real/    (dir; TYPE-dir python executable)
 #   libexec/eden/python/lib/*.dylib libthrift_python_cpp/libfolly_python_cpp/libfolly (private, no brew formula)
 #
-# (edenfs/edenfsctl.real/etc. sit under libexec/eden/bin/, not directly under
-# libexec/eden/, because `getdeps.py fixup-dyn-deps` always writes a bin/+lib/
-# pair into the output dir it's given -- see the `fixup-eden` mise task. The
-# CLI's self-locating path defaults (eden/fs/cli/daemon_util.py,
+# edenfs/edenfsctl.real/etc. are left with the raw, unmodified dependency
+# paths getdeps produced with --allow-system-packages: absolute
+# /opt/homebrew/opt/<pkg>/lib/... references, exactly how a normal Homebrew
+# binary is expected to link (plan decision #3). Nothing here bundles or
+# rewrites those -- the formula declares matching `depends_on` instead, so
+# this script (and a plain `brew install <the depends_on list>` on a
+# non-Homebrew-formula machine) just needs those kegs present, not copied.
+#
+# The CLI's self-locating path defaults (eden/fs/cli/daemon_util.py,
 # eden/fs/cli/util.py get_hg_binary, eden/fs/cli/daemon.py
 # get_edenfsctl_cmd, eden/scm/lib/edenfs-client/src/utils.rs
 # find_sibling_eden_binary) all walk upward from their own location looking
-# for these siblings, so they don't hardcode this exact nesting depth.)
+# for these siblings, so they don't hardcode the exact nesting depth above.
 #
 # Usage:
 #   ./eden/scm/packaging/mac/assemble_eden_prefix.sh <output-prefix-dir>
 #
-# Prereqs (see eden-oss-build-notes.md and mise.local.toml):
+# Prereqs (see eden-oss-build-notes.md and mise.local.toml): the Homebrew
+# packages build-eden's own toolchain step installs (see the workflow / plan
+# Phase 2 step 1), then
 #   mise run build-eden && mise run build-sl-eden
 #   mise run build-eden-python && mise run install-eden-python-runtime
 #
@@ -43,8 +48,8 @@
 # step below for why NOT fixup-dyn-deps here), and rewrites every
 # extension's rpath to point at that bundle. Every *other* (Homebrew-backed)
 # dependency is deliberately left as the absolute /opt/homebrew/... path
-# these files already carry (plan decision #3: those are depends_on, not
-# bundled).
+# these files already carry, for the same depends_on-not-bundled reason as
+# edenfs/sl above.
 #
 # lib/isl-dist.tar.xz (ISL) is intentionally not assembled here; that's
 # unchanged from the existing sapling formula and out of scope for this
@@ -59,6 +64,9 @@ GETDEPS_SCRATCH=${GETDEPS_SCRATCH:-$HOME/.local/share/getdeps/sapling}
 # installed into (mise run install-eden-python-runtime). Pinned to 3.10 here
 # because that's what actually builds today; switching the whole toolchain to
 # python@3.12 is a separate, not-yet-done Phase 2/3 decision (see the plan).
+# Note sl itself links python@3.12's framework directly (build.py's own
+# interpreter pick, independent of this), so the formula ends up needing
+# both python@3.10 and python@3.12 as depends_on regardless.
 PYTHON_BIN=${PYTHON_BIN:-/opt/homebrew/opt/python@3.10/bin/python3.10}
 PREFIX=${1:?"usage: $0 <output-prefix-dir>"}
 
@@ -69,8 +77,10 @@ die() {
 
 [ -x "$PYTHON_BIN" ] || die "python interpreter not found: $PYTHON_BIN"
 
+EDEN_INSTALLED="$GETDEPS_SCRATCH/installed/eden"
 EDEN_BUILD="$GETDEPS_SCRATCH/build/eden"
 SL_INSTALLED="$GETDEPS_SCRATCH/installed/sapling"
+[ -x "$EDEN_INSTALLED/bin/edenfs" ] || die "$EDEN_INSTALLED/bin/edenfs not found (run: mise run build-eden)"
 [ -x "$SL_INSTALLED/bin/sl" ] || die "$SL_INSTALLED/bin/sl not found (run: mise run build-sl-eden)"
 [ -d "$EDEN_BUILD/eden/fs/cli/edenfsctl.real" ] ||
   die "edenfsctl.real build tree not found under $EDEN_BUILD (run: mise run build-eden-python)"
@@ -81,49 +91,40 @@ case "$PREFIX" in
 esac
 
 rm -rf "$PREFIX"
-mkdir -p "$PREFIX/bin"
+mkdir -p "$PREFIX/bin" "$PREFIX/libexec/eden"
 
-echo "==> eden binaries + runtime dylibs (fixup-dyn-deps)"
-(
-  cd "$REPO_ROOT"
-  env -u PYTHON -u PYTHON3 -u PYTHON_SYS_EXECUTABLE \
-    ./build/fbcode_builder/getdeps.py fixup-dyn-deps \
-    --scratch-path "$GETDEPS_SCRATCH" \
-    --allow-system-packages --no-tests \
-    --src-dir=. --src-dir=sapling:. \
-    eden "$PREFIX/libexec/eden"
-)
+echo "==> eden binaries (raw getdeps install; deps stay absolute Homebrew paths)"
+for b in edenfs edenfs_privhelper eden_apfs_mount_helper; do
+  cp "$EDEN_INSTALLED/bin/$b" "$PREFIX/libexec/eden/$b"
+done
 
 echo "==> edenfsctl.real (build-tree dir; TYPE dir only installs __main__.py)"
-rm -rf "$PREFIX/libexec/eden/bin/edenfsctl.real"
-cp -R "$EDEN_BUILD/eden/fs/cli/edenfsctl.real" "$PREFIX/libexec/eden/bin/edenfsctl.real"
+cp -R "$EDEN_BUILD/eden/fs/cli/edenfsctl.real" "$PREFIX/libexec/eden/edenfsctl.real"
 
 echo "==> dereferencing folly/thrift.python/thrift.py3 symlinks into real copies"
 for rel in folly thrift/python thrift/py3; do
-  link="$PREFIX/libexec/eden/bin/edenfsctl.real/$rel"
+  link="$PREFIX/libexec/eden/edenfsctl.real/$rel"
   if [ -L "$link" ]; then
     target=$(readlink "$link")
     rm "$link"
     cp -R "$target" "$link"
   fi
 done
-find "$PREFIX/libexec/eden/bin/edenfsctl.real" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+find "$PREFIX/libexec/eden/edenfsctl.real" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
 echo "==> bundling the private thrift-python/folly-python runtime libs"
 # libthrift_python_cpp.dylib, libfolly_python_cpp.dylib and libfolly.dylib
 # are getdeps-private build products with no Homebrew formula of their own,
-# so (unlike edenfs/sl's own deps, which stay as absolute /opt/homebrew/...
-# references satisfied by the formula's depends_on -- plan decision #3) they
-# have to be bundled somewhere. Deliberately NOT using fixup-dyn-deps here:
-# it would also bundle every *Homebrew* library these 3 pull in (glog,
-# openssl, icu, ...), producing a second copy of each that lives at a
-# different path than the one the thrift.python/folly extension .so files
-# below still reference directly -- two distinct files backing "the same"
-# library loaded into one process, which made glog/gflags abort on duplicate
-# flag registration when this was tried. Copying just these 3 and adding a
-# self-referential @loader_path rpath (so they can still find each other)
-# leaves every Homebrew dependency resolving to the one, single absolute
-# keg path every other component already uses.
+# so (unlike everything above) they have to be bundled somewhere. Not using
+# fixup-dyn-deps here: it would also bundle every *Homebrew* library these 3
+# pull in (glog, openssl, icu, ...), producing a second copy of each that
+# lives at a different path than the one the thrift.python/folly extension
+# .so files below still reference directly -- two distinct files backing
+# "the same" library loaded into one process, which made glog/gflags abort
+# on duplicate flag registration when this was tried. Copying just these 3
+# and adding a self-referential @loader_path rpath (so they can still find
+# each other) leaves every Homebrew dependency resolving to the one, single
+# absolute keg path every other component already uses.
 PY_LIB_DIR="$PREFIX/libexec/eden/python/lib"
 mkdir -p "$PY_LIB_DIR"
 copy_runtime_lib() {
@@ -147,7 +148,7 @@ echo "==> relocating the thrift-python/folly-python extensions (rpaths)"
 # the new value and delete the other rather than rewriting both to it.
 FBTHRIFT_PY_LIB="$GETDEPS_SCRATCH/installed/fbthrift-python/lib"
 FOLLY_PY_LIB="$GETDEPS_SCRATCH/installed/folly-python/lib"
-find "$PREFIX/libexec/eden/bin/edenfsctl.real" -name "*.so" -print0 |
+find "$PREFIX/libexec/eden/edenfsctl.real" -name "*.so" -print0 |
   while IFS= read -r -d '' so; do
     reldir=$("$PYTHON_BIN" -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
       "$PY_LIB_DIR" "$(dirname "$so")")
@@ -170,22 +171,21 @@ chmod +x "$PREFIX/bin/sl"
 
 cat >"$PREFIX/bin/eden" <<WRAP
 #!/bin/sh
-exec "$PYTHON_BIN" "\$(cd "\$(dirname "\$0")" && pwd)/../libexec/eden/bin/edenfsctl.real/__main__.py" "\$@"
+exec "$PYTHON_BIN" "\$(cd "\$(dirname "\$0")" && pwd)/../libexec/eden/edenfsctl.real/__main__.py" "\$@"
 WRAP
 chmod +x "$PREFIX/bin/eden"
 
 echo "==> strip + codesign"
-strip -x "$PREFIX/libexec/eden/bin/edenfs" "$PREFIX/libexec/eden/bin/edenfs_privhelper" \
-  "$PREFIX/libexec/eden/bin/eden_apfs_mount_helper" 2>/dev/null || true
+strip -x "$PREFIX/libexec/eden/edenfs" "$PREFIX/libexec/eden/edenfs_privhelper" \
+  "$PREFIX/libexec/eden/eden_apfs_mount_helper" 2>/dev/null || true
 codesign -s - -f \
-  "$PREFIX/libexec/eden/bin/edenfs" \
-  "$PREFIX/libexec/eden/bin/edenfs_privhelper" \
-  "$PREFIX/libexec/eden/bin/eden_apfs_mount_helper" \
-  "$PREFIX/libexec/eden/lib"/*.dylib \
+  "$PREFIX/libexec/eden/edenfs" \
+  "$PREFIX/libexec/eden/edenfs_privhelper" \
+  "$PREFIX/libexec/eden/eden_apfs_mount_helper" \
   "$PREFIX/libexec/sl" \
   2>/dev/null || true
 
 echo "Assembled: $PREFIX"
 echo "One-time setuid step still required:"
-echo "  sudo chown root:wheel $PREFIX/libexec/eden/bin/edenfs_privhelper"
-echo "  sudo chmod 4755 $PREFIX/libexec/eden/bin/edenfs_privhelper"
+echo "  sudo chown root:wheel $PREFIX/libexec/eden/edenfs_privhelper"
+echo "  sudo chmod 4755 $PREFIX/libexec/eden/edenfs_privhelper"
