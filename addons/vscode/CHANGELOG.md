@@ -6,6 +6,7 @@
 
 - New worktrees default to a hidden `.worktrees/<label>` directory inside the repository instead of a `<repo>.worktrees` sibling; the path follows the label as you type (needs Sapling 0.3.4)
 - Opening a folder inside a nested worktree no longer attributes it to the enclosing repository
+- Clicking a change number copies the change link
 
 ## 0.2.4
 
