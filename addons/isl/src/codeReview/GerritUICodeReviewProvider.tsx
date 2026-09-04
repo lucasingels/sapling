@@ -6,7 +6,7 @@
  */
 
 import type {GerritDiffSummary} from 'isl-server/src/gerrit/gerritCodeReviewProvider';
-import type {ReactNode} from 'react';
+import type {JSX, ReactNode} from 'react';
 import {GerritPublishOperation} from '../operations/GerritPublishOperation';
 import type {Operation} from '../operations/Operation';
 import type {Dag} from '../previews';
