@@ -21,7 +21,7 @@ import * as ejeca from 'shared/ejeca';
 import * as fsUtils from 'shared/fs';
 import {clone, mockLogger, nextTick} from 'shared/testUtils';
 import {Internal} from '../Internal';
-import {absolutePathForFileInRepo, Repository} from '../Repository';
+import {absolutePathForFileInRepo, isDotGitDotDir, Repository} from '../Repository';
 import {makeServerSideTracker} from '../analytics/serverSideTracker';
 import {
   extractRepoInfoFromUrl,
@@ -149,6 +149,7 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
+        worktreesSupported: false,
       });
     });
 
@@ -171,6 +172,7 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
+        worktreesSupported: false,
       });
     });
 
@@ -191,6 +193,7 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
+        worktreesSupported: false,
       });
     });
   });
@@ -223,7 +226,21 @@ describe('Repository', () => {
       pullRequestDomain: undefined,
       preferredSubmitCommand: undefined,
       isEdenFs: false,
+      worktreesSupported: false,
     });
+  });
+
+  it('marks git-backed repos as supporting worktrees', async () => {
+    setConfigOverrideForTests([]);
+    setPathsDefault('');
+    mockEjeca([
+      [/^sl root --dotdir/, {stdout: '/path/to/myRepo/.git/sl'}],
+      [/^sl root/, {stdout: '/path/to/myRepo'}],
+      [/^sl debugroots/, {stdout: '/path/to/myRepo'}],
+    ]);
+    const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+    expect(info.isEdenFs).toBe(false);
+    expect(info.worktreesSupported).toBe(true);
   });
 
   it('handles cwd not exists', async () => {
@@ -1083,6 +1100,39 @@ describe('absolutePathForFileInRepo', () => {
     );
 
     expect(absolutePathForFileInRepo('foo\\..\\..\\file.txt', repo, path.win32)).toEqual(null);
+  });
+});
+
+describe('isDotGitDotDir', () => {
+  it('recognizes a git-backed main checkout dot dir', () => {
+    expect(isDotGitDotDir('/path/to/repo/.git/sl')).toBe(true);
+  });
+
+  it('recognizes a git-backed linked worktree dot dir', () => {
+    expect(isDotGitDotDir('/path/to/repo/.git/worktrees/feature/sl')).toBe(true);
+  });
+
+  it('rejects a .sl dot dir', () => {
+    expect(isDotGitDotDir('/path/to/repo/.sl')).toBe(false);
+  });
+
+  it('rejects other dot dirs whose basename is not sl', () => {
+    expect(isDotGitDotDir('/path/to/repo/.git')).toBe(false);
+    expect(isDotGitDotDir('/path/to/repo/.git/worktrees/feature')).toBe(false);
+  });
+
+  it('rejects an sl dir that is not under .git', () => {
+    expect(isDotGitDotDir('/path/to/repo/sl')).toBe(false);
+    expect(isDotGitDotDir('/path/to/repo/.hg/worktrees/feature/sl')).toBe(false);
+    expect(isDotGitDotDir('/path/to/repo/.git/notworktrees/feature/sl')).toBe(false);
+  });
+
+  it('works on windows paths', () => {
+    expect(isDotGitDotDir('C:\\path\\to\\repo\\.git\\sl', path.win32)).toBe(true);
+    expect(isDotGitDotDir('C:\\path\\to\\repo\\.git\\worktrees\\feature\\sl', path.win32)).toBe(
+      true,
+    );
+    expect(isDotGitDotDir('C:\\path\\to\\repo\\.sl', path.win32)).toBe(false);
   });
 });
 

@@ -38,8 +38,13 @@ function useWorktreesEnabled(): boolean {
   const worktreesEnabled = useFailsafeFeatureFlagSync(Internal.featureFlags?.Worktrees);
   const info = useAtomValue(repositoryInfo);
 
-  // Only show worktrees for EdenFS repos that are not git-based
-  return worktreesEnabled && info?.isEdenFs === true && info?.codeReviewSystem.type !== 'github';
+  // Show worktrees wherever `sl worktree` can host them: EdenFS checkouts, or git-backed
+  // repos where it delegates to `git worktree`. GitHub is still excluded for EdenFS.
+  return (
+    worktreesEnabled &&
+    info?.worktreesSupported === true &&
+    !(info?.isEdenFs === true && info?.codeReviewSystem.type === 'github')
+  );
 }
 
 /** Top-bar button, next to the branches button, showing the same worktree info as the repo dropdown. */
