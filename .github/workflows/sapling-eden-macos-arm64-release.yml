@@ -15,15 +15,6 @@ on:
       - eden-test-*
 
 env:
-  # Must be an absolute path with no .. segments: actions/cache's glob
-  # matcher rejects relative pathing outright ("Invalid pattern ... Relative
-  # pathing '.' and '..' is not allowed"), which silently no-op'd both
-  # "Restore getdeps scratch cache" and "Save getdeps scratch cache" on
-  # every run so far -- 0 files ever matched, so every run rebuilt from
-  # scratch regardless of what got cached. runner.temp is an absolute,
-  # runner-provided scratch dir outside the checkout, so this needs no ..
-  # to stay off the repo.
-  GETDEPS_SCRATCH: ${{ runner.temp }}/getdeps-scratch
   GETDEPS_JOBS: 3
   PYTHON310: /opt/homebrew/opt/python@3.10/bin/python3.10
   # The Rust openssl crate needs OPENSSL_DIR specifically (docs.rs/openssl);
@@ -75,6 +66,21 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set version
+        # GETDEPS_SCRATCH is computed here (not a plain env: value) because
+        # the runner context (needed for an absolute, outside-the-checkout
+        # path) isn't available in the workflow- or job-level env: block at
+        # all -- only inside step contexts -- confirmed the hard way when an
+        # earlier version of this file using `${{ runner.temp }}` in env:
+        # failed GitHub's own workflow-file validation outright, with zero
+        # jobs ever scheduled. $RUNNER_TEMP is the equivalent plain shell
+        # env var, always set within run: steps, so no expression needed.
+        # Must be an absolute path with no .. segments regardless:
+        # actions/cache's glob matcher rejects relative pathing outright
+        # ("Invalid pattern ... Relative pathing '.' and '..' is not
+        # allowed"), which is what silently no-op'd both "Restore getdeps
+        # scratch cache" and "Save getdeps scratch cache" on every run
+        # before this fix -- 0 files ever matched, so every run rebuilt
+        # from scratch regardless of what got cached.
         run: |
           VERSION="${{ github.event.inputs.version }}"
           if [ -z "$VERSION" ] && [ "${{ github.event_name }}" = "push" ]; then
@@ -87,6 +93,7 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "TAG=v${VERSION}" >> "$GITHUB_ENV"
           echo "ASSET=sapling-eden-${VERSION}-arm64_sequoia.tar.gz" >> "$GITHUB_ENV"
+          echo "GETDEPS_SCRATCH=$RUNNER_TEMP/getdeps-scratch" >> "$GITHUB_ENV"
 
       - name: Skip if already published (unless forced)
         # Same reasoning as the plain sapling workflow: a dispatch run that
