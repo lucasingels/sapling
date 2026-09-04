@@ -131,6 +131,17 @@ jobs:
       # below is the actual fix: it runs during job cleanup regardless of
       # what failed, so the *next* retry after any failure starts from
       # wherever this one got to, not from scratch again.
+      # Cache keys end in the run id, not just the manifests/patches hash:
+      # GitHub Actions caches are immutable per key (a second save under a
+      # key that already exists just fails, "another job may be creating
+      # this cache" or similar), so a static key lets exactly one run ever
+      # win the save and every later run -- even one that gets much
+      # further -- can never supersede it. Ending the key in ${{
+      # github.run_id }} (stable across re-runs of the *same* run, unique
+      # across different runs) means save always succeeds, and restore-keys
+      # below (a prefix match) always resolves to whichever run most
+      # recently saved one -- i.e. the most complete cache seen so far, not
+      # whichever happened to save first.
       - name: Restore getdeps scratch cache
         if: env.SKIP_BUILD != 'true'
         uses: actions/cache/restore@v6
@@ -139,14 +150,18 @@ jobs:
             ${{ env.GETDEPS_SCRATCH }}/installed
             ${{ env.GETDEPS_SCRATCH }}/downloads
             ${{ env.GETDEPS_SCRATCH }}/py310-tools
-          key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
+          key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
+          restore-keys: |
+            getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-
 
       - name: Restore sccache
         if: env.SKIP_BUILD != 'true'
         uses: actions/cache/restore@v6
         with:
           path: ~/Library/Caches/Mozilla.sccache
-          key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
+          key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-
 
       - name: Bootstrap py310-tools (Cython/pip/setuptools/wheel/delocate)
         if: env.SKIP_BUILD != 'true'
@@ -249,10 +264,8 @@ jobs:
       # if: always() is the actual point of the restore/save split above: run
       # these even when an earlier step failed, so whatever getdeps finished
       # building survives into the next retry instead of starting cold again.
-      # A cache entry is immutable once saved under a given key, so once one
-      # of these succeeds, later runs with the same manifests/patches hash
-      # just restore it (save silently no-ops on an existing key) -- this
-      # only matters for the run that gets further than any previous one.
+      # The run-id-suffixed key (see the Restore steps' comment) means this
+      # always succeeds instead of colliding with an earlier run's save.
       - name: Save getdeps scratch cache
         if: always() && env.SKIP_BUILD != 'true'
         uses: actions/cache/save@v6
@@ -261,11 +274,11 @@ jobs:
             ${{ env.GETDEPS_SCRATCH }}/installed
             ${{ env.GETDEPS_SCRATCH }}/downloads
             ${{ env.GETDEPS_SCRATCH }}/py310-tools
-          key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
+          key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
 
       - name: Save sccache
         if: always() && env.SKIP_BUILD != 'true'
         uses: actions/cache/save@v6
         with:
           path: ~/Library/Caches/Mozilla.sccache
-          key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}
+          key: sccache-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
