@@ -190,12 +190,19 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
             }
             util::path::strip_unc_prefix(util::path::canonical_path_allow_missing(value)?)
         }
-        None => run_path_generator(
-            repo,
-            &ctx.opts.label,
-            &canonical_repo_path,
-            require_generated,
-        )?,
+        None => {
+            let has_generator = repo.config().get("worktree", "path-generator").is_some();
+            if has_generator || require_generated || backend == Backend::Eden {
+                run_path_generator(
+                    repo,
+                    &ctx.opts.label,
+                    &canonical_repo_path,
+                    require_generated,
+                )?
+            } else {
+                crate::backend::default_nested_dest(repo, &ctx.opts.label)?
+            }
+        }
     };
 
     // Fast-fail before locking (re-checked inside lock).
@@ -203,7 +210,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         abort!("destination path '{}' already exists", dest.display());
     }
 
-    check_dest_not_in_repo(&dest)?;
+    check_dest(backend, &dest)?;
 
     let shared_store_path = repo.store_path().to_path_buf();
     let registry = load_registry(&shared_store_path)?;
@@ -368,7 +375,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         if dest.exists() {
             abort!("destination path '{}' already exists", dest.display());
         }
-        check_dest_not_in_repo(&dest)?;
+        check_dest(backend, &dest)?;
 
         let partial_checkout_warning = || {
             ctx.logger().warn(format!(
@@ -543,6 +550,17 @@ fn restore_snapshot_legacy(
     sapling_snapshot_checkout(&sl_bin, dest, &id).context("restoring snapshot")?;
 
     Ok(())
+}
+
+/// Validate the destination for the backend. An EdenFS checkout must not live
+/// inside another checkout. A git worktree may: `git worktree add name` at the
+/// repo root nests by design, and `git_worktree_add` excludes the directory from
+/// the parent's status.
+fn check_dest(backend: Backend, dest: &Path) -> Result<()> {
+    match backend {
+        Backend::Eden => check_dest_not_in_repo(dest),
+        Backend::Git => Ok(()),
+    }
 }
 
 fn resolve_group_for_main_path(

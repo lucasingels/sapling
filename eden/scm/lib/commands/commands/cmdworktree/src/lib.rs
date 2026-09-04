@@ -129,7 +129,10 @@ pub fn doc() -> &'static str {
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
-    choose the destination path.
+    choose the destination path when configured. Otherwise, for git-backed
+    repositories, the worktree is created at `<main root>/.worktrees/<label>`
+    (or `wt_N` without a label), the way `git worktree add <name>` nests by
+    default; the directory is excluded from the main checkout's status.
 
     Config options::
 

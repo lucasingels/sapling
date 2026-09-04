@@ -100,6 +100,51 @@ A worktree created with plain git shows up too:
     linked  $TESTTMP/wt2   second
     linked  $TESTTMP/wt3
 
+A worktree may live inside the main checkout, the way `git worktree add name`
+nests by default. sl excludes the directory from the main checkout's status:
+
+  $ cd $TESTTMP/repo
+  $ sl worktree add $TESTTMP/repo/.worktrees/nested --label nested
+  created linked worktree at $TESTTMP/repo/.worktrees/nested
+  $ sl status
+  $ git status --porcelain
+  $ grep '^/' .git/info/exclude
+  /.worktrees/
+  $ sl -R $TESTTMP/repo/.worktrees/nested log -r . -T '{desc}\n'
+  commit2
+  $ sl worktree list | grep nested
+    linked  $TESTTMP/repo/.worktrees/nested   nested
+
+Without a PATH the worktree goes under `.worktrees`, named after the label
+(made filesystem-safe) or `wt_N` without one; a taken name gets a suffix:
+
+  $ sl worktree add --label 'Ledger fix'
+  created linked worktree at $TESTTMP/repo/.worktrees/Ledger-fix
+  $ sl worktree add
+  created linked worktree at $TESTTMP/repo/.worktrees/wt_2
+  $ sl worktree add --label 'ledger/fix v2'
+  created linked worktree at $TESTTMP/repo/.worktrees/ledger-fix-v2
+  $ sl worktree add --label 'Ledger fix'
+  created linked worktree at $TESTTMP/repo/.worktrees/Ledger-fix_2
+  $ git -C $TESTTMP/repo/.worktrees/wt_2 symbolic-ref -q HEAD || echo detached
+  detached
+  $ sl worktree remove $TESTTMP/repo/.worktrees/Ledger-fix $TESTTMP/repo/.worktrees/Ledger-fix_2 $TESTTMP/repo/.worktrees/ledger-fix-v2 $TESTTMP/repo/.worktrees/wt_2 -y
+  removed $TESTTMP/repo/.worktrees/Ledger-fix
+  removed $TESTTMP/repo/.worktrees/Ledger-fix_2
+  removed $TESTTMP/repo/.worktrees/ledger-fix-v2
+  removed $TESTTMP/repo/.worktrees/wt_2
+
+A second nested worktree reuses the exclude entry:
+
+  $ sl worktree add $TESTTMP/repo/.worktrees/other
+  created linked worktree at $TESTTMP/repo/.worktrees/other
+  $ grep '^/' .git/info/exclude
+  /.worktrees/
+  $ sl worktree remove $TESTTMP/repo/.worktrees/nested $TESTTMP/repo/.worktrees/other -y
+  removed $TESTTMP/repo/.worktrees/nested
+  removed $TESTTMP/repo/.worktrees/other
+  $ sl status
+
 Commits made in a worktree are visible in the others:
 
   $ cd $TESTTMP/wt2
