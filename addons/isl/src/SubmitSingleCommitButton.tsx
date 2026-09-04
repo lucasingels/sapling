@@ -13,8 +13,8 @@ import {tracker} from './analytics';
 import {codeReviewProvider, diffSummary} from './codeReview/CodeReviewInfo';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
 import {publishWhenReady} from './codeReview/PublishWhenReadyCheckbox';
-import {t, T} from './i18n';
 import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
+import {t, T} from './i18n';
 import {readAtom} from './jotaiUtils';
 import {useRunOperation} from './operationsState';
 import {dagWithPreviews} from './previews';
@@ -65,7 +65,11 @@ export function SubmitSingleCommitButton() {
         icon
         data-testid="submit-button">
         <Icon icon="cloud-upload" slot="start" />
-        {shouldSubmitAsDraft ? <T>Submit Draft</T> : submitButtonVerb(provider)}
+        {shouldSubmitAsDraft ? (
+          <T replace={{$verb: submitButtonVerb(provider)}}>$verb Draft</T>
+        ) : (
+          submitButtonVerb(provider)
+        )}
       </Button>
     </Tooltip>
   );
