@@ -224,7 +224,7 @@ impl MultiLog {
             let msg = format!(
                 "Invalid lock used to write_meta (Lock path = {:?}, MultiLog path = {:?})",
                 lock.0.path(),
-                &self.path
+                self.path
             );
             return Err(crate::Error::programming(msg));
         }
@@ -966,7 +966,7 @@ Write valid MultiMeta"#
         assert_eq!(
             repair(),
             r#"Repairing MultiMeta Log:
-  Reset log size to 111
+  Reset log size to 113
   Rebuilt index "reverse"
 Repairing Log a
   Rebuilt index "x"

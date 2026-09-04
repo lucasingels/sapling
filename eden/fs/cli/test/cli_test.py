@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from eden.fs.cli import config as config_mod, main as main_mod, telemetry
+from eden.fs.cli import config as config_mod, main as main_mod, telemetry, util
 from eden.fs.cli.config import (
     CheckoutConfig,
     DEFAULT_REVISION,
@@ -147,12 +147,31 @@ class GlobalOptionEnvDefaultsTest(unittest.TestCase):
         self.assertEqual(args.config_dir, "/expanded/base/cfg")
 
 
+class CloneProtocolDefaultTest(unittest.TestCase):
+    def test_platform_default(self) -> None:
+        cases = (
+            ("darwin", True, util.NFS_MOUNT_PROTOCOL_STRING),
+            ("linux", False, util.FUSE_MOUNT_PROTOCOL_STRING),
+            ("win32", False, util.PRJFS_MOUNT_PROTOCOL_STRING),
+        )
+
+        for platform, use_nfs, protocol in cases:
+            with (
+                self.subTest(platform=platform),
+                patch.object(main_mod.sys, "platform", platform),
+            ):
+                args = main_mod.create_parser().parse_args(["clone", "repo", "path"])
+                self.assertEqual(args.nfs, use_nfs)
+                self.assertEqual(util.get_protocol(args.nfs), protocol)
+
+
 class RestartTest(unittest.TestCase):
     def make_restart_cmd(self) -> main_mod.RestartCmd:
         restart_cmd = main_mod.RestartCmd(argparse.ArgumentParser())
         restart_cmd.args = argparse.Namespace(
             allow_root=False,
             daemon_binary=None,
+            force_restart=False,
             migrate_to=None,
             preserved_vars=None,
             prompt=False,
@@ -246,6 +265,56 @@ class RestartTest(unittest.TestCase):
         telemetry_sample = telemetry_logger.samples[0]
         self.assertNotIn("reason", telemetry_sample.strings)
         self.assertNotIn("transport_name", telemetry_sample.strings)
+
+    def make_std_stream_mock(self, isatty: bool) -> MagicMock:
+        stream = MagicMock()
+        stream.isatty.return_value = isatty
+        return stream
+
+    def test_full_restart_skips_prompt_when_stdout_is_not_a_tty(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        instance = MagicMock()
+        stdout_mock = self.make_std_stream_mock(False)
+
+        with (
+            patch.object(main_mod.sys, "stdin", self.make_std_stream_mock(True)),
+            patch.object(main_mod.sys, "stdout", stdout_mock),
+            patch.object(main_mod, "prompt_confirmation") as prompt_confirmation,
+            patch.object(restart_cmd, "_do_stop") as do_stop,
+            patch.object(
+                restart_cmd, "_finish_restart", return_value=0
+            ) as finish_restart,
+        ):
+            self.assertEqual(
+                0, restart_cmd._full_restart(instance, 1234, None, True, False)
+            )
+
+        prompt_confirmation.assert_not_called()
+        do_stop.assert_called_once_with(
+            instance, 1234, timeout=main_mod.DEFAULT_STOP_TIMEOUT
+        )
+        finish_restart.assert_called_once_with(instance, allow_root=False)
+        written = "".join(str(c.args[0]) for c in stdout_mock.write.call_args_list)
+        self.assertIn("skipping confirmation", written)
+
+    def test_full_restart_prompts_when_stdin_and_stdout_are_ttys(self) -> None:
+        restart_cmd = self.make_restart_cmd()
+        instance = MagicMock()
+
+        with (
+            patch.object(main_mod.sys, "stdin", self.make_std_stream_mock(True)),
+            patch.object(main_mod.sys, "stdout", self.make_std_stream_mock(True)),
+            patch.object(
+                main_mod, "prompt_confirmation", return_value=False
+            ) as prompt_confirmation,
+            patch.object(restart_cmd, "_do_stop") as do_stop,
+        ):
+            self.assertEqual(
+                1, restart_cmd._full_restart(instance, 1234, None, True, False)
+            )
+
+        prompt_confirmation.assert_called_once_with("Proceed?")
+        do_stop.assert_not_called()
 
 
 class ListTest(unittest.TestCase):

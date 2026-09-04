@@ -515,7 +515,7 @@ pub struct StateEntered {
 
 impl fmt::Display for StateEntered {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", &self.name)
+        write!(f, "{}", self.name)
     }
 }
 
@@ -541,7 +541,7 @@ pub struct StateLeft {
 
 impl fmt::Display for StateLeft {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", &self.name,)
+        write!(f, "{}", self.name,)
     }
 }
 
@@ -699,8 +699,11 @@ impl EdenFsClient {
         sample.add_string("method", method);
         sample.add_string("session_id", &self.session_id);
         sample.add_string("type", "notifications");
-        sample.add_string("user", whoami::username());
-        sample.add_string("host", whoami::fallible::hostname().unwrap_or_default());
+        sample.add_string(
+            "user",
+            whoami::username().unwrap_or_else(|_| "unknown".to_owned()),
+        );
+        sample.add_string("host", whoami::hostname().unwrap_or_default());
         let _ = SCUBA_CLIENT.log(sample);
     }
 

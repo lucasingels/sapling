@@ -141,29 +141,12 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
-  // DEPRECATED: Use co_getSHA1 instead.
-  ImmediateFuture<Hash20> getSHA1(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
   folly::coro::now_task<Hash20> co_getSHA1(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
 
-  ImmediateFuture<Hash32> getBlake3(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
   folly::coro::now_task<Hash32> co_getBlake3(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
-
-  // DEPRECATED: Use co_getDigestHash instead.
-  ImmediateFuture<std::optional<Hash32>> getDigestHash(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext) const;
@@ -244,20 +227,10 @@ class VirtualInode {
   /**
    * Retrieves VirtualInode for each of the children of this
    * directory.
-   *
-   * fetchContext is used in the returned ImmediateFutures, it must have a
-   * lifetime longer than these futures.
    */
-  folly::Try<
-      std::vector<std::pair<PathComponent, ImmediateFuture<VirtualInode>>>>
-  getChildren(
-      RelativePathPiece path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext);
-
   folly::coro::now_task<
       std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
-  co_getChildren(
+  getChildren(
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
       const ObjectFetchContextPtr& fetchContext);
@@ -277,15 +250,6 @@ class VirtualInode {
    * Note: we return error values for attributes in some cases. See
    * fs/service/eden.thrift for more details on error conditions for each type.
    */
-  ImmediateFuture<
-      std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
-  getChildrenAttributes(
-      EntryAttributeFlags requestedAttributes,
-      RelativePath path,
-      const std::shared_ptr<ObjectStore>& objectStore,
-      timespec lastCheckoutTime,
-      const ObjectFetchContextPtr& fetchContext);
-
   folly::coro::now_task<
       std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
   co_getChildrenAttributes(
@@ -294,10 +258,6 @@ class VirtualInode {
       const std::shared_ptr<ObjectStore>& objectStore,
       timespec lastCheckoutTime,
       const ObjectFetchContextPtr& fetchContext);
-
-  ImmediateFuture<std::string> getBlob(
-      const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
 
   folly::coro::now_task<std::string> co_getBlob(
       const std::shared_ptr<ObjectStore>& objectStore,

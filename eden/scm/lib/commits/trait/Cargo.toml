@@ -13,13 +13,13 @@ license = "MIT"
 name = "commits_trait"
 
 [dependencies]
-anyhow = "1.0.103"
-async-trait = "0.1.86"
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 sapling-dag = { version = "0.1.0", path = "../../dag" }
 sapling-format-util = { version = "0.1.0", path = "../../util/format-util" }
 sapling-metalog = { version = "0.1.0", path = "../../metalog" }
 sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
 sapling-storemodel = { version = "0.1.0", path = "../../storemodel" }
 sapling-types = { version = "0.1.0", path = "../../types" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }

@@ -63,7 +63,6 @@ inline constexpr std::string_view kIsTakeover = "is_takeover";
 inline constexpr std::string_view kRepoSource = "repo_source";
 inline constexpr std::string_view kError = "error";
 inline constexpr std::string_view kInterface = "interface";
-inline constexpr std::string_view kIno = "ino";
 inline constexpr std::string_view kActionType = "action_type";
 
 // --- Fsck ---
@@ -173,7 +172,7 @@ inline constexpr std::string_view kRemountError = "remount_error";
 inline constexpr std::string_view kMountPath = "mount_path";
 inline constexpr std::string_view kPathType = "path_type";
 
-// --- SqliteIntegrityCheck ---
+// --- SqliteIntegrityCheck and FinishedCheckout ---
 inline constexpr std::string_view kNumErrors = "num_errors";
 
 // --- NfsCrawlDetected ---
@@ -223,6 +222,9 @@ inline constexpr std::string_view kStaleRedirectionsFailed =
     "stale_redirections_failed";
 inline constexpr std::string_view kStaleCheckoutMountUnmounted =
     "stale_checkout_mount_unmounted";
+
+// --- PrivhelperShutdown (also uses kExitSignal from SilentDaemonExit) ---
+inline constexpr std::string_view kExitCode = "exit_code";
 
 // --- CheckoutUpdateError (uses kPath and kReason from common fields) ---
 

@@ -87,6 +87,7 @@ use scuba_ext::ScubaValue;
 use source_control as thrift;
 use source_control_services::SourceControlService;
 use source_control_services::errors::source_control_service as service;
+use sql_ext::facebook::MysqlOptions;
 use srserver::RequestContext;
 use stats::prelude::*;
 use time_ext::DurationExt;
@@ -132,8 +133,6 @@ define_stats! {
     total_request_internal_failure_permille: timeseries(Average),
     total_request_invalid_permille: timeseries(Average),
 
-    // Duration per method
-    method_completion_time_ms: dynamic_histogram("method.{}.completion_time_ms", (method: String); 10, 0, 1_000, Average, Sum, Count; P 5; P 50 ; P 90),
     total_method_requests:  dynamic_timeseries("method.{}.total_method_requests", (method: String); Rate, Sum),
     total_method_internal_failure:  dynamic_timeseries("method.{}.total_method_internal_failure", (method: String); Rate, Sum),
 
@@ -153,6 +152,7 @@ pub struct SourceControlServiceImpl {
     pub(crate) acl_provider: Arc<dyn AclProvider>,
     #[allow(unused)]
     pub(crate) git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
+    pub(crate) mysql_options: MysqlOptions,
     pub(crate) watchdog_max_poll: u64,
     pub(crate) remote_diff_options: RemoteDiffOptions,
     /// KCB request-primary identity types, loaded once from Configerator at
@@ -194,6 +194,7 @@ impl SourceControlServiceImpl {
             async_requests_queue,
             acl_provider: app.environment().acl_provider.clone(),
             git_source_of_truth_config,
+            mysql_options: app.mysql_options().clone(),
             watchdog_max_poll,
             remote_diff_options: app.environment().remote_diff_options.clone(),
             request_primary_identity_types: load_request_primary_identity_types(app),
@@ -256,6 +257,16 @@ impl SourceControlServiceImpl {
         scuba.add("method", name);
         if let Some(specifier) = specifier {
             if let Some(reponame) = specifier.scuba_reponame() {
+                // Per-repo config provenance; mutation id is always None until plumbed.
+                if let Some(repo_config) = self.configs.repo_configs().repos.get(reponame.as_str())
+                {
+                    if let Some(version) = repo_config.config_version.clone() {
+                        scuba.add("repo_config_version", version);
+                    }
+                    if let Some(mutation_id) = repo_config.config_mutation_id {
+                        scuba.add("repo_config_mutation_id", mutation_id);
+                    }
+                }
                 scuba.add("reponame", reponame);
             }
             if let Some(commit) = specifier.scuba_commit() {
@@ -267,11 +278,6 @@ impl SourceControlServiceImpl {
             if let Some(tree_specifier) = specifier.scuba_param_tree_specifier() {
                 scuba.add("param_tree_specifier", tree_specifier);
             }
-        }
-
-        if let Some(config_info) = self.configs.as_ref().config_info().as_ref() {
-            scuba.add("config_store_version", config_info.content_hash.clone());
-            scuba.add("config_store_last_updated_at", config_info.last_updated_at);
         }
 
         let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
@@ -960,10 +966,6 @@ fn log_result<T: AddScubaResponse>(
     STATS::total_request_internal_failure_permille.add_value(internal_failure * 1000);
     STATS::total_request_invalid_permille.add_value(invalid_request * 1000);
     STATS::total_request_overloaded.add_value(overloaded);
-    STATS::method_completion_time_ms.add_value(
-        stats.completion_time.as_millis_unchecked() as i64,
-        (method.to_string(),),
-    );
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
@@ -1130,11 +1132,6 @@ fn log_stream_complete(
     STATS::total_request_internal_failure_permille.add_value(internal_failure * 1000);
     STATS::total_request_invalid_permille.add_value(invalid_request * 1000);
     STATS::total_request_overloaded.add_value(overloaded);
-    // Only accounts for the time to start the stream, not the overall time.
-    STATS::method_completion_time_ms.add_value(
-        initial_future_stats.completion_time.as_millis_unchecked() as i64,
-        (method.to_string(),),
-    );
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
@@ -1455,6 +1452,10 @@ impl SourceControlService for SourceControlServiceThriftImpl {
         async fn list_repos(
             params: thrift::ListReposParams,
         ) -> Result<Vec<thrift::Repo>, service::ListReposExn>;
+
+        async fn repo_exists(
+            params: thrift::RepoExistsParams,
+        ) -> Result<thrift::RepoExistsResponse, service::RepoExistsExn>;
 
         async fn repo_info(
             repo: thrift::RepoSpecifier,

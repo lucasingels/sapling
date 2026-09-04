@@ -17,6 +17,9 @@ use dashmap::DashMap;
 use types::RepoPath;
 use types::RepoPathBuf;
 
+use crate::wordset::Normalization;
+use crate::wordset::WordSet;
+
 /// Audit repositories path to make sure that it is safe to write/remove through them.
 ///
 /// This uses caching internally to avoid the heavy cost of querying the OS for each directory in
@@ -45,59 +48,9 @@ static INVALID_COMPONENTS: LazyLock<WordSet> = LazyLock::new(|| {
     WordSet::new(words)
 });
 
-/// A set of short words, for "contains" check.
-struct WordSet {
-    words_per_len: Vec<Vec<&'static str>>,
-}
-
-impl WordSet {
-    fn new(words: Vec<&'static str>) -> Self {
-        let max_len = words.iter().map(|w| w.len()).max().unwrap_or_default();
-        let mut words_per_len: Vec<Vec<&'static str>> = Vec::with_capacity(max_len + 1);
-        words_per_len.resize_with(max_len + 1, Default::default);
-        for word in words {
-            // Case-insensitive contains requires lowercase words.
-            assert_eq!(word, word.to_lowercase());
-            let words = &mut words_per_len[word.len()];
-            words.push(word);
-            // Case-insensitive contains uses u16 bits to track matches.
-            assert!(words.len() < 16);
-        }
-        Self { words_per_len }
-    }
-
-    fn contains(&self, s: &str, case_insensitive: bool) -> bool {
-        match self.words_per_len.get(s.len()) {
-            Some(words) if !words.is_empty() => {
-                if case_insensitive {
-                    // Scan `s` byte-by-byte to avoid allocation.
-                    let mut match_bits = u16::MAX;
-                    for (byte_pos, b) in s.bytes().enumerate() {
-                        let mut current_match_bits = 0u16;
-                        let b = b.to_ascii_lowercase();
-                        for (word_index, w) in words.iter().enumerate() {
-                            if Some(&b) == w.as_bytes().get(byte_pos) {
-                                current_match_bits |= 1u16 << word_index;
-                            }
-                        }
-                        match_bits &= current_match_bits;
-                        if match_bits == 0 {
-                            return false;
-                        }
-                    }
-                    match_bits != 0
-                } else {
-                    words.contains(&s)
-                }
-            }
-            None | Some(_) => false,
-        }
-    }
-}
-
 bitflags! {
-    #[derive(Copy, Clone)]
-    pub struct FsFeatures: u32 {
+    #[derive(Copy, Clone, Debug)]
+    pub struct FsFeatures: u8 {
         const CASE_INSENSITIVE = 1;
         /// `\` can be a path separator.
         const BACKSLASH_SEP = 2;
@@ -105,6 +58,15 @@ bitflags! {
         const WINDOWS_NAMES = 5;
         /// Certain characters are ignored by HFS+.
         const HFS_STRIP = 8;
+        /// Apple NFD normalization rules [1].
+        /// Changes `CASE_INSENSITIVE` to also do Unicode CaseFolding [2].
+        /// NFD case folding: `ſ` -> `s`, `ß` -> `ss`, `ﬂ` -> `fl`, `Ｓ` -> `ｓ`
+        /// NFD alone: `é` -> `e◌́`
+        /// NOT NFKD (Apple does not do these): `Ｓ` -> `S`, `．`/`․` -> `.`, `‥` -> `..`
+        /// Note: ASCII `.` does not have NFD alternatives.
+        /// [1]: https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html
+        /// [2]: https://www.unicode.org/Public/9.0.0/ucd/CaseFolding.txt
+        const APPLE_NFD = 16;
     }
 }
 
@@ -113,7 +75,7 @@ impl FsFeatures {
         if cfg!(windows) {
             Self::BACKSLASH_SEP | Self::WINDOWS_NAMES
         } else if cfg!(target_os = "macos") {
-            Self::HFS_STRIP
+            Self::HFS_STRIP | Self::APPLE_NFD
         } else {
             Self::empty()
         }
@@ -228,7 +190,9 @@ fn valid_windows_component(component: &str, fs_features: FsFeatures) -> bool {
         return true;
     }
     if let Some((l, r)) = component.split_once('~') {
-        if r.chars().any(|c| c.is_numeric()) && WINDOWS_SHORTNAME_ALIASES.contains(l, true) {
+        if r.chars().any(|c| c.is_numeric())
+            && WINDOWS_SHORTNAME_ALIASES.contains(l, Normalization::CASE)
+        {
             return false;
         }
     }
@@ -266,9 +230,17 @@ pub fn is_path_component_invalid(component: &str, fs_features: FsFeatures) -> bo
     } else {
         Cow::Borrowed(s)
     };
-    let case_insensitive = fs_features.contains(FsFeatures::CASE_INSENSITIVE);
+    let norm = {
+        // Use direct bits cast to avoid `if` branching in a hot loop (could add ~30% overhead).
+        debug_assert_eq!(
+            Normalization::CASE.bits(),
+            FsFeatures::CASE_INSENSITIVE.bits()
+        );
+        debug_assert_eq!(Normalization::NFD.bits(), FsFeatures::APPLE_NFD.bits());
+        Normalization::from_bits_truncate(fs_features.bits())
+    };
     s.is_empty()
-        || INVALID_COMPONENTS.contains(&s, case_insensitive)
+        || INVALID_COMPONENTS.contains(&s, norm)
         || !valid_windows_component(&s, fs_features)
 }
 
@@ -417,6 +389,21 @@ mod tests {
 
         // HFS chars in a normal component are fine
         assert!(audit_invalid_components("a/foo\u{200c}bar/b", hfs).is_ok());
+    }
+
+    #[test]
+    fn test_apple_nfd_case_folding() {
+        let flags = FsFeatures::APPLE_NFD | FsFeatures::CASE_INSENSITIVE;
+        assert!(audit_invalid_components("a/.ſl/b", flags).is_err());
+        assert!(audit_invalid_components("a/.ſl/b", FsFeatures::CASE_INSENSITIVE).is_ok());
+        assert!(audit_invalid_components("a/.ſl/b", FsFeatures::APPLE_NFD).is_ok());
+        assert!(audit_invalid_components("a/.é/b", flags).is_ok());
+        assert!(audit_invalid_components("a/.foo/b", flags).is_ok());
+        assert!(audit_invalid_components("a/é.foo/b", flags).is_ok());
+        assert!(audit_invalid_components("a/．sl/b", flags).is_ok());
+
+        let flags = flags | FsFeatures::HFS_STRIP;
+        assert!(audit_invalid_components("a/\u{200c}.ſl/b", flags).is_err());
     }
 
     #[test]

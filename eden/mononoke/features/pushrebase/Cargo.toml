@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blobrepo_utils = { version = "0.1.0", path = "../../blobrepo_utils" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
@@ -22,7 +22,7 @@ derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/rep
 filenodes_derivation = { version = "0.1.0", path = "../../derived_data/filenodes_derivation" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 maplit = "1.0"
@@ -38,13 +38,13 @@ scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 shared_error = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 strum = { version = "0.28.0", features = ["derive"] }
-thiserror = "2.0.18"
+thiserror = "2.0.20"
 three_way_merge = { version = "0.1.0", path = "../../common/three_way_merge" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-async-trait = "0.1.86"
+async-trait = "0.1.92"
 blobrepo_hg = { version = "0.1.0", path = "../../blobrepo/blobrepo_hg" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

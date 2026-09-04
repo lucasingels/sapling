@@ -17,6 +17,7 @@ use derived_data_remote::DerivationClient;
 use ephemeral_blobstore::BubbleId;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
+use metaconfig_types::DerivationPipelineConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use metaconfig_types::RepoConfig;
 use mononoke_types::ChangesetId;
@@ -244,6 +245,23 @@ impl DerivedDataManager {
         }
     }
 
+    // Replace the repo-level derivation pipeline config (used in tests to
+    // simulate a pipeline-enabled repo).
+    pub fn with_replaced_pipeline_config(
+        &self,
+        pipeline_config: Option<DerivationPipelineConfig>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DerivedDataManagerInner {
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_pipeline_config(pipeline_config),
+                ..self.inner.as_ref().clone()
+            }),
+        }
+    }
+
     pub fn with_replaced_derivation_service_client(
         &self,
         derivation_service_client: Option<Arc<dyn DerivationClient>>,
@@ -290,6 +308,11 @@ impl DerivedDataManager {
 
     pub fn config(&self) -> &DerivedDataTypesConfig {
         self.inner.derivation_context.config()
+    }
+
+    /// Repo-level derivation pipeline configuration, if the repo has one.
+    pub fn pipeline_config(&self) -> Option<&DerivationPipelineConfig> {
+        self.inner.derivation_context.pipeline_config()
     }
 
     pub fn config_name(&self) -> String {

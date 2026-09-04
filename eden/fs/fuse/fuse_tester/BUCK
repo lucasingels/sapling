@@ -10,7 +10,7 @@ cpp_binary(
         "ovr_config//os:macos",
     ],
     deps = [
-        "//eden/common/utils:case_sensitivity",
+        "fbsource//third-party/boost:boost_filesystem",
         "//eden/common/utils:enum",
         "//eden/common/utils:path",
         "//eden/common/utils:process_info_cache",
@@ -29,7 +29,6 @@ cpp_binary(
         "//folly/logging:logging",
     ],
     external_deps = [
-        ("boost", None, "boost_filesystem"),
         "gflags",
     ],
 )

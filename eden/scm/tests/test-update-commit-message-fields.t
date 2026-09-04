@@ -75,3 +75,13 @@ Can remove fields
   Summary: new summary
   
   Reviewers: otherperson
+
+commit --amend preserves existing fields when using --message-field
+  $ sl commit --amend -q --message-field="Summary=commit amend summary
+  > "
+  $ sl log -T '{desc}\n' -r .
+  new title
+  
+  Summary: commit amend summary
+  
+  Reviewers: otherperson

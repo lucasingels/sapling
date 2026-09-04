@@ -45,6 +45,7 @@ use mononoke_types::RepositoryId;
 
 pub use crate::store::SqlRepoManifestMapping;
 pub use crate::store::SqlRepoManifestMappingBuilder;
+pub use crate::store::is_configured;
 pub use crate::types::ManifestBranch;
 pub use crate::types::MembershipEdge;
 pub use crate::types::RepoBranch;
@@ -104,6 +105,15 @@ pub trait RepoManifestMapping: Send + Sync {
         watermark: Option<i64>,
     ) -> Result<()>;
 
+    /// Every manifest branch this repo has a watermark for, i.e. everything the
+    /// tailer has seen. The scope a periodic reconcile sweep runs over.
+    async fn list_manifest_branches(
+        &self,
+        ctx: &CoreContext,
+        manifest_repo_id: RepositoryId,
+        staleness: Staleness,
+    ) -> Result<Vec<ManifestBranch>>;
+
     /// Read the tailer watermark for one manifest branch (`None` if never set).
     async fn get_branch_watermark(
         &self,
@@ -131,6 +141,94 @@ pub trait RepoManifestMapping: Send + Sync {
         manifest_branch: &ManifestBranch,
         log_id: i64,
     ) -> Result<()>;
+}
+
+/// The facet for a repo whose config declares no routing tier.
+///
+/// Fails rather than reporting empty like [`NoopRepoManifestMapping`]: an empty
+/// answer is indistinguishable from a genuine miss, so a caller would silently
+/// skip re-pinning instead of learning it asked the wrong repo.
+#[derive(Clone)]
+pub struct UnconfiguredRepoManifestMapping;
+
+impl UnconfiguredRepoManifestMapping {
+    fn error<T>(&self) -> Result<T> {
+        Err(anyhow::anyhow!(
+            "this repo declares no repo_manifest_mapping database; only a manifest repo has one"
+        ))
+    }
+}
+
+#[async_trait]
+impl RepoManifestMapping for UnconfiguredRepoManifestMapping {
+    async fn manifest_branches_for_repo(
+        &self,
+        _ctx: &CoreContext,
+        _repo_name: &RepoName,
+        _repo_branch: &RepoBranch,
+        _staleness: Staleness,
+    ) -> Result<Vec<(RepositoryId, ManifestBranch)>> {
+        self.error()
+    }
+
+    async fn members_for_manifest_branch(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _manifest_branch: &ManifestBranch,
+        _staleness: Staleness,
+    ) -> Result<Vec<MembershipEdge>> {
+        self.error()
+    }
+
+    async fn replace_membership(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _manifest_branch: &ManifestBranch,
+        _edges: &[MembershipEdge],
+        _watermark: Option<i64>,
+    ) -> Result<()> {
+        self.error()
+    }
+
+    async fn list_manifest_branches(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _staleness: Staleness,
+    ) -> Result<Vec<ManifestBranch>> {
+        self.error()
+    }
+
+    async fn get_branch_watermark(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _manifest_branch: &ManifestBranch,
+        _staleness: Staleness,
+    ) -> Result<Option<i64>> {
+        self.error()
+    }
+
+    async fn get_read_cursor(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _staleness: Staleness,
+    ) -> Result<Option<i64>> {
+        self.error()
+    }
+
+    async fn set_branch_watermark(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _manifest_branch: &ManifestBranch,
+        _log_id: i64,
+    ) -> Result<()> {
+        self.error()
+    }
 }
 
 /// A no-op double that stores nothing and reports empty/ok everywhere, for
@@ -169,6 +267,15 @@ impl RepoManifestMapping for NoopRepoManifestMapping {
         _watermark: Option<i64>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    async fn list_manifest_branches(
+        &self,
+        _ctx: &CoreContext,
+        _manifest_repo_id: RepositoryId,
+        _staleness: Staleness,
+    ) -> Result<Vec<ManifestBranch>> {
+        Ok(vec![])
     }
 
     async fn get_branch_watermark(
@@ -299,6 +406,23 @@ impl RepoManifestMapping for TestRepoManifestMapping {
                 .insert((manifest_repo_id, manifest_branch.clone()), log_id);
         }
         Ok(())
+    }
+
+    async fn list_manifest_branches(
+        &self,
+        _ctx: &CoreContext,
+        manifest_repo_id: RepositoryId,
+        _staleness: Staleness,
+    ) -> Result<Vec<ManifestBranch>> {
+        let state = self.state.lock().expect("poisoned lock");
+        let mut branches: Vec<ManifestBranch> = state
+            .watermarks
+            .keys()
+            .filter(|(repo_id, _)| *repo_id == manifest_repo_id)
+            .map(|(_, branch)| branch.clone())
+            .collect();
+        branches.sort();
+        Ok(branches)
     }
 
     async fn get_branch_watermark(

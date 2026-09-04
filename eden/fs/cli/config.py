@@ -449,16 +449,18 @@ class EdenInstance(AbstractEdenInstance):
         if "INTEGRATION_TEST" in os.environ or "EDENFS_UNITTEST" in os.environ:
             return telemetry.NullTelemetryLogger()
 
-        if self.get_config_bool("telemetry.enable-xplatlogger-events", default=False):
-            try:
-                # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
-                from eden.fs.cli.facebook.xplat_logger import XplatLogger  # @manual
+        try:
+            # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
+            from eden.fs.cli.facebook.xplat_logger import get_xplat_logger  # @manual
 
-                return XplatLogger()
-            except ImportError:
-                pass
-            except Exception as ex:
-                log.warning(f"XplatLogger construction failed, falling back: {ex}")
+            # Python CLI telemetry continues to use edenfs_events. Other
+            # destinations request their own view from the same transport.
+            return get_xplat_logger()
+        except ImportError:
+            # OSS / non-internal builds do not ship XplatLogger; use the legacy loggers.
+            pass
+        except Exception as ex:
+            log.warning(f"XplatLogger construction failed, falling back: {ex}")
 
         try:
             # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
@@ -1584,7 +1586,7 @@ class EdenCheckout:
 
         mount_protocol = repository.get("protocol")
         if not isinstance(mount_protocol, str):
-            mount_protocol = "prjfs" if sys.platform == "win32" else "fuse"
+            mount_protocol = util.get_platform_default_mount_protocol()
         if mount_protocol not in SUPPORTED_MOUNT_PROTOCOLS:
             raise CheckoutConfigCorruptedError(
                 f'repository "{config_path}" has unsupported mount protocol '
@@ -1889,8 +1891,6 @@ def parse_snapshot_component(buf: bytes, scm_type: str) -> Tuple[str, Optional[b
     return decoded_hash, filter_bytes
 
 
-_MIGRATE_EXISTING_TO_NFS = "core.migrate_existing_to_nfs"
-_MIGRATE_EXISTING_TO_NFS_ALL_MACOS = "core.migrate_existing_to_nfs_all_macos"
 _FUSE_USE_IO_URING = "fuse.use-io-uring"
 _FUSE_IO_URING_KERNEL_RELEASE_REGEX = "fuse.io-uring-kernel-release-regex"
 _FUSE_RESTART_ON_TRANSPORT_MISMATCH = "fuse.restart-on-transport-mismatch"
@@ -1904,26 +1904,6 @@ class FuseTransportMismatch(typing.NamedTuple):
     mount: Path
     active_transport: str
     desired_transport: str
-
-
-# Fuse is still not functional on Ventura, so users will need to use NFS on
-# Ventura.
-def should_migrate_mount_protocol_to_nfs(instance: AbstractEdenInstance) -> bool:
-    if sys.platform != "darwin":
-        return False
-
-    if util.is_sandcastle():
-        return False
-
-    if instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS_ALL_MACOS, default=False):
-        return True
-
-    ventura_os_version = "22.0.0"
-
-    if tuple(os.uname().release.split(".")) >= tuple(ventura_os_version.split(".")):
-        return instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS, default=False)
-
-    return False
 
 
 def is_fuse_transport_mismatch_restart_enabled(
@@ -2004,14 +1984,6 @@ def should_migrate_inode_catalog_to_in_memory(instance: AbstractEdenInstance) ->
     return False
 
 
-def count_non_nfs_mounts(instance: AbstractEdenInstance) -> int:
-    count = 0
-    for checkout in instance.get_checkouts():
-        if checkout.get_config().mount_protocol != util.NFS_MOUNT_PROTOCOL_STRING:
-            count += 1
-    return count
-
-
 def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
     count = 0
     for checkout in instance.get_checkouts():
@@ -2021,35 +1993,6 @@ def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
         ):
             count += 1
     return count
-
-
-def count_nfs_migrations_needing_full_restart(instance: AbstractEdenInstance) -> int:
-    if sys.platform != "darwin":
-        return 0
-
-    if not instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS_ALL_MACOS, default=False):
-        return 0
-
-    return count_non_nfs_mounts(instance)
-
-
-# Checks for any non NFS mounts and migrates them to NFS.
-def _do_nfs_migration(
-    instance: EdenInstance, get_migration_success_message: Callable[[str], str]
-) -> None:
-    if count_non_nfs_mounts(instance) == 0:
-        # most the time this should be the case. we only need to migrate mounts
-        # once, and then we should just be able to skip this all other times.
-        return
-
-    print("migrating mounts to NFS ...")
-
-    for checkout in instance.get_checkouts():
-        if checkout.get_config().mount_protocol != util.NFS_MOUNT_PROTOCOL_STRING:
-            checkout.migrate_mount_protocol(util.NFS_MOUNT_PROTOCOL_STRING)
-
-    instance.log_sample("migrate_existing_clones_to_nfs")
-    print(get_migration_success_message(util.NFS_MOUNT_PROTOCOL_STRING))
 
 
 # Checks for any non in memory catalogs and migrates them to in memory.

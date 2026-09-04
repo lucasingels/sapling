@@ -197,6 +197,7 @@ function useFetchActiveDiffDetails(diffId?: string) {
       serverAPI.postMessage({
         type: 'fetchDiffSummaries',
         diffIds: [diffId],
+        partial: true,
       });
       tracker.track('DiffFetchSource', {extras: {source: 'active_diff_details'}});
     }
@@ -472,7 +473,11 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             <div className="changed-file-list">
               <div className="button-row">
                 <OpenComparisonViewButton
-                  comparison={{type: ComparisonType.Committed, hash: commit.hash}}
+                  comparison={
+                    commit.isDot && !isOptimistic && uncommittedChanges.length === 0
+                      ? {type: ComparisonType.HeadChanges}
+                      : {type: ComparisonType.Committed, hash: commit.hash}
+                  }
                 />
                 <OpenAllFilesButton commit={commit} />
                 <SplitButton trackerEventName="SplitOpenFromSplitSuggestion" commit={commit} />

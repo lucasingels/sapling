@@ -33,6 +33,7 @@ class PrivHelper;
 class ProcessInfoCache;
 class EdenFsEventsLogger;
 class FsEventLogger;
+class ReloadableConfig;
 
 namespace detail {
 /**
@@ -167,7 +168,8 @@ class Nfsd3 final : public FsChannel {
       std::chrono::nanoseconds highNfsRequestsLogInterval,
       std::chrono::nanoseconds longRunningFSRequestThreshold,
       size_t traceBusCapacity,
-      bool fastPathRPCs);
+      bool fastPathRPCs,
+      std::shared_ptr<ReloadableConfig> config);
 
   void destroy() override;
 
@@ -338,6 +340,7 @@ class Nfsd3 final : public FsChannel {
   EdenStatsPtr stats_;
   std::shared_ptr<RpcServer> server_;
   ProcessAccessLog processAccessLog_;
+  std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
   // It is critical that this is a SerialExecutor. invalidation for parent
   // directories should happen after children, and we flush invalidations by
   // adding one work item to the queue.

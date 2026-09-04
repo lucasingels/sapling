@@ -13,6 +13,7 @@ import concurrent.futures
 import enum
 import errno
 import inspect
+import io
 import json
 import os
 import platform
@@ -153,7 +154,6 @@ from eden.fs.cli.telemetry import TelemetrySample
 from eden.fs.cli.util import (
     check_health_using_lockfile,
     EdenStartError,
-    is_apple_silicon,
     wait_for_instance_healthy,
 )
 from eden.fs.service.eden.thrift_types import EdenError
@@ -535,7 +535,10 @@ class CloneCmd(Subcmd):
             "--nfs",
             dest="nfs",
             action="store_true",
-            default=is_apple_silicon(),
+            default=(
+                util.get_platform_default_mount_protocol()
+                == util.NFS_MOUNT_PROTOCOL_STRING
+            ),
             help=argparse.SUPPRESS,
         )
 
@@ -628,12 +631,12 @@ class CloneCmd(Subcmd):
         # pyre-fixme[53]: Captured variable `instance` is not annotated.
         # pyre-fixme[3]: Return type must be annotated.
         def is_nfs_default():
-            default_protocol = "PrjFS" if sys.platform == "win32" else "FUSE"
+            default_protocol = util.get_platform_default_mount_protocol()
             return (
                 instance.get_config_value(
                     "clone.default-mount-protocol", default_protocol
-                ).upper()
-                == "NFS"
+                ).lower()
+                == util.NFS_MOUNT_PROTOCOL_STRING
             )
 
         args.path = os.path.realpath(args.path)
@@ -946,6 +949,9 @@ class ReloadConfigCmd(Subcmd):
         raise NotImplementedError("Stub -- only implemented in Rust")
 
 
+CLAUDE_TIMEOUT_SECS = 120
+
+
 @subcmd("doctor", "Debug and fix issues with EdenFS")
 class DoctorCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -998,6 +1004,93 @@ class DoctorCmd(Subcmd):
         if args.current_edenfs_only:
             doctor.run_system_wide_checks = False
         return doctor.cure_what_ails_you()
+
+
+@subcmd("doctor-ai", "Run eden doctor and, on failure, ask local AI for diagnosis")
+class DoctorAICmd(Subcmd):
+    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--claude-timeout-secs",
+            type=int,
+            default=CLAUDE_TIMEOUT_SECS,
+            help="Timeout for the local claude diagnosis subprocess.",
+        )
+
+    def run(self, args: argparse.Namespace) -> int:
+        instance = get_eden_instance(args)
+        doctor_output = io.StringIO()
+        doctor_returncode = doctor_mod.cure_what_ails_you(
+            instance,
+            dry_run=False,
+            debug=args.debug,
+            fast=False,
+            wait=False,
+            min_severity_to_report=ProblemSeverity.ALL,
+            out=ui.PlainOutput(doctor_output),
+        )
+
+        doctor_text = doctor_output.getvalue()
+        if doctor_text:
+            sys.stdout.write(doctor_text)
+            if not doctor_text.endswith("\n"):
+                sys.stdout.write("\n")
+        if doctor_returncode == 0:
+            return doctor_returncode
+
+        print("\nAI diagnosis follows.\n", file=sys.stderr)
+        prompt = f"""Use the local `diagnose-sapling` skill on this `eden doctor` output.
+
+{doctor_text.strip()}
+"""
+        claude_env = os.environ.copy()
+        claude_env.pop("CLAUDECODE", None)
+        try:
+            claude_result = subprocess.run(
+                ["claude", "--print"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=args.claude_timeout_secs,
+                env=claude_env,
+                check=False,
+            )
+        except FileNotFoundError:
+            print(
+                "Local `claude` was not found on PATH; skipping AI diagnosis.",
+                file=sys.stderr,
+            )
+            return doctor_returncode
+        except subprocess.TimeoutExpired as ex:
+            stdout = (
+                ex.stdout.decode(errors="replace")
+                if isinstance(ex.stdout, bytes)
+                else (ex.stdout or "")
+            )
+            stderr = (
+                ex.stderr.decode(errors="replace")
+                if isinstance(ex.stderr, bytes)
+                else (ex.stderr or "")
+            )
+            print(
+                "Local `claude` timed out while generating the diagnosis.",
+                file=sys.stderr,
+            )
+            if stdout:
+                sys.stdout.write(stdout)
+            if stderr:
+                sys.stderr.write(stderr)
+            return doctor_returncode
+
+        if claude_result.returncode != 0:
+            print(
+                "Local `claude` failed while generating the diagnosis.",
+                file=sys.stderr,
+            )
+        if claude_result.stdout:
+            sys.stdout.write(claude_result.stdout)
+        if claude_result.stderr:
+            sys.stderr.write(claude_result.stderr)
+        return doctor_returncode
 
 
 @subcmd("health-report", "Notify critical eden issues")
@@ -2416,8 +2509,6 @@ class StartCmd(Subcmd):
                 instance, daemon_binary, args.edenfs_args, args.preserved_vars
             )
 
-        if config_mod.should_migrate_mount_protocol_to_nfs(instance):
-            config_mod._do_nfs_migration(instance, get_migration_success_message)
         if config_mod.should_migrate_inode_catalog_to_in_memory(instance):
             config_mod._do_in_memory_inode_catalog_migration(instance)
         result = daemon.start_edenfs_service(
@@ -2492,7 +2583,7 @@ class StartCmd(Subcmd):
                 cmd = ["strace", "-fttT", "-o", args.strace] + cmd
 
         # Wrap the command in sudo, if necessary
-        eden_env = daemon.get_edenfs_environment(args.preserved_vars)
+        eden_env = daemon.get_edenfs_environment(instance, args.preserved_vars)
         cmd, eden_env = daemon.prepare_edenfs_privileges(
             daemon_binary, cmd, eden_env, privhelper
         )
@@ -3053,18 +3144,26 @@ Any programs using files or directories inside the EdenFS mounts will need to
 re-open these files after EdenFS is restarted.
 """
         )
-        if not self.args.force_restart and sys.stdin.isatty():
+        # Only prompt when the user can actually see the prompt. If stdout is
+        # redirected (e.g. to a log file) the prompt is invisible and input()
+        # would block forever, so fall through to the same non-interactive
+        # behavior used for non-TTY stdin instead, with a notice so the skip
+        # is visible in the log or pipe output.
+        if not self.args.force_restart and sys.stdin.isatty() and sys.stdout.isatty():
             if prompt and not prompt_confirmation("Proceed?"):
                 print("Not confirmed.")
                 return 1
+        elif not self.args.force_restart and prompt and sys.stdin.isatty():
+            print(
+                "stdout is not a terminal; skipping confirmation and proceeding "
+                "with full restart"
+            )
 
         self._do_stop(instance, old_pid, timeout=DEFAULT_STOP_TIMEOUT)
         if migrate_to is not None:
             config_mod._do_manual_migration(
                 instance, migrate_to, get_migration_success_message
             )
-        elif config_mod.should_migrate_mount_protocol_to_nfs(instance):
-            config_mod._do_nfs_migration(instance, get_migration_success_message)
         return self._finish_restart(instance, allow_root=allow_root)
 
     def _force_restart(

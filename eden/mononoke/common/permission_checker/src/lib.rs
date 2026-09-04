@@ -15,13 +15,14 @@ mod membership;
 #[cfg(not(fbcode_build))]
 mod oss;
 mod provider;
-mod shadow;
 
 pub use checker::ArcPermissionChecker;
 pub use checker::BoxPermissionChecker;
+pub use checker::DenialReason;
 pub use checker::PermissionCheckResult;
 pub use checker::PermissionChecker;
 pub use checker::PermissionCheckerBuilder;
+pub use checker::PermissionDenial;
 #[cfg(fbcode_build)]
 pub use facebook::AccessCheckerProvider;
 pub use identity::ClientCategory;
@@ -39,9 +40,6 @@ pub use membership::MemberAllowlist;
 pub use membership::MembershipChecker;
 pub use membership::NeverMember;
 pub use provider::AclProvider;
-pub use shadow::ShadowAclProvider;
-#[cfg(fbcode_build)]
-pub type DefaultAclProvider = facebook::HipsterAclProvider;
 
 #[cfg(not(fbcode_build))]
 pub type DefaultAclProvider = dummy::DummyAclProvider;

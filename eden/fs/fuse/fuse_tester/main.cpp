@@ -16,7 +16,6 @@
 #include <sysexits.h>
 #include <csignal>
 
-#include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/ProcessInfoCache.h"
@@ -130,7 +129,7 @@ int main(int argc, char** argv) {
   auto dispatcher =
       std::make_unique<TestDispatcher>(std::move(stats), identity);
 
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   folly::Logger straceLogger{"eden.strace"};
 
@@ -148,7 +147,6 @@ int main(int argc, char** argv) {
       /*errorLogger=*/noopErrorLogger,
       std::chrono::seconds(60),
       /*notifications=*/nullptr,
-      CaseSensitivity::Sensitive,
       /*requireUtf8Path=*/true,
       /*maximumBackgroundRequests=*/12 /* the default on Linux */,
       /*maximumInFlightRequests=*/(size_t)1000,

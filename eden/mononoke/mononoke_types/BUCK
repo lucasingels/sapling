@@ -5,11 +5,6 @@ oncall("scm_server_treehugger")
 rust_library(
     name = "mononoke_types",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
-        }
-    },
     test_deps = [
         "fbsource//third-party/rust:crossbeam",
         "fbsource//third-party/rust:paste",
@@ -49,7 +44,7 @@ rust_library(
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
-        "fbsource//third-party/rust:sha1",
+        "fbsource//third-party/rust:sha1-010",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:strum",
         "fbsource//third-party/rust:thiserror",

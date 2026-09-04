@@ -10,7 +10,6 @@ sl_rust_library(
             "dependencies_override": {
                 "dependencies": {
                     "sapling-minibytes": {"features": ["frombytes"]},
-                    "sapling-version": {"path": "../version"},
                 },
             },
             "features": {
@@ -63,8 +62,8 @@ sl_rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_derive",
         "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:sha1",
-        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:sha1-010",
+        "fbsource//third-party/rust:sha2-010",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tokio-stream",
@@ -97,6 +96,7 @@ sl_rust_library(
         "//eden/scm/lib/util:util",
         "//eden/scm/lib/util/format-util:format-util",
         "//eden/scm/lib/util/redacted:redacted",
+        "//eden/scm/lib/util/try-once-lock:try-once-lock",
         "//eden/scm/lib/version:rust_version",
         "//eden/scm/lib/vlqencoding:vlqencoding",
     ],

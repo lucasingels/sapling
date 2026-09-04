@@ -201,6 +201,10 @@ struct Repo {
   1: string name;
 }
 
+struct RepoExistsResponse {
+  1: bool exists;
+}
+
 /// This structure can be bigger and contain more detailed repository info.
 struct RepoInfo {
   1: string name;
@@ -909,6 +913,11 @@ struct ListReposParams {
   /// If provided, list repos with the matching identity schemes only.
   /// Otherwise, list all repos.
   1: optional set<CommitIdentityScheme> identity_schemes;
+}
+
+struct RepoExistsParams {
+  /// Plain name rather than a RepoSpecifier, to keep the method global.
+  1: string repo_name;
 }
 
 struct RepoResolveBookmarkParams {
@@ -1678,6 +1687,7 @@ struct RunAsIdentity {
 }
 
 /// The set of identities to run hooks as. See `CommitRunHooksParams.run_as`.
+@hack.MigrationBlockingLegacyJSONSerialization
 union RunAsIdentities {
   /// A list of plain type/data identities. Sufficient for hooks that match
   /// on identity type and data only.
@@ -2031,6 +2041,11 @@ struct RepoCreationRequest {
   4: optional CustomAclParams custom_acl;
   /// Size bucket (allows for provisioning the right amount of resources for the new repo)
   5: RepoSizeBucket size_bucket;
+  /// Short branch name (e.g. "main", not a full ref like "refs/heads/main")
+  /// that the repo's HEAD symref points at from creation. When unset, no HEAD
+  /// symref is written; clones of the repo will have no default branch until
+  /// one is created manually (mononoke_admin git-symref).
+  6: optional string default_branch;
 }
 
 struct CreateReposParams {
@@ -3299,6 +3314,7 @@ stateful client exception HookRejectionsException {
 
 /// Identifies the restricted resource that an authorization check denied:
 /// either a path, or a manifest id (as a hex string).
+@hack.MigrationBlockingLegacyJSONSerialization
 union RestrictedPathAccess {
   1: string path;
   2: string manifest_id;
@@ -3324,6 +3340,18 @@ service SourceControlService extends fb303_core.BaseService {
 
   /// Get a list of all repositories.
   list<Repo> list_repos(1: ListReposParams params) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Check whether a repository exists.
+  ///
+  /// Deliberately global: callers ask this about repos that may not exist, and
+  /// a RepoSpecifier would make clients shard-route on the repo name, failing
+  /// in service routing before reaching a server. Answered from the tier-wide
+  /// repo list, so any task can answer for any repo.
+  RepoExistsResponse repo_exists(1: RepoExistsParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
@@ -4064,6 +4092,10 @@ service SourceControlService extends fb303_core.BaseService {
   /// Repository management methods
   /// ==============================
 
+  /// Create the requested repos in Mononoke. For each request that sets
+  /// `default_branch`, the repo's HEAD symref is written to point at that
+  /// branch at creation time (and deleted again if the creation fails or is
+  /// aborted).
   CreateReposToken create_repos(1: CreateReposParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,

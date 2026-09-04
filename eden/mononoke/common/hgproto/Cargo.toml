@@ -8,10 +8,10 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 async-stream = "0.3"
 bytes = { version = "1.12.1", features = ["serde"] }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 hex = { version = "0.4.3", features = ["alloc"] }
 itertools = "0.15.0"
 mercurial_bundles = { version = "0.1.0", path = "../../mercurial/bundles" }
@@ -19,9 +19,9 @@ mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 nom = "8"
 pin-project = "1.1.13"
 qps = { version = "0.1.0", path = "../../servers/slapi/slapi_server/qps" }
-thiserror = "2.0.18"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
-tokio-util = { version = "0.7.18", features = ["full"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio-util = { version = "0.7.19", features = ["full"] }
 
 [dev-dependencies]
 maplit = "1.0"

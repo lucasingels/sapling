@@ -9,10 +9,12 @@
 
 #include <folly/CancellationToken.h>
 #include <folly/CppAttributes.h>
+#include <folly/Executor.h>
 #include <folly/File.h>
 #include <folly/Function.h>
 #include <folly/Portability.h>
 #include <folly/Synchronized.h>
+#include <folly/container/F14Set.h>
 #include <folly/coro/safe/NowTask.h>
 #include <chrono>
 #include <memory>
@@ -37,6 +39,7 @@ class CheckoutContext;
 class MiniTracer;
 class DeferredDiffEntry;
 class DiffContext;
+class FuseChannel;
 class FuseDirList;
 class NfsDirList;
 class EdenMount;
@@ -74,7 +77,7 @@ struct TreeInodeState {
     treeId = std::nullopt;
   }
 
-  DirContents entries;
+  DirEntries entries;
 
   /**
    * If this TreeInode is unmaterialized (identical to an existing source
@@ -202,17 +205,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * the inode load is already-in-progress, this may NOT return the loading
    * inode. Otherwise, the returned VirtualInode may contain a ObjectStore
    * Tree or a DirEntry/TreeEntry representing the entry.
-   */
-  std::vector<std::pair<PathComponent, ImmediateFuture<VirtualInode>>>
-  getChildren(const ObjectFetchContextPtr& context, bool loadInodes);
-
-  /**
-   * Coroutine variant of getChildren() returning eagerly-resolved
-   * Try<VirtualInode> values instead of per-entry ImmediateFutures.
+   *
+   * Returns the user-visible view: restricted roots are omitted in omitted
+   * mode.
    */
   folly::coro::now_task<
       std::vector<std::pair<PathComponent, folly::Try<VirtualInode>>>>
-  co_getChildren(const ObjectFetchContextPtr& context, bool loadInodes = false);
+  getChildren(const ObjectFetchContextPtr& context, bool loadInodes = false);
 
   /**
    * Pipelined coroutine version of getChildren + getEntryAttributes.
@@ -220,10 +219,13 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * Each child task does (resolve VirtualInode → fetch attributes) in
    * sequence, and all child tasks run in parallel under a single
    * collectAllTryRange. This avoids the barrier between phases that a
-   * separate co_getChildren followed by per-attr tasks would impose,
+   * separate getChildren followed by per-attr tasks would impose,
    * preserving the latency profile of the original futures-based
    * implementation while still avoiding the ImmediateFuture wrapper
    * overhead.
+   *
+   * Returns the user-visible view: restricted roots are omitted in omitted
+   * mode.
    */
   folly::coro::now_task<
       std::vector<std::pair<PathComponent, folly::Try<EntryAttributes>>>>
@@ -259,10 +261,6 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    * The Inode object in question, and all intervening TreeInode objects,
    * will be loaded if they are not already loaded.
    */
-  ImmediateFuture<InodePtr> getChildRecursive(
-      RelativePathPiece name,
-      const ObjectFetchContextPtr& context);
-
   folly::coro::now_task<InodePtr> co_getChildRecursive(
       RelativePathPiece name,
       const ObjectFetchContextPtr& context);
@@ -274,7 +272,8 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       TreeInodePtr newParent,
       PathComponentPiece newName,
       InvalidationRequired invalidate,
-      const ObjectFetchContextPtr& context);
+      const ObjectFetchContextPtr& context,
+      bool noReplace = false);
 
 #ifndef _WIN32
   FuseDirList fuseReaddir(
@@ -351,14 +350,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
     return contents_.rlock()->isMaterialized();
   }
 
-  /**
-   * Get the digest id for this inode.
-   *
-   * DEPRECATED: Use co_getDigestHash() instead.
-   */
-  ImmediateFuture<std::optional<Hash32>> getDigestHash(
-      const ObjectFetchContextPtr& fetchContext);
-
+  /** Get the digest id for this inode. */
   folly::coro::now_task<std::optional<Hash32>> co_getDigestHash(
       const ObjectFetchContextPtr& fetchContext);
 
@@ -612,7 +604,16 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    *
    * Returns the number of inodes unloaded.
    */
-  size_t unloadChildrenUnreferencedByFs();
+  size_t unloadChildrenUnreferencedByFs(
+      const folly::CancellationToken& cancellationToken = {});
+
+  struct InodeGCUnloadResult {
+    size_t unloaded{0};
+    size_t zeroFsRefTreesRetained{0};
+  };
+
+  InodeGCUnloadResult unloadChildrenUnreferencedByFsForInodeGC(
+      const folly::CancellationToken& cancellationToken = {});
 
 #ifndef _WIN32
   /**
@@ -621,27 +622,41 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
    *
    * Returns the number of inodes unloaded.
    */
-  size_t unloadChildrenLastAccessedBefore(const timespec& cutoff);
+  size_t unloadChildrenLastAccessedBefore(
+      const timespec& cutoff,
+      const folly::CancellationToken& cancellationToken = {});
 #endif
 
   /**
    * The first step of inode garbage collection.
-   * This step behaves differently depending on the platform:
-   * - On Linux, FUSE decreases the FS ref couunt by itself. Therefore we don't
-   *   need to decrease FS ref count manually. We only unload not recently used
-   *   inodes here
+   * This step behaves differently depending on the platform and GC policy:
+   * - On Linux, pressure-based FUSE GC invalidates old directory entries to
+   *   trigger FORGET. Config-based FUSE GC only unloads old inodes.
    * - On Windows and macOS, it recursively collects all child inodes,
    *   then decreases the filesystem reference count to zero for inodes
    *   that have not been accessed since the specified cutoff time.
    * This process is bottom-up recursive: if a child inode is retained,
    * all of its parent inodes are also retained, regardless of their access
    * time.
+   *
+   * pinnedInodes controls which entries pressure-based FUSE GC may
+   * invalidate. Invalidating (unhashing) the dentry of a directory that is
+   * pinned as some process's working directory or root — or of any of its
+   * ancestors — breaks getcwd() and path resolution for that process, while
+   * reclaiming nothing (the kernel cannot FORGET a pinned inode). When
+   * pinnedInodes is non-null it holds the pinned directories; their
+   * ancestors are protected by propagating a contains-pin flag up the
+   * bottom-up traversal. When it is null, pin information is unavailable
+   * and all directory entries are skipped.
    */
   ImmediateFuture<uint64_t /* numInvalidated */>
   handleChildrenNotAccessedRecently(
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
-      folly::CancellationToken cancellationToken = {});
+      bool pressureBased,
+      folly::CancellationToken cancellationToken = {},
+      std::shared_ptr<const folly::F14FastSet<InodeNumber>> pinnedInodes =
+          nullptr);
 
   /*
    * Update a tree entry as part of a checkout operation.
@@ -747,6 +762,11 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       const InodePtr& inode,
       const std::optional<Tree::value_type>& newScmEntry);
 
+  [[nodiscard]] CheckoutActionResult removeOrReplaceRestrictedCheckoutEntry(
+      CheckoutContext* ctx,
+      const InodePtr& inode,
+      const std::optional<Tree::value_type>& newScmEntry);
+
   // Returns false without modifying the inode if it is not a valid empty
   // restricted placeholder.
   [[nodiscard]] bool updateRestrictedPlaceholder(
@@ -845,15 +865,31 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   invalidateChildrenNotAccessedRecentlyFuse(
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
-      const folly::CancellationToken& cancellationToken = {});
+      const folly::CancellationToken& cancellationToken,
+      std::shared_ptr<const folly::F14FastSet<InodeNumber>> pinnedInodes);
 
-  ImmediateFuture<uint64_t /* numInvalidated */>
-  invalidateChildrenNotAccessedRecentlyFuseImpl(
+  struct FuseGcResult {
+    uint64_t numInvalidated{0};
+    /**
+     * Whether this tree or any directory beneath it is pinned. The caller
+     * (this tree's parent) must not invalidate this tree's entry: unhashing
+     * any ancestor of a pinned directory breaks path resolution for the
+     * pinning process. Since entries are invalidated by the parent after
+     * recursing into the child, propagating this flag up the traversal
+     * protects the whole ancestor chain of every pin.
+     */
+    bool containsPin{false};
+  };
+
+  ImmediateFuture<FuseGcResult> invalidateChildrenNotAccessedRecentlyFuseImpl(
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
       const folly::CancellationToken& cancellationToken,
       const std::shared_ptr<const GcBarrierTrie>& gcBarrier,
-      const GcBarrierTrie* FOLLY_NULLABLE currentGcBarrier);
+      const GcBarrierTrie* FOLLY_NULLABLE currentGcBarrier,
+      const std::shared_ptr<const folly::F14FastSet<InodeNumber>>& pinnedInodes,
+      FuseChannel* fuseChannel,
+      folly::Executor::KeepAlive<> invalidationExecutor);
 #endif
 
   /**
@@ -967,6 +1003,12 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
   }
 
  private:
+  /** The daemon's acl:restricted-content-mode snapshot from ServerState. */
+  RestrictedContentMode restrictedContentMode() const;
+
+  /** Whether this mount hides restricted roots from directory listings. */
+  bool hidesRestrictedEntries() const;
+
   void assertRestrictedPlaceholderInvariant() const;
 
   void setAclRootState(AclRootState state) {
@@ -978,8 +1020,7 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
     if (isRestricted) {
       assertRestrictedPlaceholderInvariant();
       lastPermissionCheck_.store(
-          std::chrono::steady_clock::time_point::min(),
-          std::memory_order_relaxed);
+          std::chrono::steady_clock::now(), std::memory_order_relaxed);
     }
   }
 
@@ -1127,40 +1168,12 @@ class TreeInode final : public InodeBaseMetadata<DirContents> {
       std::vector<IncompleteInodeLoad>& pendingLoads,
       const ObjectFetchContextPtr& fetchContext);
 
-  /**
-   * Load the .gitignore file for this directory, then call computeDiff() once
-   * it is loaded.
-   */
-  [[nodiscard]] ImmediateFuture<folly::Unit> loadGitIgnoreThenDiff(
-      InodePtr gitignoreInode,
-      DiffContext* context,
-      RelativePathPiece currentPath,
-      std::vector<std::shared_ptr<const Tree>> trees,
-      const GitIgnoreStack* parentIgnore,
-      bool isIgnored);
-
   folly::coro::now_task<folly::Unit> co_loadGitIgnoreThenDiff(
       InodePtr gitignoreInode,
       DiffContext* context,
       RelativePathPiece currentPath,
       std::vector<std::shared_ptr<const Tree>> trees,
       const GitIgnoreStack* parentIgnore,
-      bool isIgnored);
-
-  /**
-   * The bulk of the actual implementation of diff()
-   *
-   * The main diff() function's GitIgnoreStack parameter contains the ignore
-   * data for the ancestors of this directory.  diff() loads .gitignore data
-   * for the current directory and then invokes computeDiff() to perform the
-   * diff once all .gitignore data is loaded.
-   */
-  [[nodiscard]] ImmediateFuture<folly::Unit> computeDiff(
-      folly::Synchronized<TreeInodeState>::LockedPtr contentsLock,
-      DiffContext* context,
-      RelativePathPiece currentPath,
-      const std::vector<std::shared_ptr<const Tree>>& trees,
-      std::unique_ptr<GitIgnoreStack> ignore,
       bool isIgnored);
 
   folly::coro::now_task<folly::Unit> co_computeDiff(

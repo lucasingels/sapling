@@ -538,6 +538,12 @@ impl<R: RepoDerivedDataArc + RepoIdentityRef> ChangesetContext<R> {
             })
             .await
     }
+
+    /// Derive the root content manifest, memoizing it on this context and its clones.
+    pub async fn prewarm_root_content_manifest(&self) -> Result<(), MononokeError> {
+        self.root_content_manifest_id().await?;
+        Ok(())
+    }
 }
 
 impl<R: RepoBlobstoreArc> ChangesetContext<R> {
@@ -562,7 +568,7 @@ impl<R: CommitGraphRef + Clone> ChangesetContext<R> {
             .changeset_generation(self.ctx(), self.id)
             .await
             .map_err(|_| {
-                MononokeError::NotAvailable(format!("Generation number missing for {:?}", &self.id))
+                MononokeError::NotAvailable(format!("Generation number missing for {:?}", self.id))
             })
     }
 
@@ -573,7 +579,7 @@ impl<R: CommitGraphRef + Clone> ChangesetContext<R> {
             .changeset_linear_depth(self.ctx(), self.id)
             .await
             .map_err(|_| {
-                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", &self.id))
+                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", self.id))
             })
     }
 
@@ -1756,6 +1762,7 @@ where
                     ManifestDiff::Changed(path, convert_entry(from), convert_entry(to))
                 }
             })
+            .map_err(MononokeError::from)
             .try_filter_map(|diff_entry| {
                 async {
                     let entry = match diff_entry {

@@ -46,6 +46,9 @@ class PrivHelperConn {
     REQ_TAKEOVER_STARTUP = 6,
     REQ_SET_LOG_FILE = 7,
     REQ_UNMOUNT_BIND = 8,
+    // Legacy macOS FUSE configuration requests. Older daemons can send these
+    // startup requests even when using NFS. Keep the request IDs as no-ops
+    // while old daemons may start against this helper.
     REQ_SET_DAEMON_TIMEOUT = 9,
     REQ_SET_USE_EDENFS = 10,
     REQ_MOUNT_NFS = 11,
@@ -56,6 +59,8 @@ class PrivHelperConn {
     REQ_SET_MEMORY_PRIORITY_FOR_PROCESS = 16,
     REQ_GET_NAMESPACE_INFO = 17,
     REQ_SET_FUSE_READ_AHEAD = 18,
+    REQ_SET_RESTART_ARGS = 19,
+    REQ_NOTIFY_CLEAN_SHUTDOWN = 20,
   };
 
   // This structure should never change. If fields need to be added to the
@@ -169,19 +174,7 @@ class PrivHelperConn {
       folly::File logFile);
   static void parseSetLogFileRequest(folly::io::Cursor& cursor);
 
-  static UnixSocket::Message serializeSetDaemonTimeoutRequest(
-      uint32_t xid,
-      std::chrono::nanoseconds duration);
-  static void parseSetDaemonTimeoutRequest(
-      folly::io::Cursor& cursor,
-      std::chrono::nanoseconds& duration);
-
-  static UnixSocket::Message serializeSetUseEdenFsRequest(
-      uint32_t xid,
-      bool useEdenFs);
-  static void parseSetUseEdenFsRequest(
-      folly::io::Cursor& cursor,
-      bool& useEdenFs);
+  static void parseLegacyMacFuseConfigRequest(folly::io::Cursor& cursor);
 
   static UnixSocket::Message serializeGetPidRequest(uint32_t xid);
   static pid_t parseGetPidResponse(const UnixSocket::Message& msg);
@@ -238,6 +231,26 @@ class PrivHelperConn {
       folly::io::Cursor& cursor,
       std::string& mountPath,
       uint32_t& readAheadKb);
+
+  static UnixSocket::Message serializeSetRestartArgsRequest(
+      uint32_t xid,
+      const EdenFsRestartArgs& args);
+  static void parseSetRestartArgsRequest(
+      folly::io::Cursor& cursor,
+      EdenFsRestartArgs& args);
+
+  static UnixSocket::Message serializeNotifyCleanShutdownRequest(
+      uint32_t xid,
+      folly::StringPiece reason);
+  static void parseNotifyCleanShutdownRequest(
+      folly::io::Cursor& cursor,
+      std::string& reason);
+
+  /**
+   * Whether a request type is sent without a registered transaction ID, and so
+   * must not be replied to.
+   */
+  static bool isOneWayRequest(MsgType type);
 
   static void serializeSanityCheckResult(
       folly::io::Appender& appender,
@@ -358,6 +371,12 @@ struct formatter<facebook::eden::PrivHelperConn::MsgType>
         break;
       case facebook::eden::PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
         name = "REQ_SET_FUSE_READ_AHEAD";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_SET_RESTART_ARGS:
+        name = "REQ_SET_RESTART_ARGS";
+        break;
+      case facebook::eden::PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:
+        name = "REQ_NOTIFY_CLEAN_SHUTDOWN";
         break;
       default:
         name = "Unknown PrivHelperConn::MsgType";

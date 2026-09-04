@@ -12,6 +12,7 @@ pub mod git_reader;
 pub mod git_uploader;
 mod gitimport_objects;
 mod gitlfs;
+mod internal_refs;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -83,6 +84,8 @@ pub use crate::gitimport_objects::TagMetadata;
 pub use crate::gitimport_objects::oid_to_sha1;
 pub use crate::gitlfs::GitImportLfs;
 pub use crate::gitlfs::LfsServerUrlFormat;
+pub use crate::internal_refs::COMMIT_CLOUD_REF_PREFIX;
+pub use crate::internal_refs::is_internal_only_ref;
 
 pub const HGGIT_MARKER_EXTRA: &str = "hg-git-rename-source";
 pub const HGGIT_MARKER_VALUE: &[u8] = b"git";
@@ -694,13 +697,13 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
             finalize_outer,
             &scuba,
             "Completed Finalize Batch for all commits",
-            "Panic while running finalize_batch for commits",
+            "finalize_batch for commits failed",
         );
         let bonsai_res = peel_joined(
             bonsai_outer,
             &scuba,
             "Completed Bonsai Changeset creation for all commits",
-            "Panic while running bonsai_creator for commits",
+            "bonsai_creator for commits failed",
         );
         // `producer` is a plain async block (not a `JoinHandle`), so its
         // `try_timed` shape is `Result<(FutureStats, ()), Error>` — no
@@ -736,7 +739,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                 "Completed Bonsai Changeset creation for all commits",
                 "Import".to_string(),
             )
-            .context("Panic while running bonsai_creator for commits")?;
+            .context("bonsai_creator for commits failed")?;
         // Ensure that the batch finalization has completed before we exit
         batch_finalizer
             .try_timed()
@@ -747,7 +750,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                 "Completed Finalize Batch for all commits",
                 "Import".to_string(),
             )
-            .context("Panic while running finalize_batch for commits")?;
+            .context("finalize_batch for commits failed")?;
     }
 
     debug!("Completed git import for repo {}.", repo_name);

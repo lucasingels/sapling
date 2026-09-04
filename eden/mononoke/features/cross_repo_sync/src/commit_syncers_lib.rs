@@ -378,8 +378,7 @@ where
     log_debug(
         ctx,
         format!(
-            "Getting version and parent map for target bookmark {}, parent version {} and synced_ancestors_versions {2:#?}",
-            target_bookmark, &parent_version, synced_ancestors_versions,
+            "Getting version and parent map for target bookmark {target_bookmark}, parent version {parent_version} and synced_ancestors_versions {synced_ancestors_versions:#?}",
         ),
     );
 
@@ -547,9 +546,7 @@ where
     log_debug(ctx, format!("target bookmark csid: {target_bookmark_csid}"));
 
     let mut parent_mapping = HashMap::new();
-    for (_source_parent_csid, (target_parent_csid, _version)) in
-        synced_ancestors_versions.rewritten_ancestors.iter()
-    {
+    for (target_parent_csid, _version) in synced_ancestors_versions.rewritten_ancestors.values() {
         // If the bookmark value is descendant of our parent it should have equivalent working
         // copy.
         if target_repo
@@ -570,10 +567,7 @@ where
     } else if parent_mapping.len() == 1 {
         log_info(
             ctx,
-            format!(
-                "all validations passed with parent_mapping {0:#?}",
-                &parent_mapping,
-            ),
+            format!("all validations passed with parent_mapping {parent_mapping:#?}",),
         );
         // There's exactly one parent that's ancestor of target_bookmark.
         // let's assume that the target_bookmark is still equivalent to what it represents.

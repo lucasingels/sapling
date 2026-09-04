@@ -273,6 +273,40 @@ struct DaemonStop : public EdenFSEvent {
   }
 };
 
+struct PrivhelperShutdown : public EdenFSEvent {
+  int64_t exit_code = 0;
+  int64_t exit_signal = 0;
+
+  PrivhelperShutdown(int64_t exit_code, int64_t exit_signal)
+      : exit_code(exit_code), exit_signal(exit_signal) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("exit_code", exit_code);
+    event.addInt("exit_signal", exit_signal);
+  }
+
+  const char* getType() const override {
+    return "privhelper_shutdown";
+  }
+};
+
+struct PrivhelperRequestStall : public EdenFSEvent {
+  std::string method;
+  double duration = 0.0; // seconds
+
+  PrivhelperRequestStall(std::string method, double duration)
+      : method(std::move(method)), duration(duration) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("method", method);
+    event.addDouble("duration", duration);
+  }
+
+  const char* getType() const override {
+    return "privhelper_request_stall";
+  }
+};
+
 struct FinishedCheckout : public EdenFSEvent {
   std::string mode;
   double duration = 0.0;
@@ -284,6 +318,8 @@ struct FinishedCheckout : public EdenFSEvent {
   uint64_t accessedBlobs = 0;
   uint64_t accessedBlobsAuxData = 0;
   uint64_t numConflicts = 0;
+  uint64_t numErrors = 0;
+  std::string error;
   uint64_t numLoadedInodes = 0;
   uint64_t numUnloadedInodes = 0;
   uint64_t numPeriodicLinkedUnloadedInodes = 0;
@@ -338,6 +374,11 @@ struct FinishedCheckout : public EdenFSEvent {
     durationFinish = durationFinish_;
   }
 
+  void populateError(uint64_t numErrors_, std::string error_) {
+    numErrors = numErrors_;
+    error = std::move(error_);
+  }
+
   void populate(DynamicEvent& event) const override {
     event.addString("mode", mode);
     event.addDouble("duration", duration);
@@ -349,6 +390,10 @@ struct FinishedCheckout : public EdenFSEvent {
     event.addInt("accessed_blobs", accessedBlobs);
     event.addInt("accessed_blobs_metadata", accessedBlobsAuxData);
     event.addInt("num_conflicts", numConflicts);
+    event.addInt("num_errors", numErrors);
+    if (!error.empty()) {
+      event.addString("error", error);
+    }
     event.addInt("loaded_inodes", numLoadedInodes);
     event.addInt("unloaded_inodes", numUnloadedInodes);
     event.addInt("linked_unloaded_inodes", numPeriodicLinkedUnloadedInodes);
@@ -396,13 +441,7 @@ struct ThriftCancellation : public EdenFSEvent {
 };
 
 struct NFSStaleError : public EdenFSEvent {
-  uint64_t ino;
-
-  explicit NFSStaleError(uint64_t ino) : ino(ino) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addInt("ino", ino);
-  }
+  void populate(DynamicEvent& /*event*/) const override {}
 
   const char* getType() const override {
     return "nfs_stale_error";
@@ -516,6 +555,23 @@ struct NfsParsingError : public EdenFSEvent {
   }
 };
 
+struct TccInvalidationDenied : public EdenFSEvent {
+  int err;
+  std::string path;
+
+  TccInvalidationDenied(int err, std::string path)
+      : err(err), path(std::move(path)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("errno", err);
+    event.addString("path", path);
+  }
+
+  const char* getType() const override {
+    return "tcc_invalidation_denied";
+  }
+};
+
 struct TooManyNfsClients : public EdenFSEvent {
   void populate(DynamicEvent& /*event*/) const override {}
 
@@ -543,7 +599,6 @@ struct MetadataSizeMismatch : public EdenFSEvent {
 
 struct InodeMetadataMismatch : public EdenFSEvent {
   uint64_t mode;
-  uint64_t ino;
   uint64_t gid;
   uint64_t uid;
   uint64_t atime;
@@ -552,14 +607,12 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   InodeMetadataMismatch(
       uint64_t mode,
-      uint64_t ino,
       uint64_t gid,
       uint64_t uid,
       uint64_t atime,
       uint64_t ctime,
       uint64_t mtime)
       : mode(mode),
-        ino(ino),
         gid(gid),
         uid(uid),
         atime(atime),
@@ -568,7 +621,6 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   void populate(DynamicEvent& event) const override {
     event.addInt("st_mode", mode);
-    event.addInt("ino", ino);
     event.addInt("gid", gid);
     event.addInt("uid", uid);
     event.addInt("atime", atime);
@@ -583,11 +635,9 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
 struct InodeLoadingFailed : public EdenFSEvent {
   std::string error;
-  uint64_t ino;
   bool causedByX2P = false;
 
-  explicit InodeLoadingFailed(std::string err, uint64_t ino)
-      : error(std::move(err)), ino(ino) {
+  explicit InodeLoadingFailed(std::string err) : error(std::move(err)) {
     if (error.find("x-x2pagentd-error")) {
       causedByX2P = true;
     }
@@ -595,7 +645,6 @@ struct InodeLoadingFailed : public EdenFSEvent {
 
   void populate(DynamicEvent& event) const override {
     event.addString("load_error", error);
-    event.addInt("ino", ino);
     event.addBool("caused_by_x2p", causedByX2P);
   }
 
@@ -718,6 +767,20 @@ struct SilentDaemonExit : public EdenFSEvent {
 
   const char* getType() const override {
     return "silent_daemon_exit";
+  }
+};
+
+struct PrivHelperExit : public EdenFSEvent {
+  std::string reason;
+
+  explicit PrivHelperExit(std::string reason) : reason(std::move(reason)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("reason", reason);
+  }
+
+  const char* getType() const override {
+    return "privhelper_exit";
   }
 };
 

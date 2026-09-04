@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 byteorder = "1.5"
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
 pydag = { version = "0.1.0", path = "../pydag" }
@@ -15,4 +15,4 @@ sapling-cpython-ext = { version = "0.1.0", path = "../../../../lib/cpython-ext" 
 sapling-mutationstore = { version = "0.1.0", path = "../../../../lib/mutationstore" }
 sapling-types = { version = "0.1.0", path = "../../../../lib/types" }
 sapling-vlqencoding = { version = "0.1.0", path = "../../../../lib/vlqencoding" }
-thiserror = "2.0.18"
+thiserror = "2.0.20"

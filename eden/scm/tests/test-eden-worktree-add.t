@@ -1,7 +1,9 @@
 
 #require eden
 
-  $ setconfig worktree.enabled=true
+  $ unset SCM_SAMPLING_FILEPATH
+  $ setconfig sampling.key.command_info=worktree_command_info
+  $ setconfig sampling.filepath=$TESTTMP/worktree-sampling
 
 setup backing repo
 
@@ -10,10 +12,45 @@ setup backing repo
   $ sl add file.txt
   $ sl commit -m "init"
 
+test worktree telemetry - normal checkout
+
+  >>> import json, os
+  >>> sample_path = os.path.join(os.environ["TESTTMP"], "worktree-sampling")
+  >>> sample_count = 0
+  >>> def print_worktree_info():
+  ...     global sample_count
+  ...     with open(sample_path) as f:
+  ...         records = [json.loads(item) for item in f.read().strip("\0").split("\0")]
+  ...     data = {}
+  ...     for record in records[sample_count:]:
+  ...         data.update(record["data"])
+  ...     sample_count = len(records)
+  ...     is_linked_worktree = data["is_linked_worktree"]
+  ...     worktree_count_group = data.get("worktree_count_group")
+  ...     worktree_count = data.get("worktree_count")
+  ...     assert isinstance(is_linked_worktree, bool)
+  ...     assert worktree_count_group is None or type(worktree_count_group) is int
+  ...     assert worktree_count is None or type(worktree_count) is int
+  ...     print((is_linked_worktree, worktree_count_group, worktree_count))
+  $ sl root > /dev/null
+  >>> print_worktree_info()
+  (False, None, None)
+
 test worktree add - basic
 
   $ sl worktree add $TESTTMP/linked1
   created linked worktree at $TESTTMP/linked1
+
+test worktree telemetry - main and linked checkouts
+
+  $ sl root > /dev/null
+  >>> print_worktree_info()
+  (False, 2, 2)
+  $ cd $TESTTMP/linked1
+  $ sl root > /dev/null
+  >>> print_worktree_info()
+  (True, 2, 2)
+  $ cd $TESTTMP/myrepo
 
 test worktree add - with label
 
@@ -421,3 +458,61 @@ test worktree add - Windows ANSI path output is accepted
   created linked worktree at $TESTTMP/gen_* (glob)
   $ python -c "import os; expected = 'gen_' + chr(0x00fc); assert os.path.isdir(os.path.join(os.environ['TESTTMP'], expected)), os.listdir(os.environ['TESTTMP'])"
 #endif
+
+Keep the max-count block last: it leaves the working copy in limitrepo with
+worktree.max-count set, which would otherwise leak into later tests (e.g. block
+the path-generator `sl worktree add` above on Windows).
+
+test worktree add - max-count limit enforced
+
+  $ cd $TESTTMP
+  $ newclientrepo limitrepo
+  $ setconfig worktree.max-count=2
+  $ touch file.txt
+  $ sl add file.txt
+  $ sl commit -m init
+  $ sl worktree add $TESTTMP/limit1
+  created linked worktree at $TESTTMP/limit1
+  $ sl worktree add $TESTTMP/limit2
+  created linked worktree at $TESTTMP/limit2
+  $ sl worktree add $TESTTMP/limit3
+  abort: cannot create worktree: limit of 2 linked worktrees reached for repository '*' (currently 2); set `worktree.max-count` in your user config (e.g. ~/.hgrc) to raise it, or 0 to disable the limit (glob)
+  [255]
+  $ test -d $TESTTMP/limit3
+  [1]
+
+test worktree add - a slot reservation counts against max-count
+
+  $ cd $TESTTMP
+  $ newclientrepo resvrepo
+  $ setconfig worktree.max-count=2
+  $ touch file.txt
+  $ sl add file.txt
+  $ sl commit -m init
+  $ sl worktree add $TESTTMP/resv1
+  created linked worktree at $TESTTMP/resv1
+
+Plant a fresh slot reservation in the separate reservations file, as an in-flight
+concurrent `worktree add` would. The group now holds 1 linked worktree + 1
+reservation, filling both slots, so the next add fails fast at reservation time
+rather than cloning and then aborting.
+
+  $ sl debugshell -c "import json, os; reg = json.load(open(repo.svfs.join('worktrees.json'))); g = next(iter(reg['groups'].values())); json.dump({'reservations': {'test-res': {'group_main': g['main'], 'dest': os.path.join(os.environ['TESTTMP'], 'pending'), 'added': '2999-01-01T00:00:00+00:00'}}}, open(repo.svfs.join('worktree-reservations.json'), 'w'))"
+  $ sl worktree add $TESTTMP/resv2
+  abort: cannot create worktree: limit of 2 linked worktrees reached for repository '*' (currently 2); set `worktree.max-count` in your user config (e.g. ~/.hgrc) to raise it, or 0 to disable the limit (glob)
+  [255]
+  $ test -d $TESTTMP/resv2
+  [1]
+
+The reservations live in their own file, so `worktrees.json` never gains a
+`reservations` key an older `sl` binary could drop.
+
+  $ sl debugshell -c "print('reservation' in open(repo.svfs.join('worktrees.json')).read())"
+  False
+
+A stale reservation (older than the TTL, e.g. orphaned by a crashed add) is pruned
+and does not keep consuming the slot.
+
+  $ sl debugshell -c "import json, os; reg = json.load(open(repo.svfs.join('worktrees.json'))); g = next(iter(reg['groups'].values())); json.dump({'reservations': {'test-res': {'group_main': g['main'], 'dest': os.path.join(os.environ['TESTTMP'], 'pending'), 'added': '2000-01-01T00:00:00+00:00'}}}, open(repo.svfs.join('worktree-reservations.json'), 'w'))"
+  $ sl worktree add $TESTTMP/resv2
+  created linked worktree at $TESTTMP/resv2

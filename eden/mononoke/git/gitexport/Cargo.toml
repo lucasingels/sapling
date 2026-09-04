@@ -19,7 +19,7 @@ name = "tests"
 path = "tests/gitexport_tools/lib.rs"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bookmarks_types = { version = "0.1.0", path = "../../repo_attributes/bookmarks/bookmarks_types" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -33,7 +33,7 @@ derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" 
 derived_data_remote = { version = "0.1.0", path = "../../derived_data/remote" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fileblob = { version = "0.1.0", path = "../../blobstore/fileblob" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
@@ -54,11 +54,11 @@ repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobsto
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
 repo_factory = { version = "0.1.0", path = "../../repo_factory" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
 warm_bookmarks_cache = { version = "0.1.0", path = "../../repo_attributes/bookmarks/warm_bookmarks_cache" }

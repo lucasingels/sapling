@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(once_cell_try)]
-
 mod acl_metrics;
 mod bfs;
 mod diff;
@@ -24,9 +22,9 @@ use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use manifest::DiffEntry;
 use manifest::DirDiffEntry;
@@ -40,6 +38,7 @@ pub use manifest::Manifest;
 use manifest::PersistOpts;
 use minibytes::Bytes;
 use pathmatcher::AlwaysMatcher;
+use pathmatcher::DynMatcher;
 use pathmatcher::Matcher;
 use slex::Items;
 pub use store::Flag;
@@ -47,6 +46,7 @@ use storemodel::InsertOpts;
 use storemodel::Kind;
 use storemodel::SerializationFormat;
 use thiserror::Error;
+use try_once_lock::OnceLock;
 use types::HgId;
 pub use types::PathComponent;
 pub use types::PathComponentBuf;
@@ -83,6 +83,36 @@ pub struct TreeManifest {
     //
     // When set, Manifest methods transparently encode input paths and decode output paths.
     path_translator: Option<Arc<dyn PathTranslator>>,
+}
+
+/// Diff several manifest pairs through one parallel breadth-first traversal.
+///
+/// Each result is tagged with its pair's index. All manifests must use the same backing store.
+pub fn diff_manifests<'a, M>(
+    pairs: Vec<(&'a TreeManifest, &'a TreeManifest, M)>,
+) -> Items<(usize, DiffEntry), anyhow::Error>
+where
+    M: 'static + Matcher + Send + Sync,
+{
+    let (pairs, translators): (Vec<_>, Vec<_>) = pairs
+        .into_iter()
+        .map(|(left, right, matcher)| {
+            (
+                (left, right, left.maybe_wrap_matcher(matcher)),
+                left.path_translator.clone(),
+            )
+        })
+        .unzip();
+    diff::diff(pairs).try_map_item(move |(index, entry): (usize, DiffEntry)| {
+        let translator = translators
+            .get(index)
+            .ok_or_else(|| anyhow!("missing path translator for manifest pair {index}"))?;
+        let path = match translator {
+            Some(translator) => translator.decode_file(&entry.path)?,
+            None => entry.path,
+        };
+        Ok((index, DiffEntry::new(path, entry.diff_type)))
+    })
 }
 
 #[derive(Error, Debug)]
@@ -129,6 +159,16 @@ impl TreeManifest {
             root: Link::ephemeral(),
             diff_grafts: Vec::new(),
             path_translator: None,
+        }
+    }
+
+    /// Creates an empty manifest using the same backing store and path translation.
+    pub fn empty(&self) -> Self {
+        TreeManifest {
+            store: self.store.clone(),
+            root: Link::ephemeral(),
+            diff_grafts: Vec::new(),
+            path_translator: self.path_translator.clone(),
         }
     }
 
@@ -388,19 +428,8 @@ impl Manifest for TreeManifest {
         other: &Self,
         matcher: M,
     ) -> Result<Items<DiffEntry, anyhow::Error>> {
-        match &self.path_translator {
-            None => Ok(diff::diff([(self, other)], Arc::new(matcher))),
-            Some(translator) => {
-                let matcher = self.maybe_wrap_matcher(matcher);
-                let translator = translator.clone();
-                Ok(
-                    diff::diff([(self, other)], matcher).try_map_item(move |entry: DiffEntry| {
-                        let path = translator.decode_file(&entry.path)?;
-                        Ok(DiffEntry::new(path, entry.diff_type))
-                    }),
-                )
-            }
-        }
+        Ok(diff_manifests(vec![(self, other, matcher)])
+            .try_map_item(|(_, entry): (usize, DiffEntry)| Ok(entry)))
     }
 
     fn modified_dirs<'a, M: 'static + Matcher + Sync + Send>(
@@ -408,8 +437,11 @@ impl Manifest for TreeManifest {
         other: &'a Self,
         matcher: M,
     ) -> Result<Box<dyn Iterator<Item = Result<DirDiffEntry>> + 'a>> {
+        let matcher: DynMatcher = Arc::new(matcher);
         Ok(Box::new(
-            diff::diff([(self, other)], Arc::new(matcher)).into_iter(),
+            diff::diff(vec![(self, other, matcher)])
+                .try_map_item(|(_, entry): (usize, DirDiffEntry)| Ok(entry))
+                .into_iter(),
         ))
     }
 }
@@ -417,8 +449,13 @@ impl Manifest for TreeManifest {
 pub fn prefetch_diff<'a>(
     pairs: impl IntoIterator<Item = (&'a TreeManifest, &'a TreeManifest)>,
 ) -> Result<()> {
-    for entry in diff::diff::<DiffEntry>(pairs, Arc::new(AlwaysMatcher::new())) {
-        entry?;
+    let matcher: DynMatcher = Arc::new(AlwaysMatcher::new());
+    let pairs = pairs
+        .into_iter()
+        .map(|(left, right)| (left, right, Arc::clone(&matcher)))
+        .collect();
+    for entry in diff::diff::<DiffEntry>(pairs) {
+        let _ = entry?;
     }
     Ok(())
 }
@@ -1000,7 +1037,7 @@ impl<M: Matcher> Matcher for TranslatingMatcher<M> {
     }
 }
 
-pub trait ReadTreeManifest: Send + Sync + 'static {
+pub trait TreeResolver: Send + Sync + 'static {
     fn get(&self, commit_id: &HgId) -> Result<TreeManifest>;
     fn get_root_id(&self, commit_id: &HgId) -> Result<HgId>;
     fn get_by_root_id(&self, root_id: &HgId) -> Result<TreeManifest>;

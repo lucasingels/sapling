@@ -48,10 +48,14 @@ use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::NeverMember;
 use repo_permission_checker::NeverAllowRepoPermissionChecker;
+use scuba::ScubaValue;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::sorted_vector_map;
 
+use crate::BypassDecision;
+use crate::BypassIdentitySource;
 use crate::ChangesetHook;
+use crate::CheckedBypassIdentities;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
@@ -60,6 +64,8 @@ use crate::HookOutcome;
 use crate::HookRejectionInfo;
 use crate::HookRepo;
 use crate::PushAuthoredBy;
+use crate::Pushvars;
+use crate::add_log_only_bypass_columns;
 
 #[derive(Clone, Debug)]
 struct FnChangesetHook {
@@ -82,6 +88,7 @@ impl ChangesetHook for FnChangesetHook {
         _changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error> {
         Ok((self.f)())
     }
@@ -112,6 +119,7 @@ impl ChangesetHook for ContentIdMatchingChangesetHook {
         changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error> {
         for (path, change) in changeset.simplified_file_changes() {
             // If we have a change to a path, but no expected change, fail
@@ -692,17 +700,37 @@ fn bypass_permission_groups_jk(
     )
 }
 
-/// Build a `CoreContext` carrying explicit client identities (as `USER:<id>`).
-fn ctx_with_identities(fb: FacebookInit, ids: &[&str]) -> CoreContext {
-    let identities: MononokeIdentitySet = ids
-        .iter()
-        .map(|id| MononokeIdentity::from_legacy_type_data("USER", *id))
-        .collect();
+/// Build a `CoreContext` carrying the given client identities.
+fn ctx_with_identities(fb: FacebookInit, identities: MononokeIdentitySet) -> CoreContext {
     let metadata = metadata::Metadata::default().set_identities(identities);
     let session = context::SessionContainer::builder(fb)
         .metadata(Arc::new(metadata))
         .build();
     CoreContext::test_mock_session(session)
+}
+
+/// Plain `USER:<unixname>` client identities, as a human pushing with a regular
+/// certificate presents. These carry no credential attributes, so
+/// `likely_an_agent()` is false.
+fn user_identities(unixnames: &[&str]) -> MononokeIdentitySet {
+    unixnames
+        .iter()
+        .map(|name| MononokeIdentity::from_legacy_type_data("USER", *name))
+        .collect()
+}
+
+/// Client identities carrying the `agent` attribute that an agent's certificate
+/// presents, so `likely_an_agent()` is true.
+///
+/// fbcode-only: the OSS `MononokeIdentitySetExt::likely_an_agent` is a constant
+/// `false` stub and `try_from_json_encoded` is unimplemented there, so there is
+/// no way to build an agent identity in an OSS build.
+#[cfg(fbcode_build)]
+fn agent_identities(unixname: &str) -> MononokeIdentitySet {
+    MononokeIdentity::try_from_json_encoded(&format!(
+        r#"{{"authn": ["mid://TEST/USER/{unixname}?agent.id=AGENT%3aclaude_code"]}}"#
+    ))
+    .expect("valid authn identity envelope")
 }
 
 fn changeset_with_bypass_msg() -> BonsaiChangeset {
@@ -882,7 +910,7 @@ async fn test_accepting_hook_with_bypass_checks_group_once(fb: FacebookInit) {
 /// while emitting one annotated rejection per rejected path.
 #[mononoke::fbinit_test]
 async fn test_unauthorized_bypass_file_hook_annotates_each_path(fb: FacebookInit) {
-    let ctx = ctx_with_identities(fb, &[]);
+    let ctx = ctx_with_identities(fb, MononokeIdentitySet::new());
     let (checker, calls) = CountingMember::new(false);
     let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
     hook_manager.register_file_hook(
@@ -1030,7 +1058,7 @@ async fn test_bypass_rejects_when_author_not_in_allowlist(fb: FacebookInit) {
 async fn test_bypass_with_client_identities_authorized(fb: FacebookInit) {
     let res = BypassScenario {
         checker: Some(allowlist(&["client_user"])),
-        client_identities: vec!["client_user".to_string()],
+        client_identities: user_identities(&["client_user"]),
         ..Default::default()
     }
     .run(fb)
@@ -1044,7 +1072,7 @@ async fn test_bypass_with_client_identities_authorized(fb: FacebookInit) {
 async fn test_bypass_with_client_identities_falls_back_to_author(fb: FacebookInit) {
     let res = BypassScenario {
         checker: Some(allowlist(&["test"])),
-        client_identities: vec!["client_user".to_string()],
+        client_identities: user_identities(&["client_user"]),
         ..Default::default()
     }
     .run(fb)
@@ -1060,7 +1088,7 @@ async fn test_bypass_with_client_identities_and_author_both_unauthorized_fails_c
 ) {
     let res = BypassScenario {
         checker: Some(allowlist(&["someoneelse"])),
-        client_identities: vec!["client_user".to_string()],
+        client_identities: user_identities(&["client_user"]),
         ..Default::default()
     }
     .run(fb)
@@ -1075,12 +1103,113 @@ async fn test_bypass_with_client_identities_and_author_both_unauthorized_fails_c
 async fn test_bypass_with_empty_client_identities_fails_closed(fb: FacebookInit) {
     let res = BypassScenario {
         checker: Some(allowlist(&[])),
-        client_identities: Vec::new(),
+        client_identities: MononokeIdentitySet::new(),
         ..Default::default()
     }
     .run(fb)
     .await;
     assert_hook_rejected(&res);
+}
+
+// =========================================================================
+// Agent bypass tests
+//
+// A bypass restricted by a permission group is a human judgement call, so an
+// agent must not be able to use one even when it pushes with an identity that
+// is in the group. These are fbcode-only: the OSS `likely_an_agent` is a
+// constant `false` stub, so there is no agent to test with there.
+// =========================================================================
+
+/// The agent/human identity builders really do differ in what
+/// `likely_an_agent()` reports, so the scenarios below are not vacuous.
+#[cfg(fbcode_build)]
+#[mononoke::test]
+fn test_agent_identities_are_recognised_as_an_agent() {
+    use permission_checker::MononokeIdentitySetExt;
+
+    assert!(agent_identities("client_user").likely_an_agent());
+    assert!(!user_identities(&["client_user"]).likely_an_agent());
+}
+
+/// An agent whose client identity is in the bypass permission group is still
+/// refused: only a human should be able to decide to override a restricted hook.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn test_agent_in_bypass_group_cannot_bypass(fb: FacebookInit) {
+    let res = BypassScenario {
+        checker: Some(AlwaysMember::new().into()),
+        client_identities: agent_identities("client_user"),
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_agent_bypass_rejected(&res);
+}
+
+/// The same on the changeset-author path, which is the path a real push takes by
+/// default. Worth its own test: that path membership-checks the author's
+/// synthetic `USER:<unixname>` identity, which never carries the credential
+/// attributes `likely_an_agent()` looks for, so the agent signal has to come
+/// from the pusher's own metadata rather than the identity set being checked.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn test_agent_cannot_bypass_on_author_path(fb: FacebookInit) {
+    let res = BypassScenario {
+        // `changeset_with_bypass_msg` is authored by "Test User <test@fb.com>".
+        checker: Some(allowlist(&["test"])),
+        client_identities: agent_identities("client_user"),
+        jk_use_client_identities: false,
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_agent_bypass_rejected(&res);
+}
+
+/// An agent that is not in the permission group is rejected for the more
+/// specific reason: it is not a member. The group check comes first, so the
+/// agent never sees a message about being an agent when the group membership is
+/// what it actually lacks.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn test_agent_not_in_bypass_group_gets_group_note(fb: FacebookInit) {
+    let res = BypassScenario {
+        checker: Some(NeverMember::new().into()),
+        client_identities: agent_identities("client_user"),
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_hook_rejected(&res);
+    let info = res[0]
+        .get_execution()
+        .rejection_info()
+        .expect("hook rejected");
+    assert!(
+        info.long_description.contains("not a member of group"),
+        "expected the not-a-member note, got {:?}",
+        info.long_description,
+    );
+    assert!(
+        !info.long_description.contains("cannot be made by an agent"),
+        "being an agent is not why this was refused, got {:?}",
+        info.long_description,
+    );
+}
+
+/// A human in the bypass permission group keeps bypassing: the block targets
+/// agents only.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn test_human_in_bypass_group_still_bypasses(fb: FacebookInit) {
+    let res = BypassScenario {
+        checker: Some(AlwaysMember::new().into()),
+        client_identities: user_identities(&["client_user"]),
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_bypassed(&res);
 }
 
 // =========================================================================
@@ -1186,6 +1315,22 @@ fn assert_hook_rejected(outcomes: &[HookOutcome]) {
     );
 }
 
+/// Assert the bypass was refused because the pusher is an agent: the hook ran
+/// and rejected, annotated with the note handing the decision to a human.
+#[cfg(fbcode_build)]
+fn assert_agent_bypass_rejected(outcomes: &[HookOutcome]) {
+    assert_hook_rejected(outcomes);
+    let info = outcomes[0]
+        .get_execution()
+        .rejection_info()
+        .expect("hook rejected");
+    assert!(
+        info.long_description.contains("cannot be made by an agent"),
+        "expected the agent bypass note, got {:?}",
+        info.long_description,
+    );
+}
+
 /// A single bypass-permission-group scenario. Registers one changeset hook
 /// ("hook1", default: always-rejecting) on bookmark "bm1" with `bypass_config` +
 /// `checker`, then runs it over `changeset` under the given JustKnobs and client
@@ -1204,7 +1349,7 @@ struct BypassScenario {
     checker: Option<ArcMembershipChecker>,
     changeset: BonsaiChangeset,
     pushvars: Option<HashMap<String, bytes::Bytes>>,
-    client_identities: Vec<String>,
+    client_identities: MononokeIdentitySet,
     jk_use_client_identities: bool,
 }
 
@@ -1216,7 +1361,7 @@ impl Default for BypassScenario {
             checker: None,
             changeset: changeset_with_bypass_msg(),
             pushvars: None,
-            client_identities: Vec::new(),
+            client_identities: MononokeIdentitySet::new(),
             jk_use_client_identities: true,
         }
     }
@@ -1224,10 +1369,7 @@ impl Default for BypassScenario {
 
 impl BypassScenario {
     async fn run(self, fb: FacebookInit) -> Vec<HookOutcome> {
-        let ctx = {
-            let id_refs: Vec<&str> = self.client_identities.iter().map(String::as_str).collect();
-            ctx_with_identities(fb, &id_refs)
-        };
+        let ctx = ctx_with_identities(fb, self.client_identities);
 
         let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
         hook_manager.register_changeset_hook("hook1", self.hook, self.bypass_config, self.checker);
@@ -1249,6 +1391,172 @@ impl BypassScenario {
         )
         .await
         .unwrap()
+    }
+}
+
+// =========================================================================
+// Bypass identity-check provenance
+//
+// A denied bypass names the required group but not whose membership was
+// actually tested, so these pin the `CheckedBypassIdentities` that backs the
+// `bypass_identity_source` / `bypass_identities_checked` Scuba columns.
+// =========================================================================
+
+/// Resolve the eager bypass decision for one always-rejecting hook registered
+/// with a group-gated commit-message bypass, under the given JustKnobs path.
+async fn bypass_decision(
+    fb: FacebookInit,
+    client_identities: MononokeIdentitySet,
+    checker: Option<ArcMembershipChecker>,
+    author: &str,
+    use_client_identities: bool,
+) -> BypassDecision {
+    let ctx = ctx_with_identities(fb, client_identities);
+    let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
+    hook_manager.register_changeset_hook(
+        "hook1",
+        always_rejecting_changeset_hook(),
+        bypass_config_with_group(),
+        checker,
+    );
+
+    justknobs::test_helpers::with_just_knobs_async(
+        bypass_permission_groups_jk(use_client_identities),
+        Box::pin(hook_manager.compute_bypass_decision_for_test(
+            "hook1",
+            &ctx,
+            None,
+            Some("This commit has @bypass_hook in the message"),
+            Some(author),
+        )),
+    )
+    .await
+    .unwrap()
+}
+
+/// The recorded provenance is that of the check that actually decided. On the
+/// client-identities path a *miss* is not the decision -- it falls through to
+/// the commit author -- so a denial there records `CommitAuthor`, the check that
+/// produced it, and the author's identity rather than the pusher's.
+#[mononoke::fbinit_test]
+async fn test_bypass_check_records_the_deciding_check(fb: FacebookInit) {
+    let decision = bypass_decision(
+        fb,
+        user_identities(&["alice"]),
+        Some(allowlist(&[])),
+        "Test User <test@fb.com>",
+        true,
+    )
+    .await;
+
+    match decision {
+        BypassDecision::UnauthorizedUser {
+            reason,
+            group,
+            check,
+        } => {
+            assert_eq!(group, "test_bypass_group");
+            assert!(
+                !reason.is_empty(),
+                "the bypass reason backs the `bypass_reason` column on denials",
+            );
+            assert_eq!(check.source, BypassIdentitySource::CommitAuthor);
+            assert_eq!(check.identities, vec!["USER:test".to_string()]);
+        }
+        other => panic!("expected UnauthorizedUser, got {other:?}"),
+    }
+}
+
+/// On the commit-author path, a denied bypass records the identity derived from
+/// the author -- not the pusher's.
+#[mononoke::fbinit_test]
+async fn test_bypass_check_records_commit_author_source(fb: FacebookInit) {
+    let decision = bypass_decision(
+        fb,
+        user_identities(&["alice"]),
+        Some(allowlist(&[])),
+        "Test User <test@fb.com>",
+        false,
+    )
+    .await;
+
+    match decision {
+        BypassDecision::UnauthorizedUser { check, .. } => {
+            assert_eq!(check.source, BypassIdentitySource::CommitAuthor);
+            assert_eq!(check.identities, vec!["USER:test".to_string()]);
+        }
+        other => panic!("expected UnauthorizedUser, got {other:?}"),
+    }
+}
+
+/// An unparsable author (a Sandcastle container's `root@<host>` default) makes
+/// the author path silently fall back to the pusher's identities. That is the
+/// case this provenance exists to make visible: the group named in the
+/// rejection was never checked against the author at all.
+#[mononoke::fbinit_test]
+async fn test_bypass_check_records_author_fallback_to_client(fb: FacebookInit) {
+    let decision = bypass_decision(
+        fb,
+        user_identities(&["svcscm"]),
+        Some(allowlist(&[])),
+        "root@0ed7-b93c-0004-0000.twshared29495.01.snb2.tw.fbinfra.net",
+        false,
+    )
+    .await;
+
+    match decision {
+        BypassDecision::UnauthorizedUser { check, .. } => {
+            assert_eq!(
+                check.source,
+                BypassIdentitySource::CommitAuthorFallbackToClient,
+            );
+            assert_eq!(check.identities, vec!["USER:svcscm".to_string()]);
+        }
+        other => panic!("expected UnauthorizedUser, got {other:?}"),
+    }
+}
+
+/// An authorized bypass carries the same provenance, so accepted and denied
+/// bypasses are comparable in one query.
+#[mononoke::fbinit_test]
+async fn test_authorized_bypass_records_identity_check(fb: FacebookInit) {
+    let decision = bypass_decision(
+        fb,
+        user_identities(&["alice"]),
+        Some(allowlist(&["alice"])),
+        "Test User <test@fb.com>",
+        true,
+    )
+    .await;
+
+    match decision {
+        BypassDecision::Authorized { check, .. } => {
+            let check = check.expect("a membership check ran");
+            assert_eq!(check.source, BypassIdentitySource::ClientIdentities);
+            assert_eq!(check.identities, vec!["USER:alice".to_string()]);
+        }
+        other => panic!("expected Authorized, got {other:?}"),
+    }
+}
+
+/// With no permission checker configured no membership check runs, so there is
+/// no provenance to record and the Scuba columns stay unset.
+#[mononoke::fbinit_test]
+async fn test_bypass_without_checker_has_no_identity_check(fb: FacebookInit) {
+    let decision = bypass_decision(
+        fb,
+        user_identities(&["alice"]),
+        None,
+        "Test User <test@fb.com>",
+        true,
+    )
+    .await;
+
+    match decision {
+        BypassDecision::Authorized { check, .. } => {
+            assert!(check.is_none(), "no membership check ran, got {check:?}");
+        }
+        other => panic!("expected Authorized, got {other:?}"),
     }
 }
 
@@ -1289,7 +1597,7 @@ async fn test_bypass_resolves_author_email_to_group_unixname(fb: FacebookInit) {
     .freeze()
     .expect("Created changeset");
 
-    let ctx = ctx_with_identities(fb, &[]);
+    let ctx = ctx_with_identities(fb, MononokeIdentitySet::new());
     let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
     hook_manager.set_employee_service_for_test(service);
     // Group admits the unixname "johndoe", NOT the email local-part "jdoe".
@@ -1337,4 +1645,212 @@ async fn test_bypass_resolves_author_email_to_group_unixname(fb: FacebookInit) {
     .unwrap();
 
     assert_bypassed(&outcomes);
+}
+
+// =========================================================================
+// Log-only hooks: the bypass decision is recorded, not applied
+// =========================================================================
+
+fn normal(value: &str) -> ScubaValue {
+    ScubaValue::Normal(value.to_string())
+}
+
+fn checked_identities() -> CheckedBypassIdentities {
+    CheckedBypassIdentities {
+        source: BypassIdentitySource::ClientIdentities,
+        identities: vec!["USER:alice".to_string()],
+    }
+}
+
+/// Assert the identity-check columns `checked_identities()` produces are set.
+fn assert_identity_check_columns(scuba: &MononokeScubaSampleBuilder) {
+    assert_eq!(
+        scuba.get("bypass_identity_source"),
+        Some(&normal("client_identities"))
+    );
+    assert_eq!(
+        scuba.get("bypass_identities_checked"),
+        Some(&ScubaValue::NormVector(vec!["USER:alice".to_string()]))
+    );
+}
+
+/// Run `add_log_only_bypass_columns` for `bypass` on a fresh sample.
+fn log_only_bypass_columns(bypass: &BypassDecision) -> MononokeScubaSampleBuilder {
+    let mut scuba = MononokeScubaSampleBuilder::with_discard();
+    add_log_only_bypass_columns(&mut scuba, bypass);
+    scuba
+}
+
+#[mononoke::test]
+fn test_log_only_bypass_columns_authorized() {
+    let scuba = log_only_bypass_columns(&BypassDecision::Authorized {
+        reason: "bypass string: @bypass_hook".to_string(),
+        permission_group: Some("test_bypass_group".to_string()),
+        check: Some(checked_identities()),
+    });
+    assert_eq!(
+        scuba.get("log_only_bypass_decision"),
+        Some(&normal("authorized"))
+    );
+    assert_eq!(
+        scuba.get("bypass_reason"),
+        Some(&normal("bypass string: @bypass_hook"))
+    );
+    assert_eq!(
+        scuba.get("bypass_permission_group"),
+        Some(&normal("test_bypass_group"))
+    );
+    assert_identity_check_columns(&scuba);
+    assert_eq!(scuba.get("bypass_blocked_for_agent"), None);
+}
+
+#[mononoke::test]
+fn test_log_only_bypass_columns_authorized_without_group() {
+    let scuba = log_only_bypass_columns(&BypassDecision::Authorized {
+        reason: "bypass string: @bypass_hook".to_string(),
+        permission_group: None,
+        check: None,
+    });
+    assert_eq!(
+        scuba.get("log_only_bypass_decision"),
+        Some(&normal("authorized"))
+    );
+    assert_eq!(
+        scuba.get("bypass_reason"),
+        Some(&normal("bypass string: @bypass_hook"))
+    );
+    assert_eq!(scuba.get("bypass_permission_group"), None);
+    assert_eq!(scuba.get("bypass_identity_source"), None);
+    assert_eq!(scuba.get("bypass_identities_checked"), None);
+    assert_eq!(scuba.get("bypass_blocked_for_agent"), None);
+}
+
+#[mononoke::test]
+fn test_log_only_bypass_columns_unauthorized_user() {
+    let scuba = log_only_bypass_columns(&BypassDecision::UnauthorizedUser {
+        reason: "bypass string: @bypass_hook".to_string(),
+        group: "test_bypass_group".to_string(),
+        check: checked_identities(),
+    });
+    assert_eq!(
+        scuba.get("log_only_bypass_decision"),
+        Some(&normal("unauthorized_user"))
+    );
+    assert_eq!(
+        scuba.get("bypass_reason"),
+        Some(&normal("bypass string: @bypass_hook"))
+    );
+    assert_eq!(
+        scuba.get("bypass_permission_group"),
+        Some(&normal("test_bypass_group"))
+    );
+    assert_identity_check_columns(&scuba);
+    assert_eq!(scuba.get("bypass_blocked_for_agent"), None);
+}
+
+#[mononoke::test]
+fn test_log_only_bypass_columns_unauthorized_agent() {
+    let scuba = log_only_bypass_columns(&BypassDecision::UnauthorizedAgent {
+        reason: "bypass string: @bypass_hook".to_string(),
+        group: "test_bypass_group".to_string(),
+        check: Some(checked_identities()),
+    });
+    assert_eq!(
+        scuba.get("log_only_bypass_decision"),
+        Some(&normal("unauthorized_agent"))
+    );
+    assert_eq!(
+        scuba.get("bypass_reason"),
+        Some(&normal("bypass string: @bypass_hook"))
+    );
+    assert_eq!(
+        scuba.get("bypass_permission_group"),
+        Some(&normal("test_bypass_group"))
+    );
+    assert_eq!(scuba.get("bypass_blocked_for_agent"), Some(&normal("true")));
+    assert_identity_check_columns(&scuba);
+}
+
+#[mononoke::test]
+fn test_log_only_bypass_columns_none() {
+    let scuba = log_only_bypass_columns(&BypassDecision::NoBypass);
+    assert_eq!(scuba.get("log_only_bypass_decision"), Some(&normal("none")));
+    for column in [
+        "bypass_reason",
+        "bypass_permission_group",
+        "bypass_identity_source",
+        "bypass_identities_checked",
+        "bypass_blocked_for_agent",
+    ] {
+        assert_eq!(scuba.get(column), None, "{column} must stay unset");
+    }
+}
+
+fn log_only_bypass_config_with_group() -> HookConfig {
+    HookConfig {
+        log_only: true,
+        ..bypass_config_with_group()
+    }
+}
+
+/// The eager bypass decision is computed for log-only hooks too: the manager
+/// does not look at `log_only`, so a log-only rollout records the same decision
+/// the hook would apply once enforcing.
+#[mononoke::fbinit_test]
+async fn test_log_only_hook_gets_a_bypass_decision(fb: FacebookInit) {
+    let ctx = ctx_with_identities(fb, user_identities(&["alice"]));
+    let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
+    hook_manager.register_changeset_hook(
+        "hook1",
+        always_rejecting_changeset_hook(),
+        log_only_bypass_config_with_group(),
+        Some(AlwaysMember::new().into()),
+    );
+
+    let decision = justknobs::test_helpers::with_just_knobs_async(
+        bypass_permission_groups_jk(true),
+        Box::pin(hook_manager.compute_bypass_decision_for_test(
+            "hook1",
+            &ctx,
+            None,
+            Some("This commit has @bypass_hook in the message"),
+            Some("Test User <test@fb.com>"),
+        )),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(decision, BypassDecision::Authorized { .. }),
+        "expected Authorized, got {decision:?}",
+    );
+}
+
+/// A log-only hook with a group-gated bypass and an authorized pusher: log-only
+/// mode still turns the rejection into an accepted execution. Whether the
+/// bypass would have applied is only recorded, never applied.
+#[mononoke::fbinit_test]
+async fn test_log_only_hook_with_authorized_bypass_is_accepted(fb: FacebookInit) {
+    let res = BypassScenario {
+        bypass_config: log_only_bypass_config_with_group(),
+        checker: Some(AlwaysMember::new().into()),
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_hook_accepted(&res);
+}
+
+/// The same with a pusher outside the group: log-only mode never blocks, so
+/// the denied bypass changes nothing about the outcome.
+#[mononoke::fbinit_test]
+async fn test_log_only_hook_with_unauthorized_bypass_is_accepted(fb: FacebookInit) {
+    let res = BypassScenario {
+        bypass_config: log_only_bypass_config_with_group(),
+        checker: Some(NeverMember::new().into()),
+        ..Default::default()
+    }
+    .run(fb)
+    .await;
+    assert_hook_accepted(&res);
 }

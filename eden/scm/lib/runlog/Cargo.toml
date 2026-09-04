@@ -13,7 +13,7 @@ license = "MIT"
 name = "runlog"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 rand = "0.10.2"
@@ -22,8 +22,8 @@ sapling-hg-http = { version = "0.1.0", path = "../hg-http" }
 sapling-progress-model = { version = "0.1.0", path = "../progress/model" }
 sapling-repo = { version = "0.1.0", path = "../repo" }
 sapling-util = { version = "0.1.0", path = "../util" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

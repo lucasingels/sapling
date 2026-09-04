@@ -302,12 +302,15 @@ export type WorktreeEntry = {
   label?: string;
   /** Whether this is the main (original) worktree. */
   role: 'main' | 'linked';
+  /** Hash checked out (`.`) in this worktree, best-effort. Absent if it couldn't be read. */
+  node?: Hash;
 };
 
 export type ApplicationInfo = {
   platformName: string;
   version: string;
   logFilePath: string;
+  isBasecamp?: boolean;
 };
 
 /**
@@ -386,9 +389,16 @@ export type StableInfo = {
   date: Date;
 };
 
+export type SlocDelta = {
+  /** Significant lines of code added */
+  insertions: number;
+  /** Significant lines of code removed */
+  deletions: number;
+};
+
 export type SlocInfo = {
   /** Significant lines of code for commit */
-  sloc: number | undefined;
+  sloc: SlocDelta | undefined;
 };
 
 export type CommitInfo = {
@@ -949,6 +959,7 @@ export const allConfigNames = [
   'isl.hold-off-refresh-ms',
   'isl.sl-progress-enabled',
   'isl.use-sl-graphql',
+  'isl.use-in-process-graphql',
   'github.preferred_submit_command',
   'isl.open-file-cmd',
   'isl.generated-files-regex',
@@ -1035,6 +1046,9 @@ export type LocalStorageName =
   | 'isl.smart-actions-order'
   | 'isl.ai-code-review-selected-option'
   | 'isl.focus-mode'
+  | 'isl.scroll-to-you-are-here-on-open'
+  | 'isl.disable-unsaved-files-warning'
+  | 'isl.show-worktree-labels'
   // The keys below are prefixes, with further dynamic keys appended afterwards
   | 'isl.edited-commit-messages:'
   | 'isl.first-pass-comments:';
@@ -1043,6 +1057,7 @@ export type ClientToServerMessage =
   | {type: 'heartbeat'; id: string}
   | {type: 'stress'; id: number; time: number; message: string}
   | {type: 'refresh'}
+  | {type: 'refreshWorktreeInfo'}
   | {type: 'clientReady'}
   | {type: 'getConfig'; name: ConfigName}
   | {type: 'setConfig'; name: SettableConfigName; value: string}
@@ -1071,7 +1086,12 @@ export type ClientToServerMessage =
   | {type: 'requestMissedOperationProgress'; operationId: string}
   | {type: 'fetchAvatars'; authors: Array<string>}
   | {type: 'fetchCommitCloudState'}
-  | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>}
+  /**
+   * `partial` says `diffIds` names diffs of interest — the commit that just got selected, say —
+   * rather than describing every diff on screen. Leave it off if `diffIds` is the whole smartlog;
+   * a server that remembers what to refetch later reads the unqualified form as the smartlog.
+   */
+  | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>; partial?: boolean}
   | {type: 'fetchDiffComments'; diffId: DiffId}
   | {type: 'fetchLandInfo'; topOfStack: DiffId}
   | {type: 'fetchAndSetStables'; additionalStables: Array<string>}
@@ -1299,19 +1319,19 @@ export type ServerToClientMessage =
   | {
       type: 'fetchedSignificantLinesOfCode';
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedPendingSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedPendingAmendSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedGkDetails';

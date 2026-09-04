@@ -84,7 +84,7 @@ ServerState::ServerState(
     std::shared_ptr<Notifier> notifier,
     bool enableFaultDetection,
     std::shared_ptr<InodeAccessLogger> inodeAccessLogger,
-    IXplatLogger* xplatLogger)
+    std::shared_ptr<IXplatLogger> xplatLogger)
     : userInfo_{std::move(userInfo)},
       edenStats_{std::move(edenStats)},
       privHelper_{std::move(privHelper)},
@@ -93,11 +93,7 @@ ServerState::ServerState(
       clock_{std::move(clock)},
       processInfoCache_{std::move(processInfoCache)},
       structuredLogger_{std::move(structuredLogger)},
-      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
-          structuredLogger_,
-          xplatLogger,
-          reloadableConfig,
-          edenStats_.copy())},
+      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(xplatLogger)},
       notificationsStructuredLogger_{std::move(notificationsStructuredLogger)},
       errorLogger_{std::move(errorLogger)},
       scribeLogger_{std::move(scribeLogger)},
@@ -127,7 +123,7 @@ ServerState::ServerState(
                             : std::make_shared<InodeAccessLogger>(
                                   config_,
                                   edenStats_.copy(),
-                                  xplatLogger)},
+                                  std::move(xplatLogger))},
       fsEventLogger_{
           initialConfig.requestSamplesPerMinute.getValue()
               ? std::make_shared<FsEventLogger>(config_, scribeLogger_)

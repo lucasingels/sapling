@@ -13,7 +13,7 @@ import {tracker} from './analytics';
 import {codeReviewProvider, diffSummary} from './codeReview/CodeReviewInfo';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
 import {publishWhenReady} from './codeReview/PublishWhenReadyCheckbox';
-import {t} from './i18n';
+import {t, T} from './i18n';
 import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {readAtom} from './jotaiUtils';
 import {useRunOperation} from './operationsState';
@@ -26,6 +26,7 @@ export function SubmitSingleCommitButton() {
   const provider = useAtomValue(codeReviewProvider);
   const diff = useAtomValue(diffSummary(headCommit?.diffId));
   const isClosed = provider != null && diff.value != null && provider?.isDiffClosed(diff.value);
+  const shouldSubmitAsDraft = useAtomValue(submitAsDraft);
 
   const runOperation = useRunOperation();
 
@@ -64,7 +65,7 @@ export function SubmitSingleCommitButton() {
         icon
         data-testid="submit-button">
         <Icon icon="cloud-upload" slot="start" />
-        {submitButtonVerb(provider)}
+        {shouldSubmitAsDraft ? <T>Submit Draft</T> : submitButtonVerb(provider)}
       </Button>
     </Tooltip>
   );

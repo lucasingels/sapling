@@ -14,7 +14,7 @@ name = "edenfs_ffi"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 # Direct dep only to force the "pure" (Rust-only) implementation via feature
 # unification: the crate's vendored C objects otherwise duplicate the
 # libblake3.a symbols when both are linked into edenfs.

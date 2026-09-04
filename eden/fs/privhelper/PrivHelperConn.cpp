@@ -134,6 +134,14 @@ uint32_t deserializeUint32(Cursor& cursor) {
   return cursor.read<uint32_t>();
 }
 
+void serializeUint64(Appender& a, uint64_t val) {
+  a.write<uint64_t>(val);
+}
+
+uint64_t deserializeUint64(Cursor& cursor) {
+  return cursor.read<uint64_t>();
+}
+
 void serializeInt32(Appender& a, int32_t val) {
   a.write<int32_t>(val);
 }
@@ -508,39 +516,6 @@ void PrivHelperConn::parseBindMountRequest(
   checkAtEnd(cursor, "bind mount request");
 }
 
-UnixSocket::Message PrivHelperConn::serializeSetDaemonTimeoutRequest(
-    uint32_t xid,
-    std::chrono::nanoseconds duration) {
-  auto msg = serializeRequestPacket(xid, REQ_SET_DAEMON_TIMEOUT);
-  Appender appender(&msg.data, kDefaultBufferSize);
-  uint64_t durationNanoseconds = duration.count();
-  appender.write<uint64_t>(durationNanoseconds);
-
-  return msg;
-}
-
-void PrivHelperConn::parseSetDaemonTimeoutRequest(
-    Cursor& cursor,
-    std::chrono::nanoseconds& duration) {
-  duration = std::chrono::nanoseconds(cursor.read<uint64_t>());
-  checkAtEnd(cursor, "set daemon timeout request");
-}
-
-UnixSocket::Message PrivHelperConn::serializeSetUseEdenFsRequest(
-    uint32_t xid,
-    bool useEdenFs) {
-  auto msg = serializeRequestPacket(xid, REQ_SET_USE_EDENFS);
-  Appender appender(&msg.data, kDefaultBufferSize);
-  appender.write<uint64_t>(static_cast<uint64_t>(((useEdenFs) ? 1 : 0)));
-
-  return msg;
-}
-
-void PrivHelperConn::parseSetUseEdenFsRequest(Cursor& cursor, bool& useEdenFs) {
-  useEdenFs = bool(cursor.read<uint64_t>());
-  checkAtEnd(cursor, "set use /dev/edenfs");
-}
-
 UnixSocket::Message PrivHelperConn::serializeGetPidRequest(uint32_t xid) {
   return serializeRequestPacket(xid, REQ_GET_PID);
 }
@@ -649,6 +624,55 @@ void PrivHelperConn::parseStartFamRequest(
   checkAtEnd(cursor, "start fam");
 }
 
+UnixSocket::Message PrivHelperConn::serializeSetRestartArgsRequest(
+    uint32_t xid,
+    const EdenFsRestartArgs& args) {
+  auto msg = serializeRequestPacket(xid, REQ_SET_RESTART_ARGS);
+  Appender appender(&msg.data, kDefaultBufferSize);
+
+  serializeBool(appender, args.enabled);
+  serializeString(appender, args.sentinelPath);
+  serializeUint64(appender, args.sentinelNonce);
+  serializeUint32(appender, args.restartCount);
+  serializeUint64(appender, args.firstRestartEpochSec);
+  serializeUint32(appender, args.maxRestarts);
+  serializeUint32(appender, args.windowSeconds);
+  return msg;
+}
+
+void PrivHelperConn::parseSetRestartArgsRequest(
+    Cursor& cursor,
+    EdenFsRestartArgs& args) {
+  args.enabled = deserializeBool(cursor);
+  args.sentinelPath = deserializeString(cursor);
+  args.sentinelNonce = deserializeUint64(cursor);
+  args.restartCount = deserializeUint32(cursor);
+  args.firstRestartEpochSec = deserializeUint64(cursor);
+  args.maxRestarts = deserializeUint32(cursor);
+  args.windowSeconds = deserializeUint32(cursor);
+  checkAtEnd(cursor, "set restart args");
+}
+
+UnixSocket::Message PrivHelperConn::serializeNotifyCleanShutdownRequest(
+    uint32_t xid,
+    StringPiece reason) {
+  auto msg = serializeRequestPacket(xid, REQ_NOTIFY_CLEAN_SHUTDOWN);
+  Appender appender(&msg.data, kDefaultBufferSize);
+  serializeString(appender, reason);
+  return msg;
+}
+
+void PrivHelperConn::parseNotifyCleanShutdownRequest(
+    Cursor& cursor,
+    std::string& reason) {
+  reason = deserializeString(cursor);
+  checkAtEnd(cursor, "notify clean shutdown");
+}
+
+bool PrivHelperConn::isOneWayRequest(MsgType type) {
+  return type == REQ_NOTIFY_CLEAN_SHUTDOWN;
+}
+
 void PrivHelperConn::serializeStopFamResponse(
     Appender& appender,
     const std::string& tmpOutputPath,
@@ -742,6 +766,11 @@ void PrivHelperConn::parseSetLogFileRequest(folly::io::Cursor& cursor) {
   // REQ_SET_LOG_FILE has an empty body.  The only contents
   // are the file descriptor transferred with the request.
   checkAtEnd(cursor, "set log file request");
+}
+
+void PrivHelperConn::parseLegacyMacFuseConfigRequest(Cursor& cursor) {
+  cursor.read<uint64_t>();
+  checkAtEnd(cursor, "legacy macOS FUSE configuration request");
 }
 
 UnixSocket::Message PrivHelperConn::serializeSetMemoryPriorityForProcessRequest(

@@ -178,7 +178,11 @@ class InodeCatalog {
   virtual bool initialized() const = 0;
 
   /**
-   * Load the directory content associated with the given `InodeNumber`
+   * Load the directory content associated with the given `InodeNumber`.
+   *
+   * Implementations must support concurrent calls to this method and
+   * loadOverlayEntries(). These calls only read directory records; callers
+   * must separately synchronize concurrent mutations.
    */
   virtual std::optional<overlay::OverlayDir> loadOverlayDir(
       InodeNumber inodeNumber) = 0;
@@ -227,6 +231,9 @@ class InodeCatalog {
    * Returns false if no overlay exists for this inode.
    *
    * Default implementation calls loadOverlayDir() and iterates the result.
+   * Implementations must support concurrent calls to this method and
+   * loadOverlayDir(). These calls only read directory records; callers must
+   * separately synchronize concurrent mutations.
    */
   using OverlayEntryIterator =
       folly::FunctionRef<void(OverlayEntryVisitor visitor)>;
@@ -234,6 +241,17 @@ class InodeCatalog {
       folly::FunctionRef<void(size_t count, OverlayEntryIterator iterate)>;
 
   virtual bool loadOverlayEntries(
+      InodeNumber inodeNumber,
+      OverlayEntryLoader loader);
+
+  /**
+   * Load inode metadata and stream directory entries when the inode is a
+   * directory. Catalogs may override this to perform both operations from one
+   * underlying read. Parsing and loader exceptions propagate, and the loader
+   * may have observed a partial directory before an exception. Callers must
+   * not commit streamed results until this method returns successfully.
+   */
+  virtual std::optional<fsck::InodeInfo> loadInodeInfoAndEntries(
       InodeNumber inodeNumber,
       OverlayEntryLoader loader);
 
