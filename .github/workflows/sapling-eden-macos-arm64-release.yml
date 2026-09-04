@@ -279,11 +279,34 @@ jobs:
             --clobber \
             "$ASSET"
 
+      # Deliberately its own check, separate from "Skip if already
+      # published" above: that one only says the release *asset* exists,
+      # not that the tap formula was successfully updated to point at it --
+      # these failed independently once (prepare_formula_eden.py lacked
+      # +x, so this step 404'd with "Permission denied" after the asset had
+      # already published successfully). Conflating the two meant the only
+      # way to retry this step was workflow_dispatch force=true, which
+      # redundantly redid the entire ~3h build for a one-line script-
+      # permission fix. This runs unconditionally (not gated on
+      # SKIP_BUILD) so it works whether or not the build ran this job.
+      - name: Skip formula push if the tap is already at this version
+        run: |
+          brew tap lucasingels/tap "https://x-access-token:${GH_TOKEN}@github.com/lucasingels/homebrew-tap" 2>/dev/null || true
+          FORMULA="$(brew --repository lucasingels/tap)/Formula/sapling-eden.rb"
+          if [ "${{ github.event.inputs.force }}" != "true" ] && [ -f "$FORMULA" ] && grep -qx "  version \"${VERSION}\"" "$FORMULA"; then
+            echo "Tap formula already at v${VERSION}; skipping (dispatch with force=true to redo)."
+            echo "SKIP_FORMULA=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Push formula to the tap
-        if: env.SKIP_BUILD != 'true'
+        if: env.SKIP_FORMULA != 'true'
         run: |
           RELEASE_URL="https://github.com/lucasingels/sapling/releases/download/v${VERSION}/${ASSET}"
-          brew tap lucasingels/tap "https://x-access-token:${GH_TOKEN}@github.com/lucasingels/homebrew-tap" 2>/dev/null || true
+          # Fetch the tarball fresh rather than assume "Assemble + package"
+          # just produced it in this workspace: this step is gated on
+          # SKIP_FORMULA now, not SKIP_BUILD, so it must work standalone on
+          # a run where the build was skipped entirely.
+          [ -f "$ASSET" ] || gh release download "v${VERSION}" --repo lucasingels/sapling --pattern "$ASSET" --clobber
           ./eden/scm/packaging/mac/prepare_formula_eden.py \
             -r "$VERSION" \
             -u "$RELEASE_URL" \
@@ -295,7 +318,7 @@ jobs:
           git push
 
       - name: Summary
-        if: env.SKIP_BUILD != 'true'
+        if: env.SKIP_FORMULA != 'true'
         run: |
           echo "Published $ASSET and lucasingels/tap/sapling-eden ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
 
