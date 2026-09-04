@@ -21,6 +21,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@v7
     - name: Set version
@@ -50,6 +51,65 @@ jobs:
           echo "Release v${VERSION} already has a bottle asset; skipping (dispatch with force=true to rebuild)."
           echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
         fi
+
+    # Nearly all of this job's time is the cargo build inside `brew install`.
+    # Three caches carry work between runs:
+    #   * sccache (GitHub Actions cache backend) skips recompiling crates whose
+    #     inputs are unchanged. Crates from the cargo registry hit across runs
+    #     because Homebrew keeps CARGO_HOME at a fixed path under `brew --cache`;
+    #     the fork's own workspace crates rebuild every time because Homebrew
+    #     unpacks the source into a differently named temp dir on each run.
+    #   * the cargo registry (crate index + downloaded .crate files), so a warm
+    #     run does not re-download ~800 crates.
+    #   * the yarn cache used by the ISL build.
+    # The last two live under `brew --cache` because Homebrew's build sandbox
+    # only lets package managers write there (Library/Homebrew/package_manager_cache.rb
+    # sets CARGO_HOME and YARN_CACHE_FOLDER to those directories).
+    - name: Locate the Homebrew cache
+      if: env.SKIP_BUILD != 'true'
+      run: echo "BREW_CACHE=$(brew --cache)" >> "$GITHUB_ENV"
+    - name: Restore the cargo registry
+      if: env.SKIP_BUILD != 'true'
+      uses: actions/cache@v6
+      with:
+        path: |
+          ${{ env.BREW_CACHE }}/cargo_cache/registry/index
+          ${{ env.BREW_CACHE }}/cargo_cache/registry/cache
+        key: ${{ runner.os }}-${{ runner.arch }}-brew-cargo-registry-${{ hashFiles('eden/scm/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-brew-cargo-registry-
+    - name: Restore the yarn cache
+      if: env.SKIP_BUILD != 'true'
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.BREW_CACHE }}/yarn_cache
+        key: ${{ runner.os }}-${{ runner.arch }}-brew-yarn-${{ hashFiles('addons/yarn.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-brew-yarn-
+    - name: Set up sccache
+      if: env.SKIP_BUILD != 'true'
+      uses: mozilla-actions/sccache-action@v0.0.10
+      with:
+        version: "v0.14.0"
+    - name: Start the sccache server
+      if: env.SKIP_BUILD != 'true'
+      # Homebrew scrubs the environment before running a formula, so a server
+      # started lazily by the first rustc call inside the build would not see the
+      # GitHub Actions cache credentials (ACTIONS_RESULTS_URL/ACTIONS_RUNTIME_TOKEN)
+      # and would fall back to a local disk cache the sandbox cannot write to.
+      # Start it here with the full environment; the sandboxed compiles only
+      # need to reach it on localhost. The idle timeout is disabled because the
+      # dependency install and rustup steps run before the first compile.
+      env:
+        SCCACHE_IDLE_TIMEOUT: "0"
+      run: sccache --start-server
     - name: Build bottle
       if: env.SKIP_BUILD != 'true'
+      env:
+        # HOMEBREW_* is the only prefix Homebrew passes through to the formula;
+        # brew_formula.rb wraps rustc with this binary when it is set.
+        HOMEBREW_SAPLING_SCCACHE: ${{ env.SCCACHE_PATH }}
       run: eden/scm/packaging/mac/build_bottle.sh "$VERSION"
+    - name: Show sccache stats
+      if: always() && env.SKIP_BUILD != 'true' && env.SCCACHE_PATH != ''
+      run: sccache --show-stats
