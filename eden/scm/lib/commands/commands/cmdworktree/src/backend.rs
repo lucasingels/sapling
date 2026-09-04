@@ -100,6 +100,60 @@ pub(crate) fn git_worktree_add(repo: &Repo, dest: &Path, target: Option<HgId>) -
         .with_context(|| format!("git worktree add {}", dest.display()))?;
     gitcompat::init::maybe_init_inside_dotgit(dest, repo.ident())
         .with_context(|| format!("initializing sl state for {}", dest.display()))?;
+    exclude_nested_worktree(repo, dest)?;
+    Ok(())
+}
+
+/// A worktree created inside the main checkout (e.g. `<root>/.worktrees/<name>`)
+/// would otherwise show up as an untracked directory in the main checkout's
+/// status. Add its parent directory (or the worktree itself when created directly
+/// under the root) to the common git dir's `info/exclude`, which every worktree of
+/// the repo reads and which is not a tracked file.
+fn exclude_nested_worktree(repo: &Repo, dest: &Path) -> Result<()> {
+    let main_root = match canonical(repo.shared_path()) {
+        Some(root) => root,
+        None => return Ok(()),
+    };
+    let dest = canonical(dest).unwrap_or_else(|| dest.to_path_buf());
+    let Ok(rel) = dest.strip_prefix(&main_root) else {
+        return Ok(());
+    };
+    // Exclude the containing directory when the worktree is one level down (the
+    // usual `.worktrees/<name>` layout), so later siblings are covered too.
+    let excluded: &Path = match rel.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => rel,
+    };
+    let mut pattern = String::from("/");
+    for component in excluded.components() {
+        pattern.push_str(&component.as_os_str().to_string_lossy());
+        pattern.push('/');
+    }
+
+    // The common git dir is the parent of the shared sl dot dir (`<common>/sl`).
+    let Some(common_git_dir) = repo.shared_dot_hg_path().parent() else {
+        return Ok(());
+    };
+    let info_dir = common_git_dir.join("info");
+    let exclude_path = info_dir.join("exclude");
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    if existing.lines().any(|line| line.trim() == pattern) {
+        return Ok(());
+    }
+    fs::create_dir_all(&info_dir)?;
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("# sl worktree: linked worktrees created inside this checkout\n");
+    content.push_str(&pattern);
+    content.push('\n');
+    fs::write(&exclude_path, content)
+        .with_context(|| format!("updating {}", exclude_path.display()))?;
     Ok(())
 }
 
@@ -207,4 +261,85 @@ pub(crate) fn sync_registry_from_git(repo: &Repo) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Directory name for a new worktree derived from its label: runs of characters
+/// outside `[A-Za-z0-9._-]` become a single `-`, leading and trailing `-` or `.`
+/// are dropped, case is kept. `None` when nothing usable is left.
+pub(crate) fn dir_name_from_label(label: &str) -> Option<String> {
+    let mut name = String::new();
+    let mut pending_dash = false;
+    for ch in label.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            if pending_dash && !name.is_empty() {
+                name.push('-');
+            }
+            pending_dash = false;
+            name.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    let name = name.trim_matches(|c| c == '-' || c == '.');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// The default destination when `sl worktree add` is given no PATH and no
+/// `worktree.path-generator`: `<main root>/.worktrees/<label>`, or `wt_N` without a
+/// label, with `_2`, `_3`, ... appended when the name is taken on disk. Nested
+/// because that is what `git worktree add <name>` does at the repo root; the
+/// directory is excluded from status by `git_worktree_add`.
+pub(crate) fn default_nested_dest(repo: &Repo, label: &str) -> Result<PathBuf> {
+    let main_root =
+        canonical(repo.shared_path()).unwrap_or_else(|| repo.shared_path().to_path_buf());
+    let dir = main_root.join(".worktrees");
+    let taken = |name: &str| dir.join(name).exists();
+    let name = match dir_name_from_label(label) {
+        Some(base) => {
+            if !taken(&base) {
+                base
+            } else {
+                let mut n = 2;
+                while taken(&format!("{base}_{n}")) {
+                    n += 1;
+                }
+                format!("{base}_{n}")
+            }
+        }
+        None => {
+            let mut n = 2;
+            while taken(&format!("wt_{n}")) {
+                n += 1;
+            }
+            format!("wt_{n}")
+        }
+    };
+    Ok(dir.join(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dir_name_from_label;
+
+    #[test]
+    fn label_to_dir_name() {
+        assert_eq!(
+            dir_name_from_label("ledger-fix").as_deref(),
+            Some("ledger-fix")
+        );
+        assert_eq!(
+            dir_name_from_label("  Ledger fix  ").as_deref(),
+            Some("Ledger-fix")
+        );
+        assert_eq!(dir_name_from_label("a / b // c").as_deref(), Some("a-b-c"));
+        assert_eq!(dir_name_from_label("..hidden..").as_deref(), Some("hidden"));
+        assert_eq!(dir_name_from_label("v1.2_rc").as_deref(), Some("v1.2_rc"));
+        assert_eq!(dir_name_from_label("---"), None);
+        assert_eq!(dir_name_from_label(""), None);
+        assert_eq!(dir_name_from_label("日本語"), None);
+    }
 }
