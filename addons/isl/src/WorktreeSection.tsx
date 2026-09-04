@@ -24,7 +24,7 @@ import {Column, Row} from './ComponentUtils';
 import css from './CwdSelector.module.css';
 import {DropdownField, DropdownFields} from './DropdownFields';
 import {Internal} from './Internal';
-import {useFeatureFlagSync} from './featureFlags';
+import {useFailsafeFeatureFlagSync} from './featureFlags';
 import {T, t} from './i18n';
 import {AddWorktreeOperation} from './operations/AddWorktreeOperation';
 import {RemoveWorktreeOperation} from './operations/RemoveWorktreeOperation';
@@ -35,7 +35,7 @@ import {applicationinfo, repositoryInfo, worktreeInfoData} from './serverAPIStat
 import {useModal} from './useModal';
 
 function useWorktreesEnabled(): boolean {
-  const worktreesEnabled = useFeatureFlagSync(Internal.featureFlags?.Worktrees);
+  const worktreesEnabled = useFailsafeFeatureFlagSync(Internal.featureFlags?.Worktrees);
   const info = useAtomValue(repositoryInfo);
 
   // Only show worktrees for EdenFS repos that are not git-based

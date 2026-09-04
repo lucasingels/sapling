@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {Atom} from 'jotai';
+import type {Loadable} from 'jotai/vanilla/utils/loadable';
+
 import {atom, useAtomValue} from 'jotai';
 import {loadable} from 'jotai/utils';
 import {randomId} from 'shared/utils';
@@ -49,6 +52,25 @@ export const qeFlagAsync = atomFamilyWeak((name?: string) => {
 export const featureFlagLoadable = atomFamilyWeak((name?: string) => {
   return loadable(featureFlagAsync(name));
 });
+
+const alwaysOnLoadable = atom<Loadable<boolean>>({state: 'hasData', data: true});
+
+/**
+ * Like `featureFlagLoadable`, for flags that only exist as an internal rollout failsafe
+ * (e.g. `Internal.featureFlags?.Worktrees`). OSS builds have no feature-flag service, so
+ * the flag name is `undefined` there and `featureFlagLoadable` would read `false` forever,
+ * hiding the feature. Here an undefined flag name means the feature is simply on; the
+ * remaining gates (EdenFS repo, code-review system) still apply.
+ */
+export function failsafeFeatureFlagLoadable(name: string | undefined): Atom<Loadable<boolean>> {
+  return name == null ? alwaysOnLoadable : featureFlagLoadable(name);
+}
+
+/** `useFeatureFlagSync` for rollout-failsafe flags; see `failsafeFeatureFlagLoadable`. */
+export function useFailsafeFeatureFlagSync(name: string | undefined): boolean {
+  const flag = useAtomValue(failsafeFeatureFlagLoadable(name));
+  return flag.state === 'hasData' ? flag.data : false;
+}
 
 /** Access featureFlag state without suspending or throwing */
 export function useFeatureFlagSync(name: string | undefined) {
