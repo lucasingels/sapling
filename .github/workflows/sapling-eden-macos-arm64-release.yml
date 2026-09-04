@@ -37,6 +37,17 @@ env:
   # OpenSSL from source. Matches eden/scm/packaging/mac/brew_formula.rb's
   # already-proven `Formula["openssl@3"].opt_prefix`.
   OPENSSL_DIR: /opt/homebrew/opt/openssl@3
+  # openssl-sys silently fell back to vendoring anyway even with OPENSSL_DIR
+  # correctly set (confirmed from the build log: its build script never even
+  # printed an OPENSSL_DIR check, only OPENSSL_NO_VENDOR -- something in the
+  # eden/sl_oss feature graph likely unifies in a `vendored` feature request
+  # that skips system-library detection outright), and the vendored build
+  # then failed on this runner ("make[1]: /bin/sh: Bad file descriptor" in
+  # `make depend`, a known macOS/BSD-make jobserver-FD quirk, unrelated to
+  # OPENSSL_DIR). OPENSSL_NO_VENDOR=1 forces openssl-sys to actually use
+  # OPENSSL_DIR and error out clearly if it can't, instead of silently
+  # vendoring and failing on something else entirely.
+  OPENSSL_NO_VENDOR: "1"
   # rust-shed's Cargo workspace has an optional/dev crate (audio_streams, a
   # Chromium crosvm dependency eden doesn't need) that pulls in a
   # chromium.googlesource.com git submodule; getdeps hardcodes `cargo build
