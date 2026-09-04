@@ -39,6 +39,25 @@ class Sapling < Formula
     # compile them, matching the getdeps build (fbcode_builder/getdeps/cargo.py).
     ENV["RUSTC_BOOTSTRAP"] = "1"
 
+    # The release workflow routes rustc through sccache so crates whose inputs
+    # are unchanged come from the GitHub Actions cache instead of being rebuilt.
+    # Homebrew scrubs the environment before running a formula and only lets
+    # HOMEBREW_* variables through, so the workflow hands the sccache binary over
+    # under that prefix. The wrapper mirrors Homebrew's own rustc shim
+    # (Library/Homebrew/shims/shared/rustc_wrapper, which appends
+    # HOMEBREW_RUSTFLAGS) with sccache in front of the compiler.
+    sccache = ENV.fetch("HOMEBREW_SAPLING_SCCACHE", "")
+    unless sccache.empty?
+      wrapper = buildpath/"sccache_rustc_wrapper"
+      wrapper.write <<~EOS
+        #!/bin/bash
+        read -ra RUSTFLAGS <<<"${HOMEBREW_RUSTFLAGS:-}"
+        exec "#{sccache}" "$@" "${RUSTFLAGS[@]}"
+      EOS
+      wrapper.chmod 0755
+      ENV["RUSTC_WRAPPER"] = wrapper.to_s
+    end
+
     python = Formula["python@3.12"].opt_prefix/"bin/python3.12"
 
     cd "eden/scm" do
