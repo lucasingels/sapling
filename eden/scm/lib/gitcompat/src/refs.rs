@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::BufWriter;
 use std::io::Write as _;
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::Context;
@@ -55,6 +56,41 @@ impl BareGit {
             .lookup_reference_follow_links("HEAD")?
             .unwrap_or_else(|| *HgId::null_id());
         Ok(id)
+    }
+
+    /// Resolve the `HEAD` of every linked worktree of this repo, i.e.
+    /// `<common>/worktrees/<name>/HEAD`. Does not include this repo's own
+    /// `HEAD` (see `resolve_head`). Unresolvable or unborn heads are skipped.
+    pub fn resolve_linked_worktree_heads(&self) -> Result<Vec<HgId>> {
+        let worktrees_dir = self.git_common_dir().join("worktrees");
+        let entries = match fs::read_dir(&worktrees_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut heads = Vec::new();
+        for entry in entries {
+            let admin_dir = entry?.path();
+            if admin_dir == self.git_dir() {
+                continue;
+            }
+            // Per-worktree HEAD; symbolic refs resolve against the shared refs.
+            let worktree_git = BareGit {
+                git_dir: admin_dir,
+                git_common_dir: self.git_common_dir.clone(),
+                parent: self.parent.clone(),
+            };
+            match worktree_git.resolve_head() {
+                Ok(id) if !id.is_null() => heads.push(id),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(
+                    "ignoring unreadable HEAD of linked worktree {}: {}",
+                    worktree_git.git_dir().display(),
+                    e
+                ),
+            }
+        }
+        Ok(heads)
     }
 
     /// Lookup a reference by full name like "refs/heads/main".
@@ -117,9 +153,29 @@ impl BareGit {
             result.insert(k, v);
         };
         self.populate_packed_references(matcher, insert)?;
-        self.populate_loose_directory_references(matcher, "refs", insert)?;
+        self.populate_loose_directory_references(matcher, self.git_common_dir(), "refs", insert)?;
+        if self.is_linked_worktree() {
+            // Per-worktree refs (refs/bisect, refs/worktree, refs/rewritten) live in the
+            // worktree's own git dir. Git never writes shared refs there.
+            self.populate_loose_directory_references(matcher, self.git_dir(), "refs", insert)?;
+        }
         self.populate_loose_file_reference(matcher, Cow::Borrowed("HEAD"), insert)?;
         Ok(result)
+    }
+
+    /// The directory a loose reference lives in. `HEAD` and git's per-worktree
+    /// namespaces are in `git_dir`; everything else is shared and lives in
+    /// `git_common_dir`. Mirrors git's `is_per_worktree_ref`.
+    fn loose_reference_base_dir(&self, name: &str) -> &Path {
+        let is_per_worktree = !name.starts_with("refs/")
+            || name.starts_with("refs/bisect/")
+            || name.starts_with("refs/worktree/")
+            || name.starts_with("refs/rewritten/");
+        if is_per_worktree {
+            self.git_dir()
+        } else {
+            self.git_common_dir()
+        }
     }
 
     /// Update a git reference. If `value` is `None` it means to delete the reference.
@@ -224,10 +280,21 @@ impl BareGit {
         name: Cow<str>,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
+        let base_dir = self.loose_reference_base_dir(name.as_ref());
+        self.populate_loose_file_reference_in(matcher, base_dir, name, insert)
+    }
+
+    fn populate_loose_file_reference_in(
+        &self,
+        matcher: &dyn Matcher,
+        base_dir: &Path,
+        name: Cow<str>,
+        insert: &mut dyn FnMut(String, ReferenceValue),
+    ) -> Result<()> {
         if !matcher.matches_file(RepoPath::from_str(name.as_ref())?)? {
             return Ok(());
         }
-        let path = self.git_dir().join(name.as_ref());
+        let path = base_dir.join(name.as_ref());
         let content = return_ok_if_not_found!(fs::read_to_string(path))?;
         let value = ReferenceValue::from_content(&content)
             .with_context(|| format!("Resolving loose reference {name:?}"))?;
@@ -238,13 +305,14 @@ impl BareGit {
     fn populate_loose_directory_references(
         &self,
         matcher: &dyn Matcher,
+        base_dir: &Path,
         prefix: &str,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
         if let DirectoryMatch::Nothing = matcher.matches_directory(RepoPath::from_str(prefix)?)? {
             return Ok(());
         }
-        let dir = return_ok_if_not_found!(fs::read_dir(self.git_dir().join(prefix)))?;
+        let dir = return_ok_if_not_found!(fs::read_dir(base_dir.join(prefix)))?;
         for entry in dir {
             let entry = entry?;
             let file_name = match entry.file_name().into_string() {
@@ -255,9 +323,9 @@ impl BareGit {
             let name = format!("{prefix}/{file_name}");
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                self.populate_loose_directory_references(matcher, &name, insert)?;
+                self.populate_loose_directory_references(matcher, base_dir, &name, insert)?;
             } else {
-                self.populate_loose_file_reference(matcher, Cow::Owned(name), insert)?;
+                self.populate_loose_file_reference_in(matcher, base_dir, Cow::Owned(name), insert)?;
             }
         }
 
@@ -269,8 +337,9 @@ impl BareGit {
         matcher: &dyn Matcher,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
-        let content =
-            return_ok_if_not_found!(fs::read_to_string(self.git_dir().join("packed-refs")))?;
+        let content = return_ok_if_not_found!(fs::read_to_string(
+            self.git_common_dir().join("packed-refs")
+        ))?;
 
         // To support "peeled" refs.
         let mut last_inserted_name: Option<&str> = None;

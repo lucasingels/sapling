@@ -18,6 +18,7 @@ use filetime::set_file_mtime;
 use fs_err as fs;
 use identity::Identity;
 use identity::dotgit::follow_dotgit_path;
+use identity::dotgit::read_git_common_dir;
 use tracing::debug;
 use types::HgId;
 
@@ -38,20 +39,51 @@ pub fn maybe_init_inside_dotgit(root_path: &Path, ident: Identity) -> Result<()>
     }
 
     let dot_git_path = follow_dotgit_path(root_path.join(".git"));
+    // For a linked git worktree, `dot_git_path` is `<main>/.git/worktrees/<name>` (per-worktree
+    // state: HEAD, index) and `common_git_path` is `<main>/.git` (objects, shared refs). The
+    // per-worktree sl dot dir (dirstate, bookmarks.current, wlock) lives under the former; the
+    // shared store (metalog, segments, mutation) under the latter, exactly like `sl share`.
+    let common_git_path = read_git_common_dir(&dot_git_path);
+    let is_linked_worktree = common_git_path != dot_git_path;
     let dot_dir = dot_git_path.join("sl");
-    let store_dir = dot_dir.join("store");
+    let shared_dot_dir = common_git_path.join("sl");
+    let store_dir = shared_dot_dir.join("store");
 
-    // Check for existence of "requires" file so we can fix repo dirs that already exist but are missing requires file.
+    // Shared store. Check for existence of "requires" file so we can fix repo dirs that already
+    // exist but are missing requires file.
     if !store_dir.join("requires").exists() {
         fs::create_dir_all(&store_dir)?;
-
-        fs::write(dot_dir.join("requires"), "store\ndotgit\n")?;
+        fs::write(shared_dot_dir.join("requires"), "store\ndotgit\n")?;
         fs::write(
             store_dir.join("requires"),
             "narrowheads\nvisibleheads\ngit\ngit-store\ndotgit\n",
         )?;
         fs::write(store_dir.join("gitdir"), format!("..{SEP}.."))?;
+    }
 
+    // Per-checkout dot dir. For the main checkout this is `shared_dot_dir` itself. Kept
+    // independent of the block above: the first `sl` run may happen in a linked worktree,
+    // which creates the shared store but must not leave the main checkout half-initialized.
+    if is_linked_worktree {
+        // Keyed on `sharedpath`, not `requires`: an `sl` that predates worktree support left
+        // `requires` (without `shared`) and an empty private store here. Rewriting `requires`
+        // and adding `sharedpath` repairs that; the stale store dir is simply ignored.
+        if !dot_dir.join("sharedpath").exists() {
+            fs::create_dir_all(&dot_dir)?;
+            fs::write(dot_dir.join("requires"), "store\ndotgit\nshared\n")?;
+            // Point at the shared dot dir, like `sl share` does. Both the Rust
+            // (`repo-minimal-info`) and Python (`localrepo`) readers accept the
+            // shared dot dir itself as the value.
+            fs::write(
+                dot_dir.join("sharedpath"),
+                shared_dot_dir.to_string_lossy().as_bytes(),
+            )?;
+        }
+    } else if !dot_dir.join("requires").exists() {
+        fs::create_dir_all(&dot_dir)?;
+        fs::write(dot_dir.join("requires"), "store\ndotgit\n")?;
+    }
+    if !dot_dir.join("dirstate").exists() {
         // Write an empty eden dirstate so it can be loaded.
         init_empty_dirstate(&dot_dir)?;
     }
@@ -60,7 +92,7 @@ pub fn maybe_init_inside_dotgit(root_path: &Path, ident: Identity) -> Result<()>
     // Skip if file mtime is up to date (since shelling out to `git config` might take time).
     let user_config_path = translated_git_user_config_path(&dot_dir, ident);
     let repo_config_path = translated_git_repo_config_path(&dot_dir, ident);
-    let git_repo_mtime = git_repo_config_mtime(&dot_git_path);
+    let git_repo_mtime = git_repo_config_mtime(&common_git_path);
     let git_user_mtime = git_user_config_mtime();
 
     // NOTE: At this point no sapling config is loaded. For simplicity, this does not respect `ui.git`.

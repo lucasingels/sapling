@@ -53,7 +53,8 @@ pub fn flush(
     if treestate.dirty() {
         tracing::debug!("flushing dirty treestate");
         let id = identity::must_sniff_dir(root)?;
-        let dot_dir = root.join(id.dot_dir());
+        // Handles dotgit (`.git/sl`), including a linked worktree whose `.git` is a file.
+        let dot_dir = id.resolve_full_dot_dir(root);
         let dirstate_path = dot_dir.join("dirstate");
 
         let _lock = wait_for_wc_lock(dot_dir, locker, lock_timeout_secs)?;

@@ -321,6 +321,15 @@ impl GitSegmentedCommits {
             }
         }
 
+        // Linked git worktrees share this store but each has its own HEAD (under
+        // `<common>/worktrees/<name>/HEAD`). Import them all so `.` resolves in every
+        // worktree and other worktrees' checkouts are present in the shared graph.
+        for id in self.git.resolve_linked_worktree_heads()? {
+            if !id.is_null() {
+                heads.push((Vertex::copy_from(id.as_ref()), head_opts.clone()));
+            }
+        }
+
         let heads = VertexListWithOptions::from(heads).sort_by_group();
 
         tracing::trace!(
@@ -336,7 +345,7 @@ impl GitSegmentedCommits {
         );
 
         self.dag
-            .import_from_git(&self.git_store, heads, self.git.git_dir())?;
+            .import_from_git(&self.git_store, heads, self.git.git_common_dir())?;
 
         let encoded_bookmarks = refencode::encode_bookmarks(&bookmarks);
         let encoded_remotenames = refencode::encode_remotenames(&remotenames);
@@ -471,7 +480,7 @@ impl GitSegmentedCommits {
 
         if !heads.is_empty() {
             self.dag
-                .import_from_git(&self.git_store, heads.into(), self.git.git_dir())?;
+                .import_from_git(&self.git_store, heads.into(), self.git.git_common_dir())?;
         }
 
         if let Some(v) = bookmarks {
