@@ -52,7 +52,6 @@ external_commands![
     cmdstatus,
     cmdversion,
     cmdwhereami,
-    #[cfg(feature = "eden")]
     cmdworktree,
     cmddebugargs,
     cmddebugconfigtree,
