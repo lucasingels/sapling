@@ -41,6 +41,7 @@ use worktree::with_worktree_path_op_lock;
 use worktree::write_worktree_name_marker;
 
 use crate::WorktreeOpts;
+use crate::backend::Backend;
 
 fn current_sl_binary() -> OsString {
     std::env::current_exe()
@@ -156,6 +157,7 @@ impl Drop for SlotReservation {
 
 pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
     let logger = ctx.logger();
+    let backend = Backend::detect(repo)?;
 
     if ctx.opts.snapshot && !ctx.opts.rev.is_empty() {
         abort!("cannot use --rev with --snapshot");
@@ -224,13 +226,12 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         }
     }
 
-    // Replicate the source repo's scm type and active filters.
+    // Replicate the source repo's scm type and active filters (EdenFS only).
     // When edensparse is in requirements, the backing store should be filteredhg
     // (even with no filter paths configured). Otherwise the backing store is hg.
     // Read active filter paths from the source repo's .sl/sparse file.
-    let clone_filters = repo
-        .requirements
-        .contains("edensparse")
+    #[cfg(feature = "eden")]
+    let clone_filters = (backend == Backend::Eden && repo.requirements.contains("edensparse"))
         .then(|| -> anyhow::Result<_> {
             let paths = filters::util::read_filter_config(repo.dot_hg_path())?
                 .map(|paths| paths.into_iter().map(|p| p.into_string().into()).collect())
@@ -252,9 +253,12 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         ])),
     )?;
 
-    let use_direct_copy: bool = repo
-        .config()
-        .get_or("worktree", "snapshot-direct-copy", || false)?;
+    // Git worktrees always use the direct copy: the legacy path goes through
+    // `sl snapshot`, which needs a snapshot-capable server.
+    let use_direct_copy: bool = backend == Backend::Git
+        || repo
+            .config()
+            .get_or("worktree", "snapshot-direct-copy", || false)?;
 
     if ctx.opts.snapshot {
         let parents = workingcopy::fast_path_wdir_parents_with_config(
@@ -280,15 +284,26 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     // needs to be copied into the new worktree.
     let (target, source_sparse_config, source_user_config, source_status) =
         with_worktree_path_op_lock(&shared_store_path, &canonical_repo_path, || {
-            let source_client_dir = edenfs_client::get_client_dir(repo.path())?;
             let parents = workingcopy::fast_path_wdir_parents_with_config(
                 repo.path(),
                 repo.ident(),
                 repo.config(),
             )?;
             let target = requested_target.or_else(|| parents.p1().copied());
-            let source_sparse_config = clone::snapshot_sparse_config(repo.dot_hg_path())?;
-            let source_user_config = clone::snapshot_eden_user_config(&source_client_dir)?;
+            let (source_sparse_config, source_user_config): (Option<Vec<u8>>, Option<String>) =
+                match backend {
+                    Backend::Git => (None, None),
+                    #[cfg(feature = "eden")]
+                    Backend::Eden => {
+                        let source_client_dir = edenfs_client::get_client_dir(repo.path())?;
+                        (
+                            clone::snapshot_sparse_config(repo.dot_hg_path())?,
+                            clone::snapshot_eden_user_config(&source_client_dir)?,
+                        )
+                    }
+                    #[cfg(not(feature = "eden"))]
+                    Backend::Eden => (None, None),
+                };
             let source_status = if ctx.opts.snapshot && use_direct_copy {
                 logger.info("computing working copy status...");
                 let matcher = Arc::new(pathmatcher::AlwaysMatcher::new());
@@ -355,20 +370,43 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         }
         check_dest_not_in_repo(&dest)?;
 
-        clone::eden_clone(repo, &dest, target, clone_filters).inspect_err(|_| {
+        let partial_checkout_warning = || {
             ctx.logger().warn(format!(
-                "worktree add may have left a partial checkout; try running `eden rm {}` to recover",
+                "worktree add may have left a partial checkout; try running `{} {}` to recover",
+                backend.remove_hint(),
                 dest.display()
             ));
-        })?;
+        };
+        match backend {
+            Backend::Git => {
+                crate::backend::git_worktree_add(repo, &dest, target)
+                    .inspect_err(|_| partial_checkout_warning())?;
+            }
+            Backend::Eden => {
+                #[cfg(feature = "eden")]
+                {
+                    clone::eden_clone(repo, &dest, target, clone_filters)
+                        .inspect_err(|_| partial_checkout_warning())?;
 
-        source_sparse_config.as_deref().map_or(Ok(()), |config| {
-            clone::write_sparse_config(config, &dest.join(repo.ident().dot_dir()))
-        })?;
+                    source_sparse_config.as_deref().map_or(Ok(()), |config| {
+                        clone::write_sparse_config(config, &dest.join(repo.ident().dot_dir()))
+                    })?;
 
-        source_user_config.as_deref().map_or(Ok(()), |config| {
-            clone::apply_eden_user_config_snapshot(repo.config().as_ref(), config, &dest)
-        })?;
+                    source_user_config.as_deref().map_or(Ok(()), |config| {
+                        clone::apply_eden_user_config_snapshot(
+                            repo.config().as_ref(),
+                            config,
+                            &dest,
+                        )
+                    })?;
+                }
+                #[cfg(not(feature = "eden"))]
+                {
+                    let _ = (&source_sparse_config, &source_user_config);
+                    abort!("EdenFS support is not compiled in");
+                }
+            }
+        }
 
         Ok(())
     })?;
@@ -381,8 +419,9 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
             // dest.exists() check above before cloning).
             logger.warn(format!(
                 "worktree add left a checkout at {} that could not be registered; \
-                 try running `eden rm {}` to recover",
+                 try running `{} {}` to recover",
                 dest.display(),
+                backend.remove_hint(),
                 dest.display()
             ));
             abort!(
@@ -420,7 +459,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         // (permissions, disk full) only costs prompt accuracy.
         if let Err(e) = write_worktree_name_marker(
             &dest,
-            &dest.join(repo.ident().dot_dir()),
+            &repo.ident().resolve_full_dot_dir(&dest),
             (!ctx.opts.label.is_empty()).then_some(ctx.opts.label.as_str()),
         ) {
             logger.warn(format!(
@@ -777,8 +816,10 @@ fn drain_workers(result_items: vfs::VfsBatchItems, logger: &TermLogger) -> anyho
 /// Update destination treestate so `sl status` in the dest matches the source.
 ///
 /// Only `added` and `removed` files need treestate entries. Modified, untracked,
-/// and deleted files are detected automatically by EdenFS (worktree commands
-/// require EdenFS — enforced in `lib.rs`).
+/// and deleted files are detected automatically by EdenFS, or by `git status`
+/// for git worktrees; in both modes the treestate is an overlay that only
+/// records adds and removes (`sl add` in a dotgit repo does not touch the git
+/// index either).
 fn update_dest_treestate(dest: &Path, status: &status::Status) -> anyhow::Result<()> {
     use treestate::filestate::FileStateV2;
     use treestate::filestate::StateFlags;

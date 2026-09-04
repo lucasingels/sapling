@@ -6,6 +6,7 @@
  */
 
 mod add;
+mod backend;
 mod label;
 mod list;
 mod remove;
@@ -64,8 +65,10 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
         other => abort!("unknown worktree subcommand '{}'", other),
     };
 
-    if !repo.requirements.contains("eden") {
-        abort!("worktree commands require an EdenFS-backed repository");
+    let backend = backend::Backend::detect(repo)?;
+    if backend == backend::Backend::Git {
+        // Worktrees made with plain `git worktree add` join the group too.
+        backend::sync_registry_from_git(repo)?;
     }
 
     runner(&ctx, repo, wc)
@@ -107,10 +110,16 @@ pub fn aliases() -> &'static str {
 pub fn doc() -> &'static str {
     r#"manage multiple linked worktrees sharing the same repository
 
-    worktree groups allow multiple EdenFS-backed working copies to share
-    the same backing store. One worktree is designated as the main worktree,
-    and additional linked worktrees can be created, listed, labeled, and
+    worktree groups allow multiple working copies to share the same
+    backing store. One worktree is designated as the main worktree, and
+    additional linked worktrees can be created, listed, labeled, and
     removed.
+
+    For EdenFS-backed repositories each linked worktree is an EdenFS
+    checkout of the backing repo. For git-backed repositories (a ".git"
+    directory) each linked worktree is a "git worktree", so plain git
+    commands work in it too, and worktrees created with "git worktree add"
+    show up in "list".
 
     Subcommands::
 
@@ -128,9 +137,7 @@ pub fn doc() -> &'static str {
       worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
       worktree.require-generated-path=true     Require path generator, disallow manual PATH
       worktree.path-generator=CMD              Shell command to generate PATH when omitted
-      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot
-
-    Currently only EdenFS-backed repositories are supported."#
+      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot (always on for git worktrees)"#
 }
 
 pub fn synopsis() -> Option<&'static str> {

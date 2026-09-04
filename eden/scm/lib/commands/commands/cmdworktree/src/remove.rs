@@ -25,13 +25,15 @@ use worktree::with_worktree_path_op_lock;
 
 use crate::CurrentGroup;
 use crate::WorktreeOpts;
+use crate::backend::Backend;
 use crate::require_group;
 
 pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) -> Result<u8> {
     let current_group = require_group(repo)?;
+    let backend = Backend::detect(repo)?;
 
     if ctx.opts.all {
-        return run_remove_all(ctx, repo, &current_group);
+        return run_remove_all(ctx, repo, &current_group, backend);
     }
 
     let path_args = &ctx.opts.args[1..];
@@ -48,9 +50,9 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
         })
         .collect::<Result<_>>()?;
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
-    validate_targets(&current_group, &target_refs)?;
+    validate_targets(&current_group, &target_refs, backend)?;
 
-    remove_and_update_registry(ctx, repo, &current_group, &target_refs)?;
+    remove_and_update_registry(ctx, repo, &current_group, &target_refs, backend)?;
 
     // NOTE: Add post-worktree-remove hook if the need arises. Note that the
     // hook's cwd (repo.path()) may not exist if the user removed the worktree
@@ -60,7 +62,11 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
 }
 
 /// Validate that all user-specified paths are removable linked worktrees.
-fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<()> {
+fn validate_targets(
+    current_group: &CurrentGroup,
+    targets: &[&Path],
+    backend: Backend,
+) -> Result<()> {
     let registry = load_registry(&current_group.shared_store_path)?;
     let grp = match registry.groups.get(&current_group.group_id) {
         Some(group) => group,
@@ -76,8 +82,9 @@ fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<(
                 );
             }
             abort!(
-                "{} is not in this worktree group, use `eden rm` instead",
-                target.display()
+                "{} is not in this worktree group, use `{}` instead",
+                target.display(),
+                backend.remove_hint()
             );
         }
         if *target == grp.main {
@@ -93,6 +100,7 @@ fn remove_and_update_registry(
     repo: &Repo,
     current_group: &CurrentGroup,
     targets: &[&Path],
+    backend: Backend,
 ) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
@@ -116,7 +124,7 @@ fn remove_and_update_registry(
                     target.display().to_string(),
                 )])),
             )?;
-            run_eden_remove(ctx, repo, target)?;
+            remove_checkout(ctx, repo, backend, target)?;
             Ok(())
         });
         match result {
@@ -165,6 +173,7 @@ fn run_remove_all(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
     current_group: &CurrentGroup,
+    backend: Backend,
 ) -> Result<u8> {
     let logger = ctx.logger();
     let registry = load_registry(&current_group.shared_store_path)?;
@@ -226,7 +235,7 @@ fn run_remove_all(
                 path.display().to_string(),
             )])),
         )?;
-        match run_eden_remove(ctx, repo, path) {
+        match remove_checkout(ctx, repo, backend, path) {
             Ok(()) => {}
             Err(err) => {
                 logger.warn(format!("failed to remove {}: {}", path.display(), err));
@@ -255,18 +264,40 @@ fn run_remove_all(
     Ok(0)
 }
 
-/// Run `eden remove` for `path`. If the checkout directory is already gone
-/// (e.g., removed externally via `eden rm`), skips the call and returns Ok
-/// so the caller can proceed to clean the worktree registry.
-fn run_eden_remove(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, path: &Path) -> Result<()> {
-    if !path.exists() {
-        ctx.logger().warn(format!(
-            "eden checkout {} not found on disk, continuing to remove from registry",
-            path.display()
-        ));
-        return Ok(());
+/// Tear down the checkout at `path` with the backend that created it.
+///
+/// EdenFS: run `eden remove`. If the checkout directory is already gone (e.g.
+/// removed externally via `eden rm`), skip the call and return Ok so the caller
+/// can proceed to clean the worktree registry.
+///
+/// Git: `git worktree remove --force`, or `git worktree prune` when the
+/// directory is already gone so the stale admin dir goes too.
+fn remove_checkout(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    backend: Backend,
+    path: &Path,
+) -> Result<()> {
+    match backend {
+        Backend::Git => crate::backend::git_worktree_remove(repo, path),
+        Backend::Eden => {
+            if !path.exists() {
+                ctx.logger().warn(format!(
+                    "eden checkout {} not found on disk, continuing to remove from registry",
+                    path.display()
+                ));
+                return Ok(());
+            }
+            #[cfg(feature = "eden")]
+            {
+                edenfs_client::run_eden_remove(repo.config().as_ref(), path)
+            }
+            #[cfg(not(feature = "eden"))]
+            {
+                abort!("EdenFS support is not compiled in");
+            }
+        }
     }
-    edenfs_client::run_eden_remove(repo.config().as_ref(), path)
 }
 
 fn confirm_remove(ctx: &ReqCtx<WorktreeOpts>, paths: &[&Path]) -> Result<()> {

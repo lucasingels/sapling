@@ -49,7 +49,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
         // costs prompt accuracy. With `--remove`, falls back to basename.
         if let Err(e) = write_worktree_name_marker(
             &target,
-            &target.join(repo.ident().dot_dir()),
+            &repo.ident().resolve_full_dot_dir(&target),
             entry.label.as_deref(),
         ) {
             logger.warn(format!(
