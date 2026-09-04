@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4
+
+### 4 September 2026
+
+- Show the worktree panel, the top-bar worktree button and the "checked out elsewhere" labels for git-backed repos, where `sl worktree` now creates `git worktree` checkouts (needs Sapling 0.3.3)
+- Pick up upstream ISL changes from the September merge, including command-palette entries for worktree operations and focus-mode handling of worktrees
+
 ## 0.2.3
 
 ### 23 July 2026
