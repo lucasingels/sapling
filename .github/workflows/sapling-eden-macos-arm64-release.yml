@@ -15,7 +15,15 @@ on:
       - eden-test-*
 
 env:
-  GETDEPS_SCRATCH: ${{ github.workspace }}/../getdeps-scratch
+  # Must be an absolute path with no .. segments: actions/cache's glob
+  # matcher rejects relative pathing outright ("Invalid pattern ... Relative
+  # pathing '.' and '..' is not allowed"), which silently no-op'd both
+  # "Restore getdeps scratch cache" and "Save getdeps scratch cache" on
+  # every run so far -- 0 files ever matched, so every run rebuilt from
+  # scratch regardless of what got cached. runner.temp is an absolute,
+  # runner-provided scratch dir outside the checkout, so this needs no ..
+  # to stay off the repo.
+  GETDEPS_SCRATCH: ${{ runner.temp }}/getdeps-scratch
   GETDEPS_JOBS: 3
   PYTHON310: /opt/homebrew/opt/python@3.10/bin/python3.10
   # The Rust openssl crate needs OPENSSL_DIR specifically (docs.rs/openssl);
