@@ -166,6 +166,28 @@ describe('GitHubPRBadge', () => {
         ).toBeInTheDocument();
       });
 
+      it('copies the PR url when clicking the PR number', () => {
+        const clipboardCopy = jest
+          .spyOn(platform, 'clipboardCopy')
+          .mockImplementation(() => undefined);
+        act(() => {
+          simulateMessageFromServer({
+            type: 'gotConfig',
+            name: 'isl.show-diff-number',
+            value: 'true',
+          });
+        });
+        fireEvent.click(
+          within(
+            within(screen.getByTestId('commit-a')).getByTestId('github-diff-info'),
+          ).getByText('#10'),
+        );
+        expect(clipboardCopy).toHaveBeenCalledWith(
+          'https://github.com/myusername/testrepo/pull/10',
+          '<a href="https://github.com/myusername/testrepo/pull/10">#10</a>',
+        );
+      });
+
       describe('url opener', () => {
         beforeEach(() => {
           jest.spyOn(platform, 'openExternalLink').mockImplementation(() => undefined);
