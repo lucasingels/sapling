@@ -29,6 +29,16 @@ env:
   # OpenSSL from source. Matches eden/scm/packaging/mac/brew_formula.rb's
   # already-proven `Formula["openssl@3"].opt_prefix`.
   OPENSSL_DIR: /opt/homebrew/opt/openssl@3
+  # rust-shed's Cargo workspace has an optional/dev crate (audio_streams, a
+  # Chromium crosvm dependency eden doesn't need) that pulls in a
+  # chromium.googlesource.com git submodule; getdeps hardcodes `cargo build
+  # --workspace` with no way to scope that out (getdeps/cargo.py run_cargo).
+  # Failed identically twice with "SecureTransport error: connection closed
+  # via error" fetching it -- libgit2's macOS TLS backend has a known flaky
+  # history with certain git hosts. Cargo's own error message suggests the
+  # fix: use the system git CLI (curl-based TLS) instead of libgit2 for git
+  # dependency fetches.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   build-and-publish:
