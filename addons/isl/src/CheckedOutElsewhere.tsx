@@ -10,7 +10,7 @@ import type {Hash, WorktreeEntry} from './types';
 import {atom} from 'jotai';
 import {basename, guessPathSep, isHexHash, pathsAreIdentical} from 'shared/utils';
 import {focusMode} from './atoms/FocusModeState';
-import {featureFlagLoadable} from './featureFlags';
+import {failsafeFeatureFlagLoadable} from './featureFlags';
 import {Internal} from './Internal';
 import {atomFamilyWeak, localStorageBackedAtom} from './jotaiUtils';
 import {repositoryInfo, worktreeInfoData} from './serverAPIState';
@@ -29,7 +29,7 @@ const enabledWorktreeInfo = atom(get => {
     return undefined;
   }
 
-  const flag = get(featureFlagLoadable(Internal.featureFlags?.Worktrees));
+  const flag = get(failsafeFeatureFlagLoadable(Internal.featureFlags?.Worktrees));
   if (flag.state !== 'hasData' || flag.data !== true) {
     return undefined;
   }
