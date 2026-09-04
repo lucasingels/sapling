@@ -27,6 +27,7 @@ import {
   currRevsetForComparison,
   labelForComparison,
 } from 'shared/Comparison';
+import {pickWorktreeDirName, WORKTREES_DIR_NAME} from 'shared/worktreePaths';
 import * as vscode from 'vscode';
 import {shouldOpenBeside} from './config';
 import {
@@ -167,33 +168,31 @@ export const vscodeCommands = {
 
     const mainRoot =
       worktreeInfo.worktrees.find(wt => wt.role === 'main')?.path ?? repo.info.repoRoot;
-    const repoName = path.basename(mainRoot);
-    const worktreesDir = path.join(path.dirname(mainRoot), `${repoName}.worktrees`);
-    const existingBasenamesInDir = new Set(
+    // New worktrees go in a hidden directory inside the main worktree, named after the label.
+    const worktreesDir = path.join(mainRoot, WORKTREES_DIR_NAME);
+    const taken = new Set(
       worktreeInfo.worktrees
         .filter(wt => path.dirname(wt.path) === worktreesDir)
         .map(wt => path.basename(wt.path)),
     );
     const MAX_WORKTREE_SUFFIX = 25;
-    let suffix = 2;
-    let defaultDest = path.join(worktreesDir, `${repoName}_${suffix}`);
-    // Find a free suffix, checking both known worktrees in the same dir and on-disk existence.
-    // The suffix range 2..MAX_WORKTREE_SUFFIX inclusive is tried.
-    while (true) {
-      const basename = `${repoName}_${suffix}`;
-      if (!existingBasenamesInDir.has(basename)) {
-        // eslint-disable-next-line no-await-in-loop
-        const existsOnDisk = await fileExists(vscode.Uri.file(defaultDest));
-        if (!existsOnDisk) {
-          break;
-        }
+    // Pick a name that's free among the known worktrees in that dir, then confirm nothing
+    // exists on disk under it; a name that does exist is marked taken and we pick again.
+    // Suffixes 2..MAX_WORKTREE_SUFFIX inclusive are tried.
+    let dirName = pickWorktreeDirName(label, name => taken.has(name), MAX_WORKTREE_SUFFIX);
+    while (dirName != null) {
+      // eslint-disable-next-line no-await-in-loop
+      const existsOnDisk = await fileExists(vscode.Uri.file(path.join(worktreesDir, dirName)));
+      if (!existsOnDisk) {
+        break;
       }
-      suffix++;
-      if (suffix > MAX_WORKTREE_SUFFIX) {
-        throw new Error(t('Could not add worktree, exceeded maximum allowed worktrees.'));
-      }
-      defaultDest = path.join(worktreesDir, `${repoName}_${suffix}`);
+      taken.add(dirName);
+      dirName = pickWorktreeDirName(label, name => taken.has(name), MAX_WORKTREE_SUFFIX);
     }
+    if (dirName == null) {
+      throw new Error(t('Could not add worktree, exceeded maximum allowed worktrees.'));
+    }
+    const defaultDest = path.join(worktreesDir, dirName);
 
     const destPath = await vscode.window.showInputBox({
       prompt: t('Worktree root path'),
