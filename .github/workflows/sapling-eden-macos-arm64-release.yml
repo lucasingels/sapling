@@ -160,6 +160,25 @@ jobs:
       # below (a prefix match) always resolves to whichever run most
       # recently saved one -- i.e. the most complete cache seen so far, not
       # whichever happened to save first.
+      # The single extra build/ path below is a deliberate, narrow exception
+      # to "only cache installed/": getdeps' marker check (getdeps/cli.py
+      # BuildCmd) looks only at installed/<project>/.built-by-getdeps and
+      # skips the whole build step -- including regenerating build/ -- the
+      # moment that marker matches, regardless of whether build/ actually
+      # exists. edenfsctl.real's full package tree (thrift-python/folly-python
+      # bindings, etc.) is a build-tree-only artifact: eden/fs/cli/CMakeLists.txt's
+      # install_fb_python_executable() only installs a single launcher file
+      # into installed/eden/bin/, never the directory assemble_eden_prefix.sh
+      # actually needs. Without caching it explicitly, a fresh runner that
+      # restores installed/eden (marker intact) would have getdeps silently
+      # skip rebuilding eden, permanently leaving build/eden/.../edenfsctl.real
+      # missing and "Assemble + package" failing its precondition check on
+      # every future retry -- confirmed by reading both getdeps/cli.py's skip
+      # logic and the CMake install() rule before this ever bit us. 8.9 MB
+      # locally, so caching it outright is cheap; the rest of build/ (full
+      # C++ object trees for the whole dependency graph) is not cached on
+      # purpose -- it would balloon cache size/restore time for no benefit,
+      # since every other project's real output lives under installed/.
       - name: Restore getdeps scratch cache
         if: env.SKIP_BUILD != 'true'
         uses: actions/cache/restore@v6
@@ -168,6 +187,7 @@ jobs:
             ${{ env.GETDEPS_SCRATCH }}/installed
             ${{ env.GETDEPS_SCRATCH }}/downloads
             ${{ env.GETDEPS_SCRATCH }}/py310-tools
+            ${{ env.GETDEPS_SCRATCH }}/build/eden/eden/fs/cli/edenfsctl.real
           key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
           restore-keys: |
             getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-
@@ -292,6 +312,7 @@ jobs:
             ${{ env.GETDEPS_SCRATCH }}/installed
             ${{ env.GETDEPS_SCRATCH }}/downloads
             ${{ env.GETDEPS_SCRATCH }}/py310-tools
+            ${{ env.GETDEPS_SCRATCH }}/build/eden/eden/fs/cli/edenfsctl.real
           key: getdeps-${{ runner.os }}-${{ hashFiles('build/fbcode_builder/manifests/**', 'build/fbcode_builder/patches/**') }}-${{ github.run_id }}
 
       - name: Save sccache
