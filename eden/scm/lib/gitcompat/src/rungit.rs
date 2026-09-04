@@ -18,6 +18,7 @@ use std::sync::RwLock;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use identity::dotgit::follow_dotgit_path;
+use identity::dotgit::read_git_common_dir;
 use spawn_ext::CommandExt;
 
 /// Run `git` outside a repo.
@@ -35,7 +36,23 @@ pub struct BareGit {
     /// This is usually `root/.git`. When `.git` is a "symlink" ("gitdir: ..."),
     /// this is the "symlink" destination.
     pub(crate) git_dir: PathBuf,
+    /// The `GIT_COMMON_DIR`. Same as `git_dir` unless `git_dir` is a linked
+    /// worktree's admin dir (`<main>/.git/worktrees/<name>`), in which case
+    /// this is the main `.git` holding objects and shared refs.
+    pub(crate) git_common_dir: PathBuf,
     pub(crate) parent: GlobalGit,
+}
+
+impl BareGit {
+    fn new(git_dir: PathBuf, parent: GlobalGit) -> Self {
+        let git_dir = follow_dotgit_path(git_dir);
+        let git_common_dir = read_git_common_dir(&git_dir);
+        Self {
+            git_dir,
+            git_common_dir,
+            parent,
+        }
+    }
 }
 
 /// Run `git` in a "regular" repo with a working copy.
@@ -107,10 +124,7 @@ impl GlobalGit {
 
     /// Associate with a bare repo.
     pub fn with_bare(self, git_dir: PathBuf) -> BareGit {
-        BareGit {
-            git_dir: follow_dotgit_path(git_dir),
-            parent: self,
-        }
+        BareGit::new(git_dir, self)
     }
 
     /// Associate with a regular repo.
@@ -128,18 +142,12 @@ impl GlobalGit {
 impl BareGit {
     /// Construct from git_dir (".git" path) and config.
     pub fn from_git_dir_and_config(git_dir: PathBuf, config: &dyn Config) -> Self {
-        Self {
-            git_dir: follow_dotgit_path(git_dir),
-            parent: GlobalGit::from_config(config),
-        }
+        Self::new(git_dir, GlobalGit::from_config(config))
     }
 
     /// Construct from git_dir (".git" path) and default config.
     pub fn from_git_dir(git_dir: PathBuf) -> Self {
-        Self {
-            git_dir: follow_dotgit_path(git_dir),
-            parent: GlobalGit::default(),
-        }
+        Self::new(git_dir, GlobalGit::default())
     }
 
     /// Associate with a working copy.
@@ -152,8 +160,21 @@ impl BareGit {
     }
 
     /// The bare repo root, usually ".git" or "<name>.git".
+    /// For a linked worktree this is the per-worktree admin dir
+    /// (`<main>/.git/worktrees/<name>`), holding `HEAD` and `index`.
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    /// The common git dir holding objects, `refs/`, `packed-refs`, `config`
+    /// and `shallow`. Same as `git_dir()` unless this is a linked worktree.
+    pub fn git_common_dir(&self) -> &Path {
+        &self.git_common_dir
+    }
+
+    /// Whether `git_dir()` is a linked worktree's admin dir.
+    pub fn is_linked_worktree(&self) -> bool {
+        self.git_dir != self.git_common_dir
     }
 }
 
@@ -247,14 +268,14 @@ pub trait GitCmd {
 impl GitCmd for GlobalGit {
     fn git_cmd(&self, cmd_name: &str, args: &[impl ToString]) -> Command {
         let args = args.iter().map(ToString::to_string).collect();
-        git_cmd_impl(cmd_name, args, self, None, None)
+        git_cmd_impl(cmd_name, args, self, None, None, false)
     }
 }
 
 impl GitCmd for BareGit {
     fn git_cmd(&self, cmd_name: &str, args: &[impl ToString]) -> Command {
         let args = args.iter().map(ToString::to_string).collect();
-        git_cmd_impl(cmd_name, args, self, Some(self.git_dir()), None)
+        git_cmd_impl(cmd_name, args, self, Some(self.git_dir()), None, false)
     }
 }
 
@@ -267,6 +288,7 @@ impl GitCmd for RepoGit {
             self,
             Some(self.git_dir()),
             Some(self.root()),
+            self.is_linked_worktree(),
         )
     }
 }
@@ -285,6 +307,7 @@ fn git_cmd_impl(
     opts: &GlobalGit,
     git_dir: Option<&Path>,
     root: Option<&Path>,
+    is_linked_worktree: bool,
 ) -> Command {
     let cfg = &opts.config;
     let mut cmd = Command::new(&cfg.git_binary);
@@ -298,7 +321,10 @@ fn git_cmd_impl(
     // --git-dir=...
     if let Some(git_dir) = git_dir {
         cmd.arg(format!("--git-dir={}", git_dir.display()));
-        if git_dir.file_name().unwrap_or_default() == ".git" {
+        // A linked worktree's git dir is `<main>/.git/worktrees/<name>`, whose basename is the
+        // worktree name rather than ".git". Without a pinned cwd git would treat the process cwd
+        // as the work tree.
+        if git_dir.file_name().unwrap_or_default() == ".git" || is_linked_worktree {
             // Run `git` from the repo root. This avoids issues like `git status` being over smart
             // and uses relative paths.
             if let Some(cwd) = root.as_ref() {

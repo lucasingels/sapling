@@ -501,6 +501,10 @@ class localrepository:
                 )
             self.sharedpath = s
             self.sharedroot = sharedvfs.dirname(s)
+            if os.path.basename(self.sharedroot) == ".git":
+                # dotgit: the shared dot dir is `<root>/.git/sl`, one level deeper
+                # than `<root>/.sl`. Match the Rust side's shared_path.
+                self.sharedroot = os.path.dirname(self.sharedroot)
             self.sharedvfs = sharedvfs
             # Read the requirements of the shared repo to make sure we
             # support them.

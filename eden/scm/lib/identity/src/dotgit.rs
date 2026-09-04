@@ -41,6 +41,35 @@ pub fn follow_dotgit_path(mut git_dir: PathBuf) -> PathBuf {
     util::path::normalize(&git_dir)
 }
 
+/// Resolve the "common" git dir for a (followed) git dir.
+///
+/// A linked git worktree has its own git dir at `<main>/.git/worktrees/<name>`
+/// holding only per-worktree state (`HEAD`, `index`, `refs/bisect`, ...).
+/// That directory contains a `commondir` file pointing (usually relatively) at
+/// the main `.git`, which holds the shared state (`objects`, `refs/heads`,
+/// `packed-refs`, `config`, ...). This mirrors `git rev-parse --git-common-dir`.
+///
+/// Returns `git_dir` unchanged when there is no `commondir` file.
+pub fn read_git_common_dir(git_dir: &Path) -> PathBuf {
+    let commondir_path = git_dir.join("commondir");
+    match fs::read_to_string(&commondir_path) {
+        Ok(content) => {
+            let content = content.trim();
+            if content.is_empty() {
+                return git_dir.to_path_buf();
+            }
+            let common = git_dir.join(content);
+            tracing::trace!(
+                "git common dir {} => {}",
+                git_dir.display(),
+                common.display()
+            );
+            util::path::normalize(&common)
+        }
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
 /// `.git` mode specific logic to resolve `dot_dir`.
 pub fn resolve_dot_dir_func(root: &Path, dot_dir: &'static str) -> PathBuf {
     assert!(dot_dir.starts_with(".git"));
