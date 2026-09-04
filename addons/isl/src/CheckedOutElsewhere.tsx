@@ -19,13 +19,13 @@ import {repositoryInfo, worktreeInfoData} from './serverAPIState';
 export const showWorktreeLabels = localStorageBackedAtom<boolean>('isl.show-worktree-labels', true);
 
 /**
- * `{info, worktreeInfo}` when the worktrees feature is enabled, this is an EdenFS
- * repo, and worktree data has loaded -- `undefined` otherwise. Shared gating logic
- * for the atoms below, so non-EdenFs/flag-off repos never pay for the extra reads.
+ * `{info, worktreeInfo}` when the worktrees feature is enabled, this repo can host
+ * worktrees, and worktree data has loaded -- `undefined` otherwise. Shared gating logic
+ * for the atoms below, so unsupported/flag-off repos never pay for the extra reads.
  */
 const enabledWorktreeInfo = atom(get => {
   const info = get(repositoryInfo);
-  if (info?.isEdenFs !== true) {
+  if (info?.worktreesSupported !== true) {
     return undefined;
   }
 

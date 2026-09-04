@@ -628,13 +628,15 @@ async function resolveWorktreeRepo(): Promise<
   if (repo == null) {
     return undefined;
   }
-  if (repo.info.isEdenFs !== true) {
+  if (repo.info.worktreesSupported !== true) {
     vscode.window.showErrorMessage(
-      t('Worktrees require EdenFS. This repository is not backed by EdenFS'),
+      t(
+        'Worktrees are not supported for this repository (needs EdenFS or a git-backed repository)',
+      ),
     );
     return undefined;
   }
-  if (repo.info.codeReviewSystem.type === 'github') {
+  if (repo.info.isEdenFs === true && repo.info.codeReviewSystem.type === 'github') {
     vscode.window.showErrorMessage(t('Worktrees are not supported for GitHub repositories'));
     return undefined;
   }

@@ -575,6 +575,7 @@ export class Repository {
     }
 
     const isEdenFs = await isEdenFsRepo(repoRoot as AbsolutePath);
+    const worktreesSupported = isEdenFs || isDotGitDotDir(dotdir);
 
     let codeReviewSystem: CodeReviewSystem;
     let pullRequestDomain;
@@ -621,6 +622,7 @@ export class Repository {
       pullRequestDomain,
       preferredSubmitCommand: preferredSubmitCommand as PreferredSubmitCommand | undefined,
       isEdenFs,
+      worktreesSupported,
     };
     logger.info('repo info: ', result);
     return result;
@@ -1944,6 +1946,27 @@ async function isEdenFsRepo(repoRoot: AbsolutePath): Promise<boolean> {
     return true;
   } catch {}
   return false;
+}
+
+/**
+ * Whether the dot dir reported by `sl root --dotdir` belongs to a git-backed ("dotgit")
+ * repo, which can host linked worktrees via `git worktree`. Such a dot dir is
+ * `<root>/.git/sl` for a main checkout, or `<main>/.git/worktrees/<name>/sl` for a
+ * linked worktree. Exported for tests.
+ */
+export function isDotGitDotDir(dotdir: string, pathMod = path): boolean {
+  if (pathMod.basename(dotdir) !== 'sl') {
+    return false;
+  }
+  const parent = pathMod.dirname(dotdir);
+  if (pathMod.basename(parent) === '.git') {
+    return true;
+  }
+  const grandparent = pathMod.dirname(parent);
+  return (
+    pathMod.basename(grandparent) === 'worktrees' &&
+    pathMod.basename(pathMod.dirname(grandparent)) === '.git'
+  );
 }
 
 /**
