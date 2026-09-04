@@ -56,6 +56,10 @@ class Sapling < Formula
 
     (bin/"sl").write <<~EOS
       #!/bin/bash
+      # `sl --version` is only recognised as the first argument; keep it there.
+      if [ "${1:-}" = "--version" ]; then
+        exec "#{opt_libexec}/sl" "$@"
+      fi
       exec "#{opt_libexec}/sl" --config "web.isl-dist-path=#{opt_libexec}/isl-dist.tar.xz" "$@"
     EOS
   end
