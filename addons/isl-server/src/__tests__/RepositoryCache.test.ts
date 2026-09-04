@@ -250,6 +250,37 @@ describe('RepositoryCache', () => {
     expect(cache.cachedRepositoryForPath('/path/to/submodule')).toEqual(undefined);
   });
 
+  it('does not match a cwd inside a nested worktree to the enclosing repo', async () => {
+    // `<root>/.worktrees/wt` is a git worktree of its own, marked by a `.git` file.
+    const dotGitPaths = new Set(['/path/to/repo/.worktrees/wt/.git']);
+    const cache = new RepositoryCache(SimpleMockRepository, path => dotGitPaths.has(path));
+    const ref = cache.getOrCreate({...ctx, cwd: '/path/to/repo'});
+    await ref.promise;
+
+    expect(cache.cachedRepositoryForPath('/path/to/repo/.worktrees/wt')).toEqual(undefined);
+    expect(cache.cachedRepositoryForPath('/path/to/repo/.worktrees/wt/foo/bar')).toEqual(undefined);
+    // The containing directory is still part of the main repo.
+    expect(cache.cachedRepositoryForPath('/path/to/repo/.worktrees')?.info.repoRoot).toEqual(
+      '/path/to/repo',
+    );
+
+    ref.unref();
+  });
+
+  it('still matches ordinary subdirectories of a repo', async () => {
+    const cache = new RepositoryCache(SimpleMockRepository, () => false);
+    const ref = cache.getOrCreate({...ctx, cwd: '/path/to/repo'});
+    await ref.promise;
+
+    expect(cache.cachedRepositoryForPath('/path/to/repo')?.info.repoRoot).toEqual('/path/to/repo');
+    expect(cache.cachedRepositoryForPath('/path/to/repo/')?.info.repoRoot).toEqual('/path/to/repo');
+    expect(cache.cachedRepositoryForPath('/path/to/repo/foo/bar')?.info.repoRoot).toEqual(
+      '/path/to/repo',
+    );
+
+    ref.unref();
+  });
+
   it('only creates one Repository even when racing lookups', async () => {
     const repoInfo = {
       type: 'success',

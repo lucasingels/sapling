@@ -358,7 +358,7 @@ describe('worktree commands', () => {
   const repoRoot = '/repo/root';
   const mainWorktree = {path: repoRoot, role: 'main' as const};
   const siblingWorktree = {
-    path: '/repo/root.worktrees/root_2',
+    path: '/repo/root/.worktrees/sibling',
     role: 'linked' as const,
     label: 'sibling',
   };
@@ -511,7 +511,7 @@ describe('worktree commands', () => {
     it('runs AddWorktreeOperation with the expected args', async () => {
       mockShowInputBox
         .mockResolvedValueOnce('my-label')
-        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+        .mockResolvedValueOnce('/repo/root/.worktrees/my-label');
       mockShowQuickPick.mockResolvedValueOnce(undefined);
 
       await addCommand.apply(ctx);
@@ -523,7 +523,7 @@ describe('worktree commands', () => {
             {type: 'config', key: 'worktree.enabled', value: 'true'},
             'worktree',
             'add',
-            '/repo/root.worktrees/root_3',
+            '/repo/root/.worktrees/my-label',
             '--label',
             'my-label',
           ],
@@ -532,10 +532,30 @@ describe('worktree commands', () => {
       );
     });
 
+    it('defaults the destination to a hidden dir inside the main worktree, named after the label', async () => {
+      mockShowInputBox.mockResolvedValueOnce('my-label').mockResolvedValueOnce(undefined);
+
+      await addCommand.apply(ctx);
+
+      expect(mockShowInputBox).toHaveBeenLastCalledWith(
+        expect.objectContaining({value: '/repo/root/.worktrees/my-label'}),
+      );
+    });
+
+    it('falls back to a numbered name when no label is given', async () => {
+      mockShowInputBox.mockResolvedValueOnce('').mockResolvedValueOnce(undefined);
+
+      await addCommand.apply(ctx);
+
+      expect(mockShowInputBox).toHaveBeenLastCalledWith(
+        expect.objectContaining({value: '/repo/root/.worktrees/wt_2'}),
+      );
+    });
+
     it('skips a default destination that already exists on disk', async () => {
       mockShowInputBox.mockResolvedValueOnce('my-label').mockResolvedValueOnce(undefined);
       mockFsAccess.mockImplementation(p =>
-        p === '/repo/root.worktrees/root_3'
+        p === '/repo/root/.worktrees/my-label'
           ? Promise.resolve()
           : Promise.reject(new Error('ENOENT')),
       );
@@ -543,14 +563,14 @@ describe('worktree commands', () => {
       await addCommand.apply(ctx);
 
       expect(mockShowInputBox).toHaveBeenLastCalledWith(
-        expect.objectContaining({value: '/repo/root.worktrees/root_4'}),
+        expect.objectContaining({value: '/repo/root/.worktrees/my-label_2'}),
       );
     });
 
     it('shows a progress notification while the worktree is being created', async () => {
       mockShowInputBox
         .mockResolvedValueOnce('my-label')
-        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+        .mockResolvedValueOnce('/repo/root/.worktrees/my-label');
       mockShowQuickPick.mockResolvedValueOnce(undefined);
 
       await addCommand.apply(ctx);
@@ -564,7 +584,7 @@ describe('worktree commands', () => {
     it('does not prompt to open the worktree when creation fails', async () => {
       mockShowInputBox
         .mockResolvedValueOnce('my-label')
-        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+        .mockResolvedValueOnce('/repo/root/.worktrees/my-label');
       mockRepo.runOrQueueOperation.mockImplementationOnce(
         (_ctx: RepositoryContext, operation: RunnableOperation, onProgress) => {
           onProgress({id: operation.id, kind: 'exit', exitCode: 1, timestamp: Date.now()});
@@ -587,7 +607,7 @@ describe('worktree commands', () => {
       mockBasecampOpenFolderAsNewTile.mockResolvedValue(true);
       mockShowInputBox
         .mockResolvedValueOnce('my-label')
-        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+        .mockResolvedValueOnce('/repo/root/.worktrees/my-label');
       mockShowQuickPick.mockResolvedValueOnce({
         label: 'Open in New Tile',
         action: 'open',
@@ -600,7 +620,7 @@ describe('worktree commands', () => {
         expect.arrayContaining([expect.objectContaining({label: 'Open in Current Window'})]),
       );
       expect(mockBasecampOpenFolderAsNewTile).toHaveBeenCalledWith(
-        '/repo/root.worktrees/root_3',
+        '/repo/root/.worktrees/my-label',
         'my-label',
       );
       expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
@@ -615,7 +635,7 @@ describe('worktree commands', () => {
       mockBasecampOpenFolderAsNewTile.mockResolvedValue(false);
       mockShowInputBox
         .mockResolvedValueOnce('my-label')
-        .mockResolvedValueOnce('/repo/root.worktrees/root_3');
+        .mockResolvedValueOnce('/repo/root/.worktrees/my-label');
       mockShowQuickPick.mockResolvedValueOnce({
         label: 'Open in New Tile',
         action: 'open',
@@ -630,7 +650,7 @@ describe('worktree commands', () => {
         expect.anything(),
       );
       expect(mockShowErrorMessage).toHaveBeenCalledWith(
-        expect.stringContaining('/repo/root.worktrees/root_3'),
+        expect.stringContaining('/repo/root/.worktrees/my-label'),
       );
     });
   });

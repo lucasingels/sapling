@@ -19,6 +19,7 @@ import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useCallback, useState} from 'react';
 import {basename, dirname, guessPathSep, pathsAreIdentical} from 'shared/utils';
+import {defaultWorktreesDir, pickWorktreeDirName} from 'shared/worktreePaths';
 import serverAPI from './ClientToServerAPI';
 import {Column, Row} from './ComponentUtils';
 import css from './CwdSelector.module.css';
@@ -316,14 +317,20 @@ function AddWorktreeButton({
   const showModal = useModal();
   const runOperation = useRunOperation();
   const sep = guessPathSep(repoRoot);
-  const parentDir = dirname(repoRoot, sep);
-  const repoName = basename(repoRoot, sep);
-  const existingBasenames = new Set(existingWorktreePaths.map(p => basename(p, guessPathSep(p))));
-  let suffix = 2;
-  while (existingBasenames.has(`${repoName}_${suffix}`)) {
-    suffix++;
-  }
-  const defaultDest = `${parentDir}${sep}${repoName}.worktrees${sep}${repoName}_${suffix}`;
+  const worktreesDir = defaultWorktreesDir(repoRoot, sep);
+
+  // New worktrees go in a hidden directory inside the main worktree, named after the label.
+  const defaultDestForLabel = useCallback(
+    (label: string) => {
+      const takenNames = new Set(
+        existingWorktreePaths
+          .filter(p => pathsAreIdentical(dirname(p, guessPathSep(p)), worktreesDir))
+          .map(p => basename(p, guessPathSep(p))),
+      );
+      return `${worktreesDir}${sep}${pickWorktreeDirName(label, name => takenNames.has(name))}`;
+    },
+    [existingWorktreePaths, worktreesDir, sep],
+  );
 
   const onClickAdd = useCallback(async () => {
     dismiss();
@@ -345,7 +352,7 @@ function AddWorktreeButton({
       component: ({returnResultAndDismiss}) => (
         <AddWorktreeModal
           returnResultAndDismiss={returnResultAndDismiss}
-          defaultDest={defaultDest}
+          defaultDestForLabel={defaultDestForLabel}
         />
       ),
     });
@@ -385,7 +392,7 @@ function AddWorktreeButton({
         serverAPI.postMessage({type: 'platform/openInNewWindow', path: result.destPath});
       }
     }
-  }, [dismiss, showModal, runOperation, defaultDest]);
+  }, [dismiss, showModal, runOperation, defaultDestForLabel]);
 
   return (
     <Button
@@ -405,13 +412,15 @@ type AddWorktreeResult = {
 
 function AddWorktreeModal({
   returnResultAndDismiss,
-  defaultDest,
+  defaultDestForLabel,
 }: {
   returnResultAndDismiss: (result: AddWorktreeResult) => void;
-  defaultDest: string;
+  defaultDestForLabel: (label: string) => string;
 }) {
-  const [destPath, setDestPath] = useState(defaultDest);
+  // Until the path is edited by hand, it follows the label as the user types.
+  const [customDest, setCustomDest] = useState<string | null>(null);
   const [label, setLabel] = useState('');
+  const destPath = customDest ?? defaultDestForLabel(label);
   const appInfo = useAtomValue(applicationinfo);
   const isVSCode = platform.platformName === 'vscode';
   const [openIn, setOpenIn] = useState<AddWorktreeResult['openIn']>(isVSCode ? 'new' : 'none');
@@ -436,7 +445,7 @@ function AddWorktreeModal({
           <TextField
             data-testid="add-worktree-path"
             value={destPath}
-            onInput={e => setDestPath(e.currentTarget?.value ?? '')}
+            onInput={e => setCustomDest(e.currentTarget?.value ?? '')}
             onBlur={() => setIsEditingPath(false)}
             autoFocus
           />

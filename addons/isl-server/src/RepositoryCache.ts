@@ -8,9 +8,40 @@
 import type {AbsolutePath, RepositoryError, ValidatedRepoInfo} from 'isl/src/types';
 import type {RepositoryContext} from './serverTypes';
 
+import fs from 'node:fs';
+import nodePath from 'node:path';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {ensureTrailingPathSep} from 'shared/pathUtils';
 import {Repository} from './Repository';
+
+/** Whether a path exists on disk. Injectable so tests don't need a real filesystem. */
+type ExistsSync = (path: string) => boolean;
+
+/** Strip trailing path separators, so a cwd with one compares equal to a repo root without. */
+function stripTrailingSep(path: string): string {
+  return path.length > 1 ? path.replace(/[\\/]+$/, '') : path;
+}
+
+/**
+ * Whether some directory between `path` and `repoRoot` (including `path` itself, excluding
+ * `repoRoot`) holds a `.git` entry, meaning `path` lives in a worktree or repo nested inside
+ * `repoRoot` rather than in `repoRoot` itself.
+ */
+function hasNestedDotGit(path: string, repoRoot: string, existsSync: ExistsSync): boolean {
+  const root = stripTrailingSep(repoRoot);
+  let current = stripTrailingSep(path);
+  while (current !== root && current.startsWith(ensureTrailingPathSep(root))) {
+    if (existsSync(nodePath.join(current, '.git'))) {
+      return true;
+    }
+    const parent = stripTrailingSep(nodePath.dirname(current));
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+  return false;
+}
 
 /**
  * Reference-counting access to a {@link Repository}, via a Promise.
@@ -63,6 +94,8 @@ class RefCounted<T extends {dispose: () => void}> {
 }
 
 class RepoMap {
+  constructor(private existsSync: ExistsSync = fs.existsSync) {}
+
   /**
    * Previously distributed RepositoryReferences, keyed by repository root path
    * Note that Repositories do not define their own `cwd`, and can be reused across cwds.
@@ -83,7 +116,15 @@ class RepoMap {
 
   public getLongestPrefixMatch(path: AbsolutePath): RefCounted<Repository> | undefined {
     for (const repoRoot of this.orderedRoots) {
-      if (path === repoRoot || path.startsWith(ensureTrailingPathSep(repoRoot))) {
+      if (path === repoRoot) {
+        return this.reposByRoot.get(repoRoot);
+      }
+      if (path.startsWith(ensureTrailingPathSep(repoRoot))) {
+        // A worktree nested inside a checkout (like `<root>/.worktrees/foo`) is its own
+        // repository, so it must not be attributed to the enclosing one.
+        if (hasNestedDotGit(path, repoRoot, this.existsSync)) {
+          continue;
+        }
         return this.reposByRoot.get(repoRoot);
       }
     }
@@ -114,10 +155,15 @@ class RepoMap {
  * We still enable Repository reuse in this case by double checking for pre-existing Repos at the last second.
  */
 class RepositoryCache {
-  // allow mocking Repository in tests
-  constructor(private RepositoryType = Repository) {}
+  // allow mocking Repository and the filesystem in tests
+  constructor(
+    private RepositoryType = Repository,
+    existsSync: ExistsSync = fs.existsSync,
+  ) {
+    this.repoMap = new RepoMap(existsSync);
+  }
 
-  private repoMap = new RepoMap();
+  private repoMap: RepoMap;
   private activeReposEmitter = new TypedEventEmitter<'change', undefined>();
 
   private lookup(dirGuess: AbsolutePath): RefCounted<Repository> | undefined {
