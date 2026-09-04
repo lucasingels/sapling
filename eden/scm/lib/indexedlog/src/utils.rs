@@ -17,8 +17,8 @@ use std::sync::atomic;
 
 use memmap2::MmapOptions;
 use minibytes::Bytes;
-use twox_hash::XxHash;
 use twox_hash::XxHash32;
+use twox_hash::XxHash64;
 
 use crate::config;
 use crate::errors::IoResultExt;
@@ -112,7 +112,7 @@ pub fn open_dir(lock_path: impl AsRef<Path>) -> io::Result<File> {
 
 #[inline]
 pub fn xxhash<T: AsRef<[u8]>>(buf: T) -> u64 {
-    let mut xx = XxHash::default();
+    let mut xx = XxHash64::default();
     xx.write(buf.as_ref());
     xx.finish()
 }
@@ -239,10 +239,7 @@ fn atomic_read_symlink(path: &Path) -> io::Result<Vec<u8>> {
         Ok(hex::decode(&encoded_content[4..]).map_err(|_e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{:?}: cannot decode hex content {:?}",
-                    path, &encoded_content,
-                ),
+                format!("{path:?}: cannot decode hex content {encoded_content:?}",),
             )
         })?)
     } else {
@@ -276,10 +273,7 @@ pub(crate) fn mkdir_p(dir: impl AsRef<Path>) -> crate::Result<()> {
                     if let Some(parent) = dir.parent() {
                         if fix_perm_path(parent, true).is_ok() {
                             return try_mkdir_once().context(dir, "cannot mkdir").context(|| {
-                                format!(
-                                    "while trying to mkdir {:?} after fix_perm {:?}",
-                                    &dir, &parent
-                                )
+                                format!("while trying to mkdir {dir:?} after fix_perm {parent:?}")
                             });
                         }
                     }

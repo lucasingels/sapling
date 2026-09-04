@@ -19,13 +19,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Error;
+#[cfg(fbcode_build)]
+use backend_if::RimBackend;
 use cached_config::ConfigStore;
 use clientinfo::ClientEntryPoint;
 use fbinit::FacebookInit;
 use gotham::router::Router;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ArtilleryMiddleware;
-use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
 use gotham_ext::middleware::LogMiddleware;
 use gotham_ext::middleware::MetadataMiddleware;
@@ -38,7 +39,6 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use http::HeaderValue;
 use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
-use mononoke_configs::MononokeConfigs;
 use rate_limiting::RateLimitEnvironment;
 use scuba_ext::MononokeScubaSampleBuilder;
 #[cfg(fbcode_build)]
@@ -61,16 +61,21 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     test_friendly_logging: bool,
     tls_session_data_log_path: Option<&Path>,
     rate_limiter: Option<RateLimitEnvironment>,
-    configs: Arc<MononokeConfigs>,
     common_config: &CommonConfig,
     readonly: bool,
     mtls_disabled: bool,
     config_store: &ConfigStore,
     is_shadow_tier: bool,
     tls_ca_path: Option<&Path>,
+    rim_backend: Option<i32>,
 ) -> Result<SaplingRemoteApi, Error> {
     #[cfg(fbcode_build)]
-    crate::utils::rim_shadow::init();
+    let rim_backend = rim_backend
+        .map(RimBackend)
+        .inspect(|rim_backend| crate::utils::rim_rate_limiter::init(*rim_backend));
+
+    #[cfg(not(fbcode_build))]
+    let _ = rim_backend;
 
     let ctx = ServerContext::new(mononoke, will_exit);
 
@@ -88,7 +93,6 @@ pub fn build<R: Send + Sync + Clone + 'static>(
 
     let handler = MononokeHttpHandler::builder()
         .add(TlsSessionDataMiddleware::new(tls_session_data_log_path)?)
-        .add(ConfigInfoMiddleware::new(configs))
         .add(MetadataMiddleware::new(
             fb,
             common_config.internal_identity.clone(),
@@ -127,11 +131,14 @@ pub fn build<R: Send + Sync + Clone + 'static>(
             fb,
             common_config.edenapi_dumper_scuba_table.clone(),
         ))
-        .add(ThrottleMiddleware::new())
+        .add(<ScubaMiddleware<SaplingRemoteApiScubaHandler>>::new(scuba))
+        .add(ThrottleMiddleware::new(
+            #[cfg(fbcode_build)]
+            rim_backend,
+        ))
         .add(LoadMiddleware::new())
         .add(log_middleware)
         .add(OdsMiddleware::new())
-        .add(<ScubaMiddleware<SaplingRemoteApiScubaHandler>>::new(scuba))
         .add(TimerMiddleware::new())
         .build(router);
 

@@ -17,7 +17,7 @@ name = "macro_test"
 path = "test/basic_test.rs"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blob = { version = "0.1.0", path = "../../blob" }
 bytes = { version = "1.12.1", features = ["serde"] }
 manifest-augmented-tree = { version = "0.1.0", path = "../../manifest-augmented-tree" }
@@ -30,13 +30,13 @@ sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
 sapling-revisionstore_types = { version = "0.1.0", path = "../../revisionstore/types" }
 sapling-type_macros = { version = "0.1.0", path = "proc_macros" }
 sapling-types = { version = "0.1.0", path = "../../types" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_derive = "1.0.185"
-thiserror = "2.0.18"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_derive = "1.0.229"
+thiserror = "2.0.20"
 
 [dev-dependencies]
 quickcheck_macros = "1.2.0"
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 
 [features]
 default = ["for-tests"]

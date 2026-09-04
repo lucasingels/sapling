@@ -8,11 +8,6 @@ rust_library(
         "src/**/*.rs",
         "test_data/**/*.txt",
     ]),
-    autocargo = {
-        "cargo_toml_config": {
-            "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
-        }
-    },
     test_deps = [
         "fbsource//third-party/rust:async-compression",
         "fbsource//third-party/rust:futures-util",
@@ -35,7 +30,7 @@ rust_library(
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:bytes",
-        "fbsource//third-party/rust:digest",
+        "fbsource//third-party/rust:digest-010",
         "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:gix-actor",
@@ -46,7 +41,7 @@ rust_library(
         "fbsource//third-party/rust:ouroboros",
         "fbsource//third-party/rust:quickcheck",
         "fbsource//third-party/rust:regex",
-        "fbsource//third-party/rust:sha1",
+        "fbsource//third-party/rust:sha1-010",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",

@@ -13,6 +13,7 @@
 //! other crates (e.g., `clone`, Python bindings for smartlog) can access
 //! worktree group information without pulling in command-layer dependencies.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 #[cfg(unix)]
@@ -23,6 +24,8 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -52,6 +55,87 @@ pub struct WorktreeEntry {
     pub added: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// Worktree registry information for a single checkout.
+///
+/// Note: `Group::new` inserts the main checkout into `worktrees`, so both counts
+/// include the main checkout, not just linked worktrees.
+#[derive(Debug, Eq, PartialEq)]
+pub struct WorktreeInfo {
+    /// Whether this checkout is a linked worktree (i.e. not the group's main checkout).
+    pub is_linked: bool,
+    /// Total number of checkouts in this checkout's group (main + linked).
+    pub worktree_count_group: usize,
+    /// Total number of checkouts across all groups in the registry (main + linked).
+    pub worktree_count: usize,
+}
+
+/// In-flight `worktree add` slot reservations, keyed by a unique per-add
+/// reservation id (see [`new_reservation_id`]).
+///
+/// Persisted in a **separate** file (`worktree-reservations.json`), *not* inside
+/// `worktrees.json`. This separation is deliberate and load-bearing:
+///
+/// * An older `sl` binary that predates reservations rewrites `worktrees.json`
+///   whenever it prunes on `list`/`remove`. If reservations lived there it would
+///   silently drop them, deleting a concurrent add's slot and re-opening the
+///   over-limit race. Old binaries never open `worktree-reservations.json`, so
+///   they cannot clobber it.
+/// * `worktrees.json` therefore keeps its existing (version 1) shape, so no
+///   on-disk migration or version bump is needed.
+///
+/// A reservation is recorded (under the registry lock) *before* the destination
+/// checkout is cloned, counts against `worktree.max-count`, and is removed once
+/// the add finishes (or fails). Keying by a unique id (rather than by
+/// destination) ensures each add only ever releases its own reservation: two
+/// adds targeting the *same* destination get distinct ids, so one aborting
+/// cannot free the other's slot.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Reservations {
+    #[serde(default)]
+    pub reservations: BTreeMap<String, Reservation>,
+}
+
+/// A single reserved slot held by an in-progress `worktree add`.
+#[derive(Serialize, Deserialize)]
+pub struct Reservation {
+    /// Canonical main path of the group whose limit this slot counts against.
+    pub group_main: PathBuf,
+    /// Destination checkout path (for observability/debugging).
+    pub dest: PathBuf,
+    /// RFC 3339 timestamp of when the slot was reserved. Used to expire stale
+    /// reservations orphaned by a crashed `worktree add` so they cannot consume
+    /// a slot forever (see [`Reservations::prune_stale`]).
+    pub added: String,
+}
+
+/// Default time a `worktree add` slot reservation stays valid, in seconds (1
+/// hour). Overridable via the `worktree.reservation-ttl` config. A reservation
+/// is created just before cloning the destination and removed once the add
+/// finishes (or fails); anything older than this was orphaned by a crash and is
+/// pruned so it cannot consume a slot forever. The default is sized generously
+/// so a slow clone or snapshot restore is never mistaken for a crash.
+pub const DEFAULT_RESERVATION_TTL_SECONDS: i64 = 60 * 60;
+
+/// Per-process counter making reservation ids unique even if two are created
+/// within the same nanosecond in one process.
+static RESERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a globally-unique id for a `worktree add` slot reservation.
+///
+/// Combines the process id, a high-resolution timestamp, and a per-process
+/// counter. Concurrent adds run in separate processes (distinct pids), and a
+/// crashed add whose pid is later reused differs in the timestamp, so two live
+/// reservations never collide on the same id. Keying reservations by this id
+/// (instead of by destination) means each add releases only its own slot.
+pub fn new_reservation_id() -> String {
+    let seq = RESERVATION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = chrono::Utc::now();
+    let nanos = now
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| now.timestamp_micros());
+    format!("{}-{}-{}", std::process::id(), nanos, seq)
 }
 
 impl Registry {
@@ -85,10 +169,75 @@ impl Group {
             worktrees,
         }
     }
+
+    /// Number of linked worktrees in the group, excluding the main worktree.
+    pub fn linked_worktree_count(&self) -> usize {
+        self.worktrees.keys().filter(|p| *p != &self.main).count()
+    }
+}
+
+impl Reservations {
+    /// Drop reservations older than `ttl_seconds`. A reservation only lives for
+    /// the duration of a single `worktree add`; anything older was almost
+    /// certainly orphaned by a crashed add and must not keep consuming a slot.
+    pub fn prune_stale(&mut self, ttl_seconds: i64) {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(ttl_seconds);
+        self.reservations.retain(|_, reservation| {
+            match chrono::DateTime::parse_from_rfc3339(&reservation.added) {
+                Ok(added) => added.with_timezone(&chrono::Utc) > cutoff,
+                // Keep entries whose timestamp we cannot parse: dropping one
+                // would re-open the race the reservation exists to prevent. In
+                // practice this never happens since we always write RFC 3339.
+                Err(_) => true,
+            }
+        });
+    }
+
+    /// Number of active reservations counting against `group_main`'s limit.
+    /// Call [`Reservations::prune_stale`] first to exclude orphaned slots.
+    pub fn count_for_group(&self, group_main: &Path) -> usize {
+        self.reservations
+            .values()
+            .filter(|reservation| reservation.group_main == group_main)
+            .count()
+    }
+}
+
+impl Reservation {
+    /// Create a reservation for `group_main`/`dest` stamped with the current time.
+    pub fn now(group_main: PathBuf, dest: PathBuf) -> Self {
+        Self {
+            group_main,
+            dest,
+            added: chrono::Utc::now().to_rfc3339(),
+        }
+    }
 }
 
 const GROUP_ID_NAMESPACE: &[u8] = b"group-id";
 const WORKTREE_OP_LOCK_NAMESPACE: &[u8] = b"worktree-op-lock";
+
+std::thread_local! {
+    static REGISTRY_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct RegistryLockScope;
+
+impl RegistryLockScope {
+    fn enter() -> Result<Self> {
+        if REGISTRY_LOCK_DEPTH.with(|depth| depth.get() > 0) {
+            anyhow::bail!("cannot acquire registry lock while already holding registry lock");
+        }
+        REGISTRY_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Ok(Self)
+    }
+}
+
+impl Drop for RegistryLockScope {
+    fn drop(&mut self) {
+        REGISTRY_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 // These derived names must be stable outside a single process: group IDs are
 // written to the registry, and lock names are used for on-disk coordination.
@@ -220,6 +369,10 @@ fn worktree_path_lockfile_name(worktree_path: &Path) -> String {
 }
 
 pub fn lock_worktree_path_op(shared_store_path: &Path, worktree_path: &Path) -> Result<PathLock> {
+    let registry_lock_held = REGISTRY_LOCK_DEPTH.with(|depth| depth.get() > 0);
+    if registry_lock_held {
+        anyhow::bail!("cannot acquire worktree path operation lock while holding registry lock");
+    }
     let lock_path = shared_store_path.join(worktree_path_lockfile_name(worktree_path));
     Ok(PathLock::exclusive(lock_path)?)
 }
@@ -318,6 +471,31 @@ pub fn load_registry(shared_store_path: &Path) -> Result<Registry> {
     }
 }
 
+/// Return worktree group information for `repo_path`, if it is registered.
+pub fn worktree_info(shared_store_path: &Path, repo_path: &Path) -> Result<Option<WorktreeInfo>> {
+    let current = util::path::strip_unc_prefix(fs::canonicalize(repo_path).with_context(|| {
+        format!(
+            "failed to canonicalize repository path {}",
+            repo_path.display()
+        )
+    })?);
+    let registry = load_registry(shared_store_path)?;
+    let Some(group_id) = registry.find_group_for_path(&current) else {
+        return Ok(None);
+    };
+    let worktree_count = registry
+        .groups
+        .values()
+        .map(|group| group.worktrees.len())
+        .sum();
+
+    Ok(registry.groups.get(&group_id).map(|group| WorktreeInfo {
+        is_linked: current != group.main,
+        worktree_count_group: group.worktrees.len(),
+        worktree_count,
+    }))
+}
+
 pub fn save_registry(shared_store_path: &Path, registry: &Registry) -> Result<()> {
     let path = shared_store_path.join("worktrees.json");
     let content = serde_json::to_string_pretty(registry).context("failed to serialize registry")?;
@@ -332,6 +510,22 @@ pub fn dissolve_group(registry: &mut Registry, group_id: &str) {
     registry.groups.remove(group_id);
 }
 
+/// Remove `group_id` from the registry if it has no linked worktrees.
+///
+/// In-flight reservations live in a separate file and are not consulted here: if
+/// an add is mid-flight when its group is dissolved, its later registration
+/// simply recreates the group. Reservations count by group main path, so they
+/// remain enforced across the dissolve.
+pub fn dissolve_group_if_empty(registry: &mut Registry, group_id: &str) {
+    let should_dissolve = registry
+        .groups
+        .get(group_id)
+        .is_some_and(|group| group.linked_worktree_count() == 0);
+    if should_dissolve {
+        dissolve_group(registry, group_id);
+    }
+}
+
 /// Lock the registry file, load it, run `f`, and write back the result.
 ///
 /// This lock is intentionally coarse and should stay scoped to the
@@ -343,11 +537,66 @@ pub fn with_registry_lock<T>(
     shared_store_path: &Path,
     f: impl FnOnce(&mut Registry) -> Result<T>,
 ) -> Result<T> {
+    let _scope = RegistryLockScope::enter()?;
     let lock_path = shared_store_path.join("worktrees.lock");
     let _lock = PathLock::exclusive(&lock_path)?;
     let mut registry = load_registry(shared_store_path)?;
     let result = f(&mut registry)?;
     save_registry(shared_store_path, &registry)?;
+    Ok(result)
+}
+
+// --- Reservation Persistence ---
+//
+// Reservations are stored in their own file, separate from `worktrees.json`, so
+// that an older `sl` binary rewriting the registry cannot drop them (see the
+// `Reservations` doc comment).
+
+const RESERVATIONS_FILE: &str = "worktree-reservations.json";
+
+pub fn load_reservations(shared_store_path: &Path) -> Result<Reservations> {
+    let path = shared_store_path.join(RESERVATIONS_FILE);
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let reservations: Reservations = serde_json::from_str(&content)
+                .with_context(|| format!("failed to parse reservations at {}", path.display()))?;
+            Ok(reservations)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Reservations::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn save_reservations(shared_store_path: &Path, reservations: &Reservations) -> Result<()> {
+    let path = shared_store_path.join(RESERVATIONS_FILE);
+    let content =
+        serde_json::to_string_pretty(reservations).context("failed to serialize reservations")?;
+    util::file::atomic_write(&path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_bytes())
+    })?;
+    Ok(())
+}
+
+/// Run `f` holding the registry lock, giving it read-only access to the registry
+/// (for the linked-worktree count) and mutable access to the reservations. Only
+/// the reservations file is written back — `worktrees.json` is left untouched,
+/// so this never races an older `sl` binary that rewrites the registry.
+///
+/// The same lock file as [`with_registry_lock`] is used, so reservation and
+/// registry updates serialize against each other and the linked-worktree count
+/// observed here is consistent with concurrent registrations.
+pub fn with_reservations<T>(
+    shared_store_path: &Path,
+    f: impl FnOnce(&Registry, &mut Reservations) -> Result<T>,
+) -> Result<T> {
+    let _scope = RegistryLockScope::enter()?;
+    let lock_path = shared_store_path.join("worktrees.lock");
+    let _lock = PathLock::exclusive(&lock_path)?;
+    let registry = load_registry(shared_store_path)?;
+    let mut reservations = load_reservations(shared_store_path)?;
+    let result = f(&registry, &mut reservations)?;
+    save_reservations(shared_store_path, &reservations)?;
     Ok(result)
 }
 
@@ -420,6 +669,76 @@ mod tests {
         let reg = load_registry(dir.path()).unwrap();
         assert_eq!(reg.version, 1);
         assert!(reg.groups.is_empty());
+    }
+
+    #[test]
+    fn test_worktree_info_roles() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let main_path = checkouts_dir.path().join("main");
+        let linked_path = checkouts_dir.path().join("linked");
+        let unregistered_path = checkouts_dir.path().join("legacy-share");
+        let other_main_path = checkouts_dir.path().join("other-main");
+        let other_linked_path = checkouts_dir.path().join("other-linked");
+        for path in [
+            &main_path,
+            &linked_path,
+            &unregistered_path,
+            &other_main_path,
+            &other_linked_path,
+        ] {
+            std::fs::create_dir(path).unwrap();
+        }
+
+        assert_eq!(worktree_info(store_dir.path(), &main_path).unwrap(), None);
+
+        let main_path = util::path::strip_unc_prefix(fs::canonicalize(main_path).unwrap());
+        let linked_path = util::path::strip_unc_prefix(fs::canonicalize(linked_path).unwrap());
+        let other_main_path = fs::canonicalize(other_main_path).unwrap();
+        let other_linked_path = fs::canonicalize(other_linked_path).unwrap();
+        let mut group = Group::new(main_path.clone());
+        group.worktrees.insert(
+            linked_path.clone(),
+            WorktreeEntry {
+                added: "2025-01-01T00:00:00Z".to_string(),
+                label: None,
+            },
+        );
+        let mut other_group = Group::new(other_main_path);
+        other_group.worktrees.insert(
+            other_linked_path,
+            WorktreeEntry {
+                added: "2025-01-01T00:00:00Z".to_string(),
+                label: None,
+            },
+        );
+        let mut registry = Registry::new();
+        registry.groups.insert("test-group-id".to_string(), group);
+        registry
+            .groups
+            .insert("other-group-id".to_string(), other_group);
+        save_registry(store_dir.path(), &registry).unwrap();
+
+        assert_eq!(
+            worktree_info(store_dir.path(), &main_path).unwrap(),
+            Some(WorktreeInfo {
+                is_linked: false,
+                worktree_count_group: 2,
+                worktree_count: 4,
+            })
+        );
+        assert_eq!(
+            worktree_info(store_dir.path(), &linked_path).unwrap(),
+            Some(WorktreeInfo {
+                is_linked: true,
+                worktree_count_group: 2,
+                worktree_count: 4,
+            })
+        );
+        assert_eq!(
+            worktree_info(store_dir.path(), &unregistered_path).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -629,6 +948,81 @@ mod tests {
         let _lock2 = lock_worktree_path_op(dir.path(), &path2).unwrap();
     }
 
+    #[test]
+    fn test_worktree_lock_then_registry_lock_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("/tmp/worktree-lock-then-registry-lock");
+
+        with_worktree_path_op_lock(dir.path(), &path, || {
+            with_registry_lock(dir.path(), |_registry| Ok(()))
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_registry_lock_then_worktree_lock_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("/tmp/registry-lock-then-worktree-lock");
+
+        let err = with_registry_lock(dir.path(), |_registry| {
+            lock_worktree_path_op(dir.path(), &path).map(|_lock| ())
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "cannot acquire worktree path operation lock while holding registry lock"
+            )
+        );
+    }
+
+    #[test]
+    fn test_reservations_lock_then_worktree_lock_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("/tmp/reservations-lock-then-worktree-lock");
+
+        let err = with_reservations(dir.path(), |_registry, _reservations| {
+            lock_worktree_path_op(dir.path(), &path).map(|_lock| ())
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "cannot acquire worktree path operation lock while holding registry lock"
+            )
+        );
+    }
+
+    #[test]
+    fn test_registry_lock_then_registry_lock_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = with_registry_lock(dir.path(), |_registry| {
+            with_registry_lock(dir.path(), |_registry| Ok(()))
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot acquire registry lock while already holding registry lock")
+        );
+    }
+
+    #[test]
+    fn test_registry_lock_then_reservations_lock_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = with_registry_lock(dir.path(), |_registry| {
+            with_reservations(dir.path(), |_registry, _reservations| Ok(()))
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot acquire registry lock while already holding registry lock")
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn test_worktree_path_lockfile_name_is_stable() {
@@ -769,5 +1163,212 @@ mod tests {
 
         dissolve_group(&mut registry, "grp2");
         assert!(!registry.groups.contains_key("grp2"));
+    }
+
+    // --- Reservation tests ---
+
+    fn stale_reservation(group_main: &str, dest: &str) -> Reservation {
+        let stale =
+            chrono::Utc::now() - chrono::Duration::seconds(DEFAULT_RESERVATION_TTL_SECONDS + 60);
+        Reservation {
+            group_main: PathBuf::from(group_main),
+            dest: PathBuf::from(dest),
+            added: stale.to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn test_load_registry_v1_has_no_reservations_field() {
+        // A version 1 registry (the only on-disk shape) loads fine; reservations
+        // are never stored in worktrees.json.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+            "version": 1,
+            "groups": {
+                "grp1": {
+                    "main": "/tmp/main",
+                    "worktrees": {
+                        "/tmp/main": {"added": "2025-01-01T00:00:00Z"}
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(dir.path().join("worktrees.json"), legacy).unwrap();
+
+        let reg = load_registry(dir.path()).unwrap();
+        assert_eq!(reg.version, 1);
+        assert!(reg.groups.contains_key("grp1"));
+    }
+
+    #[test]
+    fn test_registry_json_never_contains_reservations() {
+        // Reservations live in their own file, so worktrees.json must never
+        // gain a `reservations` key that an old binary would drop.
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::new();
+        reg.groups
+            .insert("grp1".to_string(), Group::new(PathBuf::from("/tmp/main")));
+        save_registry(dir.path(), &reg).unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("worktrees.json")).unwrap();
+        assert!(!content.contains("reservation"));
+    }
+
+    #[test]
+    fn test_reservations_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reservations = Reservations::default();
+        reservations.reservations.insert(
+            "res-1".to_string(),
+            Reservation::now(PathBuf::from("/tmp/main"), PathBuf::from("/tmp/pending")),
+        );
+
+        save_reservations(dir.path(), &reservations).unwrap();
+        let loaded = load_reservations(dir.path()).unwrap();
+        let res = loaded.reservations.get("res-1").unwrap();
+        assert_eq!(res.group_main, PathBuf::from("/tmp/main"));
+        assert_eq!(res.dest, PathBuf::from("/tmp/pending"));
+    }
+
+    #[test]
+    fn test_load_reservations_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_reservations(dir.path())
+                .unwrap()
+                .reservations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_new_reservation_id_is_unique() {
+        assert_ne!(new_reservation_id(), new_reservation_id());
+    }
+
+    #[test]
+    fn test_prune_stale() {
+        let mut reservations = Reservations::default();
+        // Fresh reservation is kept.
+        reservations.reservations.insert(
+            "res-fresh".to_string(),
+            Reservation::now(PathBuf::from("/tmp/main"), PathBuf::from("/tmp/fresh")),
+        );
+        // A reservation stamped well beyond the TTL is dropped.
+        reservations.reservations.insert(
+            "res-stale".to_string(),
+            stale_reservation("/tmp/main", "/tmp/stale"),
+        );
+        // An unparsable timestamp is conservatively kept.
+        reservations.reservations.insert(
+            "res-garbage".to_string(),
+            Reservation {
+                group_main: PathBuf::from("/tmp/main"),
+                dest: PathBuf::from("/tmp/garbage"),
+                added: "not-a-timestamp".to_string(),
+            },
+        );
+
+        reservations.prune_stale(DEFAULT_RESERVATION_TTL_SECONDS);
+
+        assert!(reservations.reservations.contains_key("res-fresh"));
+        assert!(!reservations.reservations.contains_key("res-stale"));
+        assert!(reservations.reservations.contains_key("res-garbage"));
+    }
+
+    #[test]
+    fn test_count_for_group() {
+        let mut reservations = Reservations::default();
+        reservations.reservations.insert(
+            "a".to_string(),
+            Reservation::now(PathBuf::from("/tmp/main"), PathBuf::from("/tmp/a")),
+        );
+        reservations.reservations.insert(
+            "b".to_string(),
+            Reservation::now(PathBuf::from("/tmp/main"), PathBuf::from("/tmp/b")),
+        );
+        reservations.reservations.insert(
+            "c".to_string(),
+            Reservation::now(PathBuf::from("/tmp/other"), PathBuf::from("/tmp/c")),
+        );
+
+        assert_eq!(reservations.count_for_group(&PathBuf::from("/tmp/main")), 2);
+        assert_eq!(
+            reservations.count_for_group(&PathBuf::from("/tmp/other")),
+            1
+        );
+        assert_eq!(reservations.count_for_group(&PathBuf::from("/tmp/none")), 0);
+    }
+
+    #[test]
+    fn test_with_reservations_persists_only_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a registry so with_reservations can read it; it must not rewrite it.
+        with_registry_lock(dir.path(), |registry| {
+            registry
+                .groups
+                .insert("grp1".to_string(), Group::new(PathBuf::from("/tmp/main")));
+            Ok(())
+        })
+        .unwrap();
+
+        with_reservations(dir.path(), |registry, reservations| {
+            assert!(registry.groups.contains_key("grp1"));
+            reservations.reservations.insert(
+                "res-1".to_string(),
+                Reservation::now(PathBuf::from("/tmp/main"), PathBuf::from("/tmp/pending")),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            load_reservations(dir.path())
+                .unwrap()
+                .reservations
+                .contains_key("res-1")
+        );
+    }
+
+    #[test]
+    fn test_linked_worktree_count_excludes_main() {
+        let mut group = Group::new(PathBuf::from("/tmp/main"));
+        assert_eq!(group.linked_worktree_count(), 0);
+        group.worktrees.insert(
+            PathBuf::from("/tmp/linked"),
+            WorktreeEntry {
+                added: "2025-01-01T00:00:00Z".to_string(),
+                label: None,
+            },
+        );
+        assert_eq!(group.linked_worktree_count(), 1);
+    }
+
+    #[test]
+    fn test_dissolve_group_if_empty_removes_main_only_group() {
+        let mut registry = Registry::new();
+        registry
+            .groups
+            .insert("grp1".to_string(), Group::new(PathBuf::from("/tmp/main")));
+
+        dissolve_group_if_empty(&mut registry, "grp1");
+        assert!(!registry.groups.contains_key("grp1"));
+    }
+
+    #[test]
+    fn test_dissolve_group_if_empty_keeps_group_with_linked_worktree() {
+        let mut registry = Registry::new();
+        let mut group = Group::new(PathBuf::from("/tmp/main"));
+        group.worktrees.insert(
+            PathBuf::from("/tmp/linked"),
+            WorktreeEntry {
+                added: "2025-01-01T00:00:00Z".to_string(),
+                label: None,
+            },
+        );
+        registry.groups.insert("grp1".to_string(), group);
+
+        dissolve_group_if_empty(&mut registry, "grp1");
+        assert!(registry.groups.contains_key("grp1"));
     }
 }

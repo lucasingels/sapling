@@ -5,8 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeSet;
 use std::fmt;
 
+use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
 use context::CoreContext;
@@ -30,13 +32,16 @@ use sql::sql_common::mysql::ValueError;
 use sql::sql_common::mysql::opt_try_from_rowfield;
 use sql_construct::SqlConstruct;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
-use sql_ext::Connection;
 use sql_ext::SqlConnections;
 use sql_ext::mononoke_queries;
 use strum::Display as EnumDisplay;
 use strum::EnumString;
 
 type FromValueResult<T> = Result<T, FromValueError>;
+
+const FAIL_DERIVATION_ON_RESTRICTED_MANIFEST_ID_STORE_ERROR: &str =
+    "scm/mononoke:fail_derivation_on_restricted_manifest_id_store_error";
+const MAX_LOGGED_ENTRIES: usize = 10;
 
 pub use mononoke_types::RestrictedManifestId;
 
@@ -58,10 +63,75 @@ pub enum ManifestType {
     ContentManifest,
 }
 
+/// Identifies a manifest-ID store writer for per-callsite JustKnob targeting.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestIdStoreWriteCallsite {
+    DeriveFromHgManifestAndParentsStaged,
+    FinalizeEnvelope,
+    CreateHgManifest,
+    FinalizeUploadedHgChangeset,
+    TrackAllRestrictedPaths,
+    CreateFsnode,
+    CreateContentManifestDirectory,
+}
+
+impl ManifestIdStoreWriteCallsite {
+    fn switch_value(self) -> &'static str {
+        match self {
+            Self::DeriveFromHgManifestAndParentsStaged => {
+                "mercurial_derivation::derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents_staged"
+            }
+            Self::FinalizeEnvelope => {
+                "mercurial_derivation::derive_hg_augmented_manifest::finalize_envelope"
+            }
+            Self::CreateHgManifest => {
+                "mercurial_derivation::derive_hg_manifest::create_hg_manifest"
+            }
+            Self::FinalizeUploadedHgChangeset => {
+                "blobrepo_hg::repo_commit::UploadEntries::finalize"
+            }
+            Self::TrackAllRestrictedPaths => {
+                "mercurial_derivation::mapping::track_all_restricted_paths"
+            }
+            Self::CreateFsnode => "fsnodes::derive::create_fsnode",
+            Self::CreateContentManifestDirectory => {
+                "content_manifest_derivation::derive::create_content_manifest_directory"
+            }
+        }
+    }
+}
+
+/// Returns `Ok(())` while manifest-ID store writes are best-effort. When the
+/// fail-derivation JustKnob is enabled for `callsite`, returns `error` so the
+/// derivation fails.
+pub fn maybe_propagate_manifest_id_store_write_error(
+    error: Error,
+    callsite: ManifestIdStoreWriteCallsite,
+) -> Result<()> {
+    if justknobs::eval(
+        FAIL_DERIVATION_ON_RESTRICTED_MANIFEST_ID_STORE_ERROR,
+        None,
+        Some(callsite.switch_value()),
+    ) {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 /// Entry representing a restricted path with its manifest type and id
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone, Derivative)]
+#[derivative(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RestrictedPathManifestIdEntry {
+    /// Database-assigned insertion ID. Hand-created entries omit it until read back.
+    #[derivative(
+        PartialEq = "ignore",
+        Hash = "ignore",
+        PartialOrd = "ignore",
+        Ord = "ignore"
+    )]
+    pub id: Option<u64>,
     pub manifest_type: ManifestType,
     pub manifest_id: RestrictedManifestId,
     #[derivative(Debug(format_with = "fmt_path_bytes"))]
@@ -89,6 +159,7 @@ impl RestrictedPathManifestIdEntry {
             ..
         } = PathHash::from_repo_path(&repo_path);
         Ok(Self {
+            id: None,
             manifest_type,
             manifest_id,
             path,
@@ -129,11 +200,18 @@ pub trait RestrictedPathsManifestIdStore: Send + Sync {
         // TODO(T239041722): handle different paths with the same manifest id
     ) -> Result<Vec<NonRootMPath>>;
 
-    /// Get all entries from the database
+    /// Get all entries from the database with their insertion IDs.
     async fn get_all_entries(
         &self,
         ctx: &CoreContext,
         // TODO(T239041722): add limit
+    ) -> Result<Vec<RestrictedPathManifestIdEntry>>;
+
+    /// Get entries whose insertion ID is at or above the inclusive lower bound.
+    async fn get_entries_by_id(
+        &self,
+        ctx: &CoreContext,
+        min_id: u64,
     ) -> Result<Vec<RestrictedPathManifestIdEntry>>;
 
     /// Get all entries in this repo matching a manifest id, regardless of
@@ -203,6 +281,14 @@ impl RestrictedPathsManifestIdStore for NoopRestrictedPathsManifestIdStore {
         Ok(vec![])
     }
 
+    async fn get_entries_by_id(
+        &self,
+        _ctx: &CoreContext,
+        _min_id: u64,
+    ) -> Result<Vec<RestrictedPathManifestIdEntry>> {
+        Ok(vec![])
+    }
+
     async fn get_all_paths_by_manifest_id(
         &self,
         _ctx: &CoreContext,
@@ -255,8 +341,9 @@ mononoke_queries! {
         "
     }
 
-    read SelectAllEntries(repo_id: RepositoryId) -> (ManifestType, RestrictedManifestId, NonRootMPath) {
+    read SelectAllEntries(repo_id: RepositoryId) -> (u64, ManifestType, RestrictedManifestId, NonRootMPath) {
         "SELECT
+            id,
             manifest_type,
             manifest_id,
             path
@@ -264,6 +351,21 @@ mononoke_queries! {
             restricted_paths_manifest_ids
          WHERE
             repo_id = {repo_id}
+         "
+    }
+
+    read SelectEntriesById(repo_id: RepositoryId, min_id: u64) -> (u64, ManifestType, RestrictedManifestId, NonRootMPath) {
+        "SELECT
+            id,
+            manifest_type,
+            manifest_id,
+            path
+         FROM
+            restricted_paths_manifest_ids
+         WHERE
+            repo_id = {repo_id}
+            AND id >= {min_id}
+         ORDER BY id
          "
     }
 
@@ -328,7 +430,14 @@ impl RestrictedPathsManifestIdStore for SqlRestrictedPathsManifestIdStore {
             ctx.sql_query_telemetry(),
             &values[..],
         )
-        .await?;
+        .await
+        .inspect_err(|err| {
+            let mut scuba = ctx.scuba().clone();
+            scuba.unsampled().log_with_msg(
+                "Failed to add restricted manifest id entries to manifest id store",
+                manifest_id_store_insert_error_message(self.repo_id, entries, err),
+            );
+        })?;
 
         Ok(result.affected_rows() > 0)
     }
@@ -364,11 +473,44 @@ impl RestrictedPathsManifestIdStore for SqlRestrictedPathsManifestIdStore {
         .await?;
 
         rows.into_iter()
-            .map(|(manifest_type, manifest_id, non_root_mpath)| {
-                let repo_path = RepoPath::DirectoryPath(non_root_mpath);
-                RestrictedPathManifestIdEntry::new(manifest_type, manifest_id, repo_path)
+            .map(|(id, manifest_type, manifest_id, non_root_mpath)| {
+                Ok(RestrictedPathManifestIdEntry {
+                    id: Some(id),
+                    ..RestrictedPathManifestIdEntry::new(
+                        manifest_type,
+                        manifest_id,
+                        RepoPath::DirectoryPath(non_root_mpath),
+                    )?
+                })
             })
-            .collect::<Result<_>>()
+            .collect()
+    }
+
+    async fn get_entries_by_id(
+        &self,
+        ctx: &CoreContext,
+        min_id: u64,
+    ) -> Result<Vec<RestrictedPathManifestIdEntry>> {
+        let rows = SelectEntriesById::query(
+            &self.connections.read_connection,
+            ctx.sql_query_telemetry(),
+            &self.repo_id,
+            &min_id,
+        )
+        .await?;
+
+        rows.into_iter()
+            .map(|(id, manifest_type, manifest_id, non_root_mpath)| {
+                Ok(RestrictedPathManifestIdEntry {
+                    id: Some(id),
+                    ..RestrictedPathManifestIdEntry::new(
+                        manifest_type,
+                        manifest_id,
+                        RepoPath::DirectoryPath(non_root_mpath),
+                    )?
+                })
+            })
+            .collect()
     }
 
     async fn get_all_paths_by_manifest_id(
@@ -490,6 +632,37 @@ fn fmt_path_hash_bytes(path_hash: &PathHashBytes, f: &mut fmt::Formatter) -> fmt
     write!(f, "\"{}\"", hex::encode(&path_hash.0))
 }
 
+fn manifest_id_store_insert_error_message(
+    repo_id: RepositoryId,
+    entries: &[RestrictedPathManifestIdEntry],
+    error: &(impl fmt::Display + ?Sized),
+) -> String {
+    let manifest_types = entries
+        .iter()
+        .map(|entry| entry.manifest_type.to_string())
+        .collect::<BTreeSet<_>>();
+    let logged_entries = entries
+        .iter()
+        .take(MAX_LOGGED_ENTRIES)
+        .map(|entry| {
+            serde_json::json!({
+                "manifest_type": entry.manifest_type.to_string(),
+                "path": String::from_utf8_lossy(&entry.path.0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "repo_id": repo_id.id(),
+        "entry_count": entries.len(),
+        "manifest_types": manifest_types,
+        "entries": logged_entries,
+        "entries_truncated": entries.len() > MAX_LOGGED_ENTRIES,
+        "error": format!("{error:#}"),
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use fbinit::FacebookInit;
@@ -497,7 +670,6 @@ mod tests {
     use smallvec::SmallVec;
 
     use super::*;
-
     fn manifest_id_from(bytes: &[u8]) -> RestrictedManifestId {
         RestrictedManifestId::new(SmallVec::from_slice(bytes))
     }
@@ -506,14 +678,12 @@ mod tests {
         manifest_type: ManifestType,
         manifest_id: &RestrictedManifestId,
         path: &str,
-    ) -> RestrictedPathManifestIdEntry {
+    ) -> Result<RestrictedPathManifestIdEntry> {
         RestrictedPathManifestIdEntry::new(
             manifest_type,
             manifest_id.clone(),
-            RepoPath::dir(NonRootMPath::new(path).expect("valid path"))
-                .expect("valid directory repo path"),
+            RepoPath::dir(NonRootMPath::new(path)?)?,
         )
-        .expect("valid entry")
     }
 
     #[mononoke::fbinit_test]
@@ -534,27 +704,27 @@ mod tests {
 
         // The same manifest id is stored in both repos under two manifest types.
         store_repo1
-            .add_entry(&ctx, entry(ManifestType::Hg, &shared_id, "repo1/hg"))
+            .add_entry(&ctx, entry(ManifestType::Hg, &shared_id, "repo1/hg")?)
             .await?;
         store_repo1
             .add_entry(
                 &ctx,
-                entry(ManifestType::HgAugmented, &shared_id, "repo1/hg_aug"),
+                entry(ManifestType::HgAugmented, &shared_id, "repo1/hg_aug")?,
             )
             .await?;
         store_repo2
-            .add_entry(&ctx, entry(ManifestType::Hg, &shared_id, "repo2/hg"))
+            .add_entry(&ctx, entry(ManifestType::Hg, &shared_id, "repo2/hg")?)
             .await?;
         store_repo2
             .add_entry(
                 &ctx,
-                entry(ManifestType::HgAugmented, &shared_id, "repo2/hg_aug"),
+                entry(ManifestType::HgAugmented, &shared_id, "repo2/hg_aug")?,
             )
             .await?;
 
         // A control entry with a different manifest id must survive deletion.
         store_repo1
-            .add_entry(&ctx, entry(ManifestType::Hg, &control_id, "repo1/control"))
+            .add_entry(&ctx, entry(ManifestType::Hg, &control_id, "repo1/control")?)
             .await?;
 
         // (a) get_all_paths_by_manifest_id is scoped to the store's repo: repo1

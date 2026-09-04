@@ -334,7 +334,7 @@ async fn published_bookmarks_step<V: VisitOne>(
     checker: &Checker<V>,
 ) -> Result<StepOutput, StepError> {
     let mut edges = vec![];
-    for (_, bcs_id) in published_bookmarks.iter() {
+    for bcs_id in published_bookmarks.values() {
         checker.add_edge(&mut edges, EdgeType::PublishedBookmarksToChangeset, || {
             Node::Changeset(ChangesetKey {
                 inner: bcs_id.clone(),
@@ -2219,10 +2219,7 @@ where
     let step_output = match step_result {
         Ok(s) => Ok(s),
         Err(e) => {
-            let msg = format!(
-                "Could not step to {:?}, due to {:?}, via {:?}",
-                &walk_item, e, via
-            );
+            let msg = format!("Could not step to {walk_item:?}, due to {e:?}, via {via:?}");
             // Log to scuba regardless
             add_node_to_scuba(
                 via.as_ref().and_then(|v| v.source_node()),

@@ -164,6 +164,9 @@ pub struct CommonConfig {
     pub async_requests_config: AsyncRequestsConfig,
     /// Repo name prefix for RL Land Service push diversion.
     pub rl_land_service_repo_prefix: Option<String>,
+    /// Repo-name marker -> manifest repo, routing diverted pushes to the
+    /// manifest repo named in their submit_manifest_land request.
+    pub multi_repo_land_manifest_repos: BTreeMap<String, String>,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -298,6 +301,13 @@ pub struct RepoConfig {
     pub remote_diff_config: Option<RemoteDiffConfig>,
     /// Configuration for commit rate limiting.
     pub commit_rate_limit_config: Option<CommitRateLimitConfig>,
+    /// Version of the per-repo config snapshot this config was parsed from
+    /// (the last content-changing parse); `None` unless loaded via a
+    /// per-repo config handle.
+    pub config_version: Option<String>,
+    /// Mutation ID of the per-repo config snapshot; always `None` until the
+    /// configerator client exposes mutationId.
+    pub config_mutation_id: Option<i64>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -391,6 +401,9 @@ pub struct DerivedDataConfig {
     /// Extra derived data types that are available for read but not necessarily enabled for derivation.
     pub extra_types_available_for_read: HashSet<DerivableType>,
 
+    /// Derived data types the warm bookmarks cache must not wait on.
+    pub wbc_excluded_types: HashSet<DerivableType>,
+
     /// Repo-level pipeline configuration.
     pub pipeline_config: Option<DerivationPipelineConfig>,
 }
@@ -451,6 +464,11 @@ impl DerivedDataConfig {
             .contains(&derivable_type)
             || self.is_enabled(derivable_type)
     }
+
+    /// Whether the warm bookmarks cache should skip waiting for this type.
+    pub fn is_excluded_from_wbc(&self, derivable_type: DerivableType) -> bool {
+        self.wbc_excluded_types.contains(&derivable_type)
+    }
 }
 
 /// A single stage in a derivation pipeline, keyed by its absolute path.
@@ -478,18 +496,6 @@ impl DerivationPipelineConfig {
     pub fn validate(&self) -> Result<()> {
         if self.types.is_empty() {
             bail!("Derivation pipeline config must have at least one derivable type");
-        }
-
-        // TODO: remove this guard once augmented manifests v2 implements
-        // `PipelineDerivable`. Until then v2 is configurable but not
-        // pipeline-derivable, so accepting it here would defer the failure to
-        // runtime (and only for v2, while v1 succeeds). Reject it at config load.
-        if self.types.contains(&DerivableType::HgAugmentedManifestsV2) {
-            bail!(
-                "pipeline_config.types cannot contain hg_augmented_manifests_v2: \
-                 augmented manifests v2 does not support derivation pipelines; \
-                 use hg_augmented_manifests instead"
-            );
         }
 
         for (stage_path, config) in &self.stages {
@@ -1045,7 +1051,7 @@ pub struct PushrebaseFlags {
     pub merge_resolution_override: MergeResolutionOverride,
     /// Per-request Sandcastle land instance id (`LAND_INSTANCE_ID` pushvar); stamped on Scuba to group a land's attempts. Observability only.
     pub land_instance_id: Option<String>,
-    /// Per-request Phabricator diff FBID (`PHAB_DIFF_ID` pushvar); the QE bucketing key, stamped on Scuba for per-diff dedup. Observability only.
+    /// Per-request Phabricator diff FBID (`PHAB_DIFF_ID` pushvar); stamped on Scuba for per-diff attribution (join key back to Landcastle/Phabricator datasets). Observability only.
     pub phab_diff_id: Option<String>,
 }
 
@@ -1058,8 +1064,16 @@ pub const PHAB_DIFF_ID_PUSHVAR_KEY: &str = "PHAB_DIFF_ID";
 /// Per-request override for the `pushrebase_enable_merge_resolution` JustKnob.
 ///
 /// `UseJk` (the default) consults the JK as before. `ForceOn`/`ForceOff`
-/// wins over the JK and is used by the QE rollout to assign requests to
-/// a treatment or control arm independent of the global flag.
+/// wins over the JK. This is the permanent per-land control surface for
+/// merge resolution:
+/// - `rebase_stack_onto` honors whatever the caller sets; the
+///   multi-repo-land manifest-land path built on it gates that on
+///   `scm/mononoke:sslv2_merge_resolution_enabled`;
+/// - the author-facing opt-out (`@no-merge-resolution` pragma ->
+///   Landcastle sends the pushvar as `"false"`) is tracked in T285699818,
+///   and exposure through checkout-less land APIs in T285699837.
+///
+/// Batched pushrebase does not honor the per-request override.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum MergeResolutionOverride {
     /// Defer to the `pushrebase_enable_merge_resolution` JustKnob (default).
@@ -1088,22 +1102,6 @@ impl MergeResolutionOverride {
             Some(b"true" | b"1") => Self::ForceOn,
             Some(b"false" | b"0") => Self::ForceOff,
             _ => Self::UseJk,
-        }
-    }
-
-    /// Stable Scuba label for the `mr_qe_arm` column, identifying which QE
-    /// arm a request was assigned to: `ForceOn` -> `"test"`, `ForceOff` ->
-    /// `"control"`, `UseJk` -> `"bypass"`. `"bypass"` covers both
-    /// out-of-experiment traffic and any path that does not honor the
-    /// per-request override (e.g. batched pushrebase), so `test`/`control`
-    /// rows always reflect lands that actually received their assigned
-    /// treatment. Never rename these literals without coordinating with the
-    /// QE readout/dashboards that bucket on `mr_qe_arm`.
-    pub fn qe_arm_str(&self) -> &'static str {
-        match self {
-            Self::ForceOn => "test",
-            Self::ForceOff => "control",
-            Self::UseJk => "bypass",
         }
     }
 }
@@ -1168,13 +1166,6 @@ mod merge_resolution_override_tests {
             MergeResolutionOverride::from_pushvar_value(Some(b"\xff\xfe")),
             MergeResolutionOverride::UseJk,
         );
-    }
-
-    #[mononoke::test]
-    fn qe_arm_str_maps_each_variant() {
-        assert_eq!(MergeResolutionOverride::ForceOn.qe_arm_str(), "test");
-        assert_eq!(MergeResolutionOverride::ForceOff.qe_arm_str(), "control");
-        assert_eq!(MergeResolutionOverride::UseJk.qe_arm_str(), "bypass");
     }
 }
 
@@ -2354,15 +2345,6 @@ pub enum UriGeneratorType {
     LocalFS,
 }
 
-/// Information on a loaded config
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub struct ConfigInfo {
-    /// A hash of the raw config content
-    pub content_hash: String,
-    /// The time when the config was last updated
-    pub last_updated_at: u64,
-}
-
 /// The concurrency setting to be used during git protocol
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct GitConcurrencyParams {
@@ -2597,13 +2579,34 @@ pub struct EnforcementConditionSet {
     pub client_identity_regexes: Vec<ComparableRegex>,
 }
 
+/// Parse a bare AMP group name into a `GROUP:` identity.
+///
+/// Restricted-path configs and `.slacl` files spell rollout allowlist groups as
+/// bare names, the same way `admin_bypass_group` does. Every rejection here is
+/// deliberate and fail-closed: silently accepting a malformed or already
+/// prefixed value would produce an identity that never matches any caller,
+/// leaving a tent owner believing an allowlist is active when it is not.
+pub fn parse_bare_group_name(value: &str) -> Result<MononokeIdentity> {
+    if value.is_empty() {
+        bail!("group name must not be empty");
+    }
+    if value.trim() != value {
+        bail!("group name `{value}` must not have leading or trailing whitespace");
+    }
+    if value.contains(':') {
+        bail!("expected a bare group name, got `{value}`: omit the `GROUP:` prefix");
+    }
+    MononokeIdentity::from_str(&format!("GROUP:{value}"))
+        .with_context(|| format!("Failed to parse group name `{value}`"))
+}
+
 /// Restriction metadata for a single restricted path.
 ///
-/// Supersedes the bare path -> ACL mapping that `path_acls` used to carry: it
-/// holds the REPO_REGION ACL, an optional permission-request group, and a
-/// `read_only` flag. When `read_only` is true, derivation stops recording new
-/// manifest-id-store entries for the path; enforcement on existing entries and
-/// config-based authorization are unaffected.
+/// Holds the REPO_REGION ACL, an optional permission-request group, an optional
+/// rollout allowlist group, and a `read_only` flag. When `read_only` is true,
+/// derivation stops recording new manifest-id-store entries for the path;
+/// enforcement on existing entries and config-based authorization are
+/// unaffected.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PathRestrictionMetadata {
     /// REPO_REGION ACL protecting this path.
@@ -2611,6 +2614,12 @@ pub struct PathRestrictionMetadata {
     /// AMP group clients are redirected to when requesting access, instead of
     /// exposing the REPO_REGION ACL. If `None`, defaults to `repo_region_acl`.
     pub permission_request_group: Option<MononokeIdentity>,
+    /// AMP group whose members are temporarily allowlisted to read this path
+    /// during rollout, so the tent owner can triage them before granting real
+    /// access in the REPO_REGION ACL. `None` means no rollout allowlist, which
+    /// is *not* the same as an empty group: a caller must be allowlisted for
+    /// every restricted path in a request for the allowlist to grant access.
+    pub rollout_allowlist_group: Option<MononokeIdentity>,
     /// When true, no new manifest-id-store entries are derived for this path.
     pub read_only: bool,
 }
@@ -2630,18 +2639,12 @@ impl PathRestrictionMetadata {
 pub struct RestrictedPathsConfig {
     /// Map from restricted path prefixes to their restriction metadata
     pub path_restriction_metadata: HashMap<NonRootMPath, PathRestrictionMetadata>,
-    /// Whether the in-memory cache of manifest ids should be used instead of
-    /// directly querying the manifest id store DB
-    pub use_manifest_id_cache: bool,
-    /// Interval to update the in-memory cache of manifest ids
-    pub cache_update_interval_ms: u64,
+    /// Manifest-id store cache configuration.
+    pub manifest_id_store_config: RestrictedPathsManifestIdStoreConfig,
     /// Soft restricted paths configuration
     pub soft_path_acls: Vec<SoftRestrictedPathConfig>,
     /// Group name for tooling that should be allowlisted for all restricted paths.
     pub tooling_allowlist_group: Option<String>,
-    /// Group name for tooling that is allowlisted during rollout for all restricted paths.
-    /// Used during rollout for tooling that will likely be permanently allowlisted.
-    pub rollout_allowlist_group: Option<String>,
     /// Group identity whose members may bypass all Path ACL enforcement — both
     /// read access to restricted paths and maintainer-gated `.slacl`
     /// modifications. Intended for admins fighting SEVs or debugging issues.
@@ -2664,16 +2667,41 @@ impl Default for RestrictedPathsConfig {
     fn default() -> Self {
         Self {
             path_restriction_metadata: HashMap::new(),
-            use_manifest_id_cache: true,
-            cache_update_interval_ms: 1000,
+            manifest_id_store_config: RestrictedPathsManifestIdStoreConfig::default(),
             soft_path_acls: Vec::new(),
             tooling_allowlist_group: None,
-            rollout_allowlist_group: None,
             admin_bypass_group: None,
             acl_file_name: DEFAULT_ACL_FILE_NAME.to_string(),
             enforcement_condition_sets: Vec::new(),
             enforcement_enabled: false,
             acl_manifest_mode: AclManifestMode::Disabled,
+        }
+    }
+}
+
+/// Configuration for the restricted-path manifest-id cache.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RestrictedPathsManifestIdStoreConfig {
+    /// Whether to use the in-memory cache instead of querying the store directly.
+    pub use_manifest_id_cache: bool,
+    /// Interval between cache update attempts.
+    pub cache_update_interval_ms: u64,
+    /// Whether update attempts fetch only recently inserted rows.
+    pub use_incremental_cache_updates: bool,
+    /// Number of IDs below the watermark included in incremental queries.
+    pub incremental_cache_update_lookback_ids: u64,
+    /// Interval between full cache reconciliations in incremental mode.
+    pub cache_full_refresh_interval_ms: u64,
+}
+
+impl Default for RestrictedPathsManifestIdStoreConfig {
+    fn default() -> Self {
+        Self {
+            use_manifest_id_cache: true,
+            cache_update_interval_ms: 1_000,
+            use_incremental_cache_updates: false,
+            incremental_cache_update_lookback_ids: 1_000,
+            cache_full_refresh_interval_ms: 30 * 60 * 1_000,
         }
     }
 }
@@ -2701,6 +2729,12 @@ pub struct RestrictedPathsAclFile {
     /// that transitively provides access to the ACL.
     /// If not specified, will default to `repo_region_acl`.
     permission_request_group: Option<MononokeIdentity>,
+    /// AMP group whose members are temporarily allowlisted to read this
+    /// directory during rollout, so the tent owner can triage them before
+    /// granting real access in the REPO_REGION ACL. `None` means no rollout
+    /// allowlist: a caller must be allowlisted for every restricted path in a
+    /// request for the allowlist to grant access.
+    rollout_allowlist_group: Option<MononokeIdentity>,
     // TODO(T248660053): possibly add dry-run mode
 }
 
@@ -2709,10 +2743,12 @@ impl RestrictedPathsAclFile {
     pub fn new(
         repo_region_acl: MononokeIdentity,
         permission_request_group: Option<MononokeIdentity>,
+        rollout_allowlist_group: Option<MononokeIdentity>,
     ) -> Result<Self> {
         Self {
             repo_region_acl,
             permission_request_group,
+            rollout_allowlist_group,
         }
         .validate()
     }
@@ -2729,6 +2765,11 @@ impl RestrictedPathsAclFile {
     /// If not specified, will default to `repo_region_acl`.
     pub fn permission_request_group(&self) -> Option<&MononokeIdentity> {
         self.permission_request_group.as_ref()
+    }
+
+    /// AMP group temporarily allowlisted to read this directory during rollout.
+    pub fn rollout_allowlist_group(&self) -> Option<&MononokeIdentity> {
+        self.rollout_allowlist_group.as_ref()
     }
 
     /// Run all the necessary validations on the ACL file
@@ -2750,6 +2791,19 @@ mod tests {
 
     fn mp(s: &str) -> MPath {
         MPath::new(s.as_bytes()).unwrap()
+    }
+
+    #[mononoke::test]
+    fn test_repo_config_default_has_no_provenance() {
+        let config = RepoConfig::default();
+        assert_eq!(
+            config.config_version, None,
+            "a default RepoConfig must carry no config version"
+        );
+        assert_eq!(
+            config.config_mutation_id, None,
+            "a default RepoConfig must carry no config mutation id"
+        );
     }
 
     /// Build a stage with the given dependency paths.
@@ -2802,19 +2856,18 @@ mod tests {
     }
 
     #[mononoke::test]
-    fn test_pipeline_config_rejects_hg_augmented_manifests_v2() {
-        // Given an otherwise-valid pipeline config whose only deviation is that
-        // it enables augmented manifests v2 — a type that is configurable but
-        // does not implement `PipelineDerivable`, so it would otherwise fail at
-        // runtime in a pipeline while v1 succeeds.
+    fn test_pipeline_config_accepts_hg_augmented_manifests_v2() {
+        // Given: an otherwise-valid pipeline config enabling augmented
+        // manifests v2.
         let config = DerivationPipelineConfig {
             types: BTreeSet::from([DerivableType::HgAugmentedManifestsV2]),
             ..pipeline_config(vec![("", stage(vec![]))])
         };
 
-        // When validating the pipeline config, then it is rejected at
-        // config-load time instead of deferring the failure to runtime.
-        assert_rejects(config, "hg_augmented_manifests_v2");
+        // When/Then: validation accepts the pipeline-derivable type.
+        config
+            .validate()
+            .expect("augmented manifests v2 should support derivation pipelines");
     }
 
     #[mononoke::test]

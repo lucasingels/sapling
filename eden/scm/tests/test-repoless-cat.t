@@ -241,6 +241,14 @@ Test cat --output preserves executable and symlink metadata:
   -rw-r--r-- normal
   -rwxr-xr-x script
 
+Test cat --output overwrites an existing symlink:
+
+  $ rm output/link
+  $ ln -s normal output/link
+  $ sl cat -R test:server2 -r $A --output 'output/%p' link
+  $ readlink output/link
+  script
+
 Test cat --tar preserves executable and symlink metadata:
 
   $ rm -rf output output.tar

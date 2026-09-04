@@ -5,7 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {DiffId, DiffSummary, Hash, PageVisibility, Result, ValidatedRepoInfo} from '../types';
+import type {
+  DiffId,
+  DiffSignalSummary,
+  DiffSummary,
+  Hash,
+  PageVisibility,
+  Result,
+  ValidatedRepoInfo,
+} from '../types';
 import type {UICodeReviewProvider} from './UICodeReviewProvider';
 
 import {atom} from 'jotai';
@@ -23,9 +31,17 @@ import {
   parseCommitMessageFields,
 } from '../CommitInfoView/CommitMessageFields';
 import {Internal} from '../Internal';
-import {getTracker} from '../analytics/globalTracker';
-import {atomFamilyWeak, atomWithOnChange, configBackedAtom, writeAtom} from '../jotaiUtils';
+import {tracker} from '../analytics';
+import {
+  atomFamilyWeak,
+  atomWithOnChange,
+  configBackedAtom,
+  readAtom,
+  writeAtom,
+} from '../jotaiUtils';
 import {messageSyncingEnabledState} from '../messageSyncing';
+import platform from '../platform';
+import {browserPageVisibility, combinePageVisibility} from '../platformVisibility';
 import {dagWithPreviews} from '../previews';
 import {commitByHash, repositoryInfo} from '../serverAPIState';
 import {registerCleanup, registerDisposable} from '../utils';
@@ -74,6 +90,33 @@ export const diffSummary = atomFamilyWeak((diffId: DiffId | undefined) =>
     return {value: all.value.get(diffId) ?? null}; // null = loaded but not found
   }),
 );
+
+/**
+ * Whether a DiffSignalSummary represents actionable (failed or warning) signals.
+ * Includes `running-failed` / `running-warnings` so summary-based gating stays
+ * consistent with detail-based gating (`fail`/`warning` details) while signals
+ * are still in progress. Keep this predicate in one place so all "Fix signals"
+ * entry points evolve together.
+ */
+export function isSignalSummaryActionable(summary: DiffSignalSummary | undefined): boolean {
+  return (
+    summary === 'failed' ||
+    summary === 'warning' ||
+    summary === 'running-failed' ||
+    summary === 'running-warnings'
+  );
+}
+
+/**
+ * Whether the diff for `diffId` has actionable signals, based on `diffSummary`.
+ * Shared predicate for SmartActionsMenu, actionConfigs, and any other
+ * summary-based gating. Uses `readAtom` so it can be called outside React
+ * (e.g. in `actionConfigs.shouldShow`).
+ */
+export function hasDiffActionableSignals(diffId: DiffId): boolean {
+  const result = readAtom(diffSummary(diffId));
+  return result.error == null && isSignalSummaryActionable(result.value?.signalSummary);
+}
 
 export const branchingDiffInfos = atomFamilyWeak((branchName: string) =>
   atom<Result<DiffSummary | undefined>>(get => {
@@ -143,7 +186,7 @@ registerCleanup(
     serverAPI.postMessage({
       type: 'fetchDiffSummaries',
     });
-    getTracker()?.track('DiffFetchSource', {extras: {source: 'webview_startup'}});
+    tracker.track('DiffFetchSource', {extras: {source: 'webview_startup'}});
   }),
   import.meta.hot,
 );
@@ -260,7 +303,9 @@ export const effectiveSchemaForCommit = atomFamilyWeak((hashOrHead: Hash | 'head
 );
 
 export const pageVisibility = atomWithOnChange(
-  atom<PageVisibility>(document.hasFocus() ? 'focused' : document.visibilityState),
+  atom<PageVisibility>(
+    combinePageVisibility(browserPageVisibility(document), platform.visibility?.getVisibility()),
+  ),
   debounce(state => {
     serverAPI.postMessage({
       type: 'pageVisibility',
@@ -269,8 +314,9 @@ export const pageVisibility = atomWithOnChange(
   }, 50),
 );
 
+let parentVisibility = platform.visibility?.getVisibility();
 const handleVisibilityChange = () => {
-  const newValue = document.hasFocus() ? 'focused' : document.visibilityState;
+  const newValue = combinePageVisibility(browserPageVisibility(document), parentVisibility);
   writeAtom(pageVisibility, oldValue => {
     if (oldValue !== newValue && newValue === 'hidden') {
       clearTrackedCache();
@@ -278,6 +324,11 @@ const handleVisibilityChange = () => {
     return newValue;
   });
 };
+
+const platformVisibilityDisposable = platform.visibility?.onDidChangeVisibility(visibility => {
+  parentVisibility = visibility;
+  handleVisibilityChange();
+});
 
 window.addEventListener('focus', handleVisibilityChange);
 window.addEventListener('blur', handleVisibilityChange);
@@ -288,6 +339,7 @@ registerCleanup(
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('focus', handleVisibilityChange);
     window.removeEventListener('blur', handleVisibilityChange);
+    platformVisibilityDisposable?.dispose();
   },
   import.meta.hot,
 );

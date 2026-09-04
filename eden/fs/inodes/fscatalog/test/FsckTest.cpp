@@ -31,6 +31,7 @@ using folly::ByteRange;
 using folly::StringPiece;
 using std::make_shared;
 using std::string;
+using ::testing::Contains;
 using ::testing::HasSubstr;
 using ::testing::UnorderedElementsAre;
 
@@ -369,6 +370,28 @@ class FsckTest : public ::testing::TestWithParam<InodeCatalogType> {
   }
 };
 
+TEST(InodeInfoTest, addParentIsDeterministic) {
+  fsck::InodeInfo info{InodeNumber{42}, fsck::InodeType::File};
+  fsck::InodeInfo reverseInfo{InodeNumber{42}, fsck::InodeType::File};
+
+  info.addParent(InodeNumber{30}, S_IFREG | 0755);
+  info.addParent(InodeNumber{10}, S_IFREG | 0644);
+  info.addParent(InodeNumber{20}, S_IFREG | 0700);
+  info.addParent(InodeNumber{10}, S_IFREG | 0600);
+  reverseInfo.addParent(InodeNumber{10}, S_IFREG | 0600);
+  reverseInfo.addParent(InodeNumber{20}, S_IFREG | 0700);
+  reverseInfo.addParent(InodeNumber{10}, S_IFREG | 0644);
+  reverseInfo.addParent(InodeNumber{30}, S_IFREG | 0755);
+
+  EXPECT_THAT(
+      info.parents,
+      ::testing::ElementsAre(
+          InodeNumber{10}, InodeNumber{10}, InodeNumber{20}, InodeNumber{30}));
+  EXPECT_EQ(S_IFREG | 0600, info.modeFromParent);
+  EXPECT_EQ(info.parents, reverseInfo.parents);
+  EXPECT_EQ(info.modeFromParent, reverseInfo.modeFromParent);
+}
+
 TEST_P(FsckTest, testNoErrors) {
   auto testOverlay = make_shared<TestOverlay>(overlayType());
   auto root = testOverlay->init();
@@ -414,6 +437,41 @@ TEST_P(FsckTest, testNoErrors) {
       "src/foo/x/y/another_child.txt",
       checker.computePath(layout.src_foo_x_y.number(), "another_child.txt"_pc)
           .toString());
+}
+
+TEST_P(FsckTest, testNoErrorsMemoryEfficientScanDisabled) {
+  auto testOverlay = make_shared<TestOverlay>(overlayType());
+  auto root = testOverlay->init();
+  SimpleOverlayLayout layout(root);
+  testOverlay->closeCleanly();
+
+  testOverlay->recreateSqliteInodeCatalog();
+  FsFileContentStore& fcs = testOverlay->fcs();
+  InodeCatalog* catalog = testOverlay->inodeCatalog();
+  std::optional<InodeNumber> nextInode;
+  if (overlayType() == InodeCatalogType::Legacy) {
+    nextInode = catalog->initOverlay(/*createIfNonExisting=*/false);
+  } else {
+    nextInode = catalog->initOverlay(/*createIfNonExisting=*/true);
+    fcs.initialize(/*createIfNonExisting=*/false);
+  }
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      catalog,
+      &fcs,
+      nextInode,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue(),
+      CaseSensitivity::Sensitive,
+      /*useMemoryEfficientScan=*/false);
+  checker.scanForErrors();
+  EXPECT_THAT(errorMessages(checker), UnorderedElementsAre());
+  EXPECT_EQ(
+      "src/foo/x/y/z.txt",
+      checker.computePath(layout.src_foo_x_y_zTxt.number()).toString());
 }
 
 TEST_P(FsckTest, testMissingNextInodeNumber) {
@@ -599,6 +657,43 @@ TEST(FsckProgressTest, repairReportsSlowPhases) {
   EXPECT_EQ(10, *progressEvents.back().progress10Pct);
 }
 
+TEST(FsckRepairTest, orphanRepairPreservesSubtreeWhenChildReloadFails) {
+  auto testOverlay = make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  root.save();
+
+  auto orphan = root.mkdir("orphan");
+  auto file = orphan.create("a-file", "contents");
+  auto child = orphan.mkdir("child");
+  orphan.save();
+  child.save();
+
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay->inodeCatalog(),
+      &testOverlay->fcs(),
+      std::nullopt,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue());
+
+  auto result =
+      checker.repairErrors([&](const OverlayChecker::Progress& progress) {
+        if (progress.phase == OverlayChecker::Progress::Phase::Repairing &&
+            progress.progress10Pct == 0) {
+          testOverlay->inodeCatalog()->removeOverlayDir(child.number());
+        }
+      });
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(1, result->totalErrors);
+  EXPECT_EQ(0, result->fixedErrors);
+  EXPECT_TRUE(testOverlay->inodeCatalog()->hasOverlayDir(orphan.number()));
+  EXPECT_TRUE(testOverlay->fcs().hasOverlayFile(file.number()));
+}
+
 TEST_P(FsckTest, testTruncatedDirData) {
   // This test doesn't work for SQLite or InMemory backed overlays because it
   // directly manipluates the written overlay data on disk to simulate file
@@ -691,6 +786,74 @@ TEST_P(FsckTest, testTruncatedDirData) {
       testOverlay->fcs().hasOverlayFile(layout.src_foo_x_y_defTxt.number()));
 
   testOverlay->inodeCatalog()->close(checker.getNextInodeNumber());
+}
+
+TEST(FsckScanTest, partiallyParsedDirDoesNotLinkChildren) {
+  auto testOverlay = make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  SimpleOverlayLayout layout(root);
+
+  auto srcDataFile = testOverlay->fcs().openFileNoVerify(layout.src.number());
+  auto fd = std::get<folly::File>(srcDataFile).fd();
+  auto fileSize = lseek(fd, 0, SEEK_END);
+  folly::checkUnixError(fileSize, "failed to determine directory inode size");
+  ASSERT_GT(fileSize, FsFileContentStore::kHeaderLength);
+  folly::checkUnixError(
+      ftruncate(fd, fileSize - 1), "failed to truncate directory inode");
+
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay->inodeCatalog(),
+      &testOverlay->fcs(),
+      std::nullopt,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue(),
+      CaseSensitivity::Sensitive,
+      /*useMemoryEfficientScan=*/true);
+  checker.scanForErrors();
+
+  auto messages = errorMessages(checker);
+  EXPECT_THAT(
+      messages,
+      Contains(
+          fmt::format(
+              "found orphan directory inode {}", layout.src_foo.number())));
+  EXPECT_THAT(
+      messages,
+      Contains(
+          fmt::format(
+              "found orphan file inode {}", layout.src_todoTxt.number())));
+}
+
+TEST(FsckScanTest, unreadableParentProducesDescriptivePath) {
+  auto testOverlay = make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  SimpleOverlayLayout layout(root);
+
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay->inodeCatalog(),
+      &testOverlay->fcs(),
+      std::nullopt,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue(),
+      CaseSensitivity::Sensitive,
+      /*useMemoryEfficientScan=*/true);
+  checker.scanForErrors();
+  ASSERT_THAT(errorMessages(checker), UnorderedElementsAre());
+
+  testOverlay->inodeCatalog()->removeOverlayDir(layout.src_foo_x_y.number());
+  EXPECT_EQ(
+      fmt::format(
+          "src/foo/x/y/[unreadable_child({})]",
+          layout.src_foo_x_y_zTxt.number()),
+      checker.computePath(layout.src_foo_x_y_zTxt.number()).toString());
 }
 
 TEST_P(FsckTest, testMissingDirData) {
@@ -965,12 +1128,18 @@ TEST(FsckWalTest, scanForErrorsLeavesWalUntouched) {
   ASSERT_TRUE(baseBefore.has_value());
   EXPECT_EQ(0u, baseBefore->entries()->count("walAdded"));
 
-  // Materialize the child file on disk so that scanForErrors sees an
+  // Materialize the child dir on disk so that scanForErrors sees an
   // inode with no parent (the WAL ADD that would link it to root is
-  // intentionally NOT merged by a read-only scan).
-  overlay::OverlayDir emptyChild;
+  // intentionally NOT merged by a read-only scan). Give it an entry:
+  // a contentless orphan dir would be quietly reclaimed, not reported.
+  overlay::OverlayDir childDir;
+  overlay::OverlayEntry grandChild;
+  grandChild.mode() = S_IFREG | 0644;
+  grandChild.inodeNumber() = testOverlay->allocateInodeNumber().get();
+  grandChild.hash() = "0123456789012345678901234567890123456789";
+  childDir.entries()->emplace("grandchild", std::move(grandChild));
   testOverlay->inodeCatalog()->saveOverlayDir(
-      childIno, std::move(emptyChild), /*crashSafe=*/true);
+      childIno, std::move(childDir), /*crashSafe=*/true);
 
   InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
     return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
@@ -1007,6 +1176,56 @@ TEST(FsckWalTest, scanForErrorsLeavesWalUntouched) {
   auto baseAfter = testOverlay->inodeCatalog()->loadOverlayDir(kRootNodeId);
   ASSERT_TRUE(baseAfter.has_value());
   EXPECT_EQ(0u, baseAfter->entries()->count("walAdded"));
+
+  testOverlay->inodeCatalog()->close(std::nullopt);
+}
+
+TEST(FsckWalTest, emptyOrphanDirWithWalIsReportedNotReclaimed) {
+  // An empty, parentless dir record whose WAL has not been merged may
+  // still gain children when the WAL replays; it must be reported as an
+  // orphan rather than classified as a reclaimable contentless record.
+  auto testOverlay = std::make_shared<TestOverlay>(InodeCatalogType::Legacy);
+  auto root = testOverlay->init();
+  root.save();
+  testOverlay->closeCleanly();
+
+  auto nextInode =
+      testOverlay->inodeCatalog()->initOverlay(/*createIfNonExisting=*/false);
+  ASSERT_TRUE(nextInode.has_value());
+
+  auto orphanIno = testOverlay->allocateInodeNumber();
+  testOverlay->inodeCatalog()->saveOverlayDir(
+      orphanIno, overlay::OverlayDir{}, /*crashSafe=*/true);
+  overlay::OverlayEntry entry;
+  entry.mode() = S_IFREG | 0644;
+  entry.inodeNumber() = testOverlay->allocateInodeNumber().get();
+  entry.hash() = "0123456789012345678901234567890123456789";
+  testOverlay->fcs().appendWalEntry(
+      orphanIno, WalOpType::ADD, PathComponentPiece{"pending"}, &entry);
+  ASSERT_TRUE(testOverlay->fcs().hasWal(orphanIno));
+
+  InodeCatalog::LookupCallback lookup = [](auto&&, auto&&) {
+    return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
+        std::runtime_error("no lookup callback"));
+  };
+  OverlayChecker checker(
+      testOverlay->inodeCatalog(),
+      &testOverlay->fcs(),
+      nextInode,
+      lookup,
+      testOverlay->getTestConfig()->fsckNumErrorDiscoveryThreads.getValue());
+  checker.scanForErrors();
+
+  auto orphanInoStr = std::to_string(orphanIno.get());
+  bool reported = false;
+  for (const auto& err : checker.getErrors()) {
+    auto msg = err->getMessage(&checker);
+    if (msg.find("orphan") != std::string::npos &&
+        msg.find(orphanInoStr) != std::string::npos) {
+      reported = true;
+    }
+  }
+  EXPECT_TRUE(reported) << "expected orphan report for inode " << orphanInoStr;
 
   testOverlay->inodeCatalog()->close(std::nullopt);
 }

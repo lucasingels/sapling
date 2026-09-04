@@ -92,7 +92,8 @@ class OverlayChecker {
       std::optional<InodeNumber> nextInodeNumber,
       InodeCatalog::LookupCallback& lookupCallback,
       uint64_t numErrorDiscoveryThreads,
-      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive);
+      CaseSensitivity caseSensitive = CaseSensitivity::Sensitive,
+      bool useMemoryEfficientScan = true);
 
   ~OverlayChecker();
 
@@ -217,6 +218,7 @@ class OverlayChecker {
 
   using ShardID = uint32_t;
   void scanForWalChildren();
+  void scanForWalInodes();
   bool recoverWalFiles();
   void readInodes(const ProgressCallback& progressCallback = [](auto) {});
   void readInodeSubdir(const AbsolutePath& path, ShardID shardID);
@@ -233,9 +235,16 @@ class OverlayChecker {
   std::optional<fsck::InodeInfo> loadInodeInfoFromInodeCatalog(
       InodeNumber number,
       folly::Synchronized<std::vector<std::unique_ptr<Error>>>& errors) const;
+  std::optional<fsck::InodeInfo> loadDirectoryChildren(
+      std::optional<fsck::InodeInfo> info,
+      folly::Synchronized<std::vector<std::unique_ptr<Error>>>& errors) const;
 
   void linkInodeChildren();
+  void linkInodeChildrenMemoryEfficient();
   void scanForParentErrors();
+  bool isContentlessOrphanFile(const fsck::InodeInfo& info);
+  bool isContentlessOrphanDir(const fsck::InodeInfo& info);
+  void reclaimContentlessOrphans();
   void checkNextInodeNumber();
 
   template <typename ErrorType, typename... Args>
@@ -254,9 +263,15 @@ class OverlayChecker {
 
   std::unique_ptr<Impl> impl_;
   std::vector<std::unique_ptr<Error>> errors_;
+  // Orphans with no recoverable data (e.g. unclaimed preallocated overlay
+  // files after a crash). Populated by scanForParentErrors(); not counted
+  // as errors, and deleted only by reclaimContentlessOrphans(), which
+  // runs from repairErrors(). A scan-only fsck leaves them on disk.
+  std::vector<InodeNumber> contentlessOrphanFiles_;
+  std::vector<InodeNumber> contentlessOrphanDirs_;
   uint64_t maxInodeNumber_{kRootNodeId.get()};
 
-  // Number of threads used for loading inodes in the error discovery phase.
+  // Number of workers used per parallel fsck stage.
   uint64_t numErrorDiscoveryThreads_;
 
   std::unordered_map<InodeNumber, PathInfo> pathCache_;

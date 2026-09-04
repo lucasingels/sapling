@@ -22,7 +22,9 @@ sapling-streampager = { version = "0.12.0", path = "../third-party/streampager" 
 sapling-time-interval = { version = "0.1.0", path = "../util/time-interval" }
 terminal_size = "0.4.4"
 termwiz = { version = "0.23.3", default-features = false }
-wezterm-dynamic = { version = "0.2.1", features = ["std"], default-features = false }
+# termwiz derives FromDynamic/ToDynamic on a HashMap, which the patched (git) wezterm-dynamic
+# only provides behind its "std" feature; nothing else in the graph turns it on.
+wezterm-dynamic = { version = "0.2.1", features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 termios = "0.3"

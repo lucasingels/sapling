@@ -127,7 +127,7 @@ impl IdMap {
                             Group::NON_MASTER.0 as u8,
                         ]))]
                     } else {
-                        panic!("bug: invalid segment {:?}", &data);
+                        panic!("bug: invalid segment {data:?}");
                     }
                 } else {
                     let slice = &data[..8];
@@ -160,7 +160,7 @@ impl IdMap {
                         Group::NON_MASTER.0 as u8,
                     ]))]
                 } else {
-                    panic!("bug: invalid segment {:?}", &data);
+                    panic!("bug: invalid segment {data:?}");
                 }
             })
             .flush_filter(Some(|_, _| {
@@ -237,13 +237,9 @@ impl IdMap {
         name: &[u8],
         max_group: Group,
     ) -> Result<Option<Id>> {
-        Ok(self.find_id_by_name(name)?.and_then(|id| {
-            if id.group() <= max_group {
-                Some(id)
-            } else {
-                None
-            }
-        }))
+        Ok(self
+            .find_id_by_name(name)?
+            .filter(|&id| id.group() <= max_group))
     }
 
     /// Insert a new entry mapping from a name to an id.
@@ -316,8 +312,7 @@ impl IdMap {
                     let value = value?;
                     if value.len() < 8 {
                         return bug(format!(
-                            "find_range got entry {:?} shorter than expected",
-                            &value
+                            "find_range got entry {value:?} shorter than expected"
                         ));
                     }
                     let name: &[u8] = &value[9..];

@@ -40,6 +40,7 @@ cpp_library(
         "Nfsd3.cpp",
     ],
     headers = [
+        "NfsAccessRateLimiter.h",
         "NfsRequestContext.h",
         "Nfsd3.h",
     ],
@@ -49,6 +50,7 @@ cpp_library(
         "//eden/common/utils:system_error",
         "//eden/common/utils:throw",
         "//eden/common/utils:utils",
+        "//eden/fs/config:config",
         "//eden/fs/privhelper:interface",
         "//eden/fs/store:context",
         "//eden/fs/telemetry:error_info",
@@ -69,11 +71,13 @@ cpp_library(
         "//eden/common/utils:case_sensitivity",
         "//eden/fs/inodes:fs_channel",
         "//eden/fs/inodes:request_context",
+        "//eden/fs/nfs/rpc:rpc",
         "//eden/fs/nfs/rpc:server",
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:process_access_log",
         "//folly:exception_wrapper",
         "//folly:function",
+        "//folly:token_bucket",
     ],
 )
 

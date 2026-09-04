@@ -37,6 +37,7 @@ use metaconfig_types::ComparableRegex;
 use metaconfig_types::EnforcementConditionSet;
 use metaconfig_types::PathRestrictionMetadata;
 use metaconfig_types::RestrictedPathsConfig;
+use metaconfig_types::RestrictedPathsManifestIdStoreConfig;
 use metadata::Metadata;
 use mononoke_api::MononokeError;
 use mononoke_api::Repo as TestRepo;
@@ -1311,6 +1312,7 @@ async fn setup_test_repo(
                 PathRestrictionMetadata {
                     repo_region_acl: acl,
                     permission_request_group: None,
+                    rollout_allowlist_group: None,
                     read_only: config_paths_read_only,
                 },
             )
@@ -1325,8 +1327,12 @@ async fn setup_test_repo(
 
     let config = RestrictedPathsConfig {
         path_restriction_metadata,
-        use_manifest_id_cache,
-        cache_update_interval_ms,
+        manifest_id_store_config: RestrictedPathsManifestIdStoreConfig {
+            use_manifest_id_cache,
+            cache_update_interval_ms,
+            use_incremental_cache_updates: true,
+            ..Default::default()
+        },
         tooling_allowlist_group,
         acl_manifest_mode,
         enforcement_condition_sets: enforcement_condition_sets.to_vec(),
@@ -1334,12 +1340,9 @@ async fn setup_test_repo(
         ..Default::default()
     };
 
-    // Build the manifest id cache with the specified refresh interval
     let cache = Arc::new(
         RestrictedPathsManifestIdCacheBuilder::new(ctx.clone(), manifest_id_store.clone())
-            .with_refresh_interval(std::time::Duration::from_millis(
-                config.cache_update_interval_ms,
-            ))
+            .with_manifest_id_store_cache(config.manifest_id_store_config.clone())
             .build()
             .await?,
     );

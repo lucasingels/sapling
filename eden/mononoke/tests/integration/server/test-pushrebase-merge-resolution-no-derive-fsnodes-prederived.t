@@ -9,6 +9,14 @@
 #
 # Setup: WBC derivation disabled, fsnodes explicitly derived via admin CLI.
 # The merge resolution pre-check finds existing fsnodes and proceeds normally.
+#
+# `derived_data_use_content_manifests` is pinned OFF so this test deterministically
+# covers the fsnode branch of the pre-check. Without the pin it inherits the
+# ambient test default (true, see common/mononoke_macros/test_just_knobs), under
+# which the pre-check looks for content manifests and this fixture -- which only
+# pre-derives fsnodes -- would legitimately skip merge resolution.
+# The content-manifest branch is covered by
+# test-pushrebase-merge-resolution-content-manifests-prederived.t.
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ setconfig push.edenapi=true
@@ -16,6 +24,7 @@
   $ merge_just_knobs <<EOF
   > {
   >   "bools": {
+  >     "scm/mononoke:derived_data_use_content_manifests": false,
   >     "scm/mononoke:pushrebase_enable_merge_resolution": true,
   >     "scm/mononoke:pushrebase_merge_resolution_derive_fsnodes": false
   >   },

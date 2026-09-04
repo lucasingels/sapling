@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-#![feature(never_type)]
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,6 +97,9 @@ struct MononokeServerArgs {
     /// Configerator path to the MononokeRateLimits config to load
     #[clap(long, default_value = "scm/mononoke/ratelimiting/ratelimits")]
     rate_limit_config_path: Option<String>,
+    /// RIM backend ID for EdenAPI QPS shadow probes
+    #[clap(long)]
+    rim_backend: Option<i32>,
     /// Mark this instance as a shadow tier. Shadow tiers never forward
     /// shadow traffic, preventing forwarding loops.
     #[clap(long, default_value_t = false)]
@@ -220,7 +221,7 @@ impl RepoShardedProcessExecutor for MononokeServerProcessExecutor {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.remove_repo(&self.repo_name)
-            .with_context(|| format!("Failure in stopping repo {}", &self.repo_name))
+            .with_context(|| format!("Failure in stopping repo {}", self.repo_name))
     }
 }
 
@@ -367,7 +368,6 @@ fn main(fb: FacebookInit) -> Result<()> {
             }
             repo_listener::create_repo_listeners(
                 fb,
-                app.configs(),
                 common,
                 mononoke.clone(),
                 host_port,
@@ -386,6 +386,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 args.shadow_tier,
                 Some(Path::new(&args.tls_args.tls_ca)),
                 rate_limit_config_path,
+                args.rim_backend,
             )
             .await
         }

@@ -8,15 +8,15 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 faster-hex = "0.6.1"
-http = "1.4.2"
+http = "1.5.0"
 mime = "0.3.14"
 quickcheck = "1.1"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 
 [dev-dependencies]
 assert_matches = "1.5"
 maplit = "1.0"
 mononoke_macros = { version = "0.1.0", path = "../mononoke_macros" }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

@@ -14,13 +14,13 @@ name = "procinfo"
 
 [dependencies]
 libc = "0.2.186"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
-cc = "1.2.67"
+cc = "1.4.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ntapi = "0.4.3"

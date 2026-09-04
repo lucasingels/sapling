@@ -11,7 +11,7 @@ license = "GPLv2+"
 path = "src/commit_id.rs"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 bonsai_git_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_git_mapping" }
 bonsai_globalrev_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_globalrev_mapping" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_hg_mapping" }
@@ -20,7 +20,7 @@ bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 commit_id_types = { version = "0.1.0", path = "../commit_id_types" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 strum = { version = "0.28.0", features = ["derive"] }

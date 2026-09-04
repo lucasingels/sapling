@@ -11,6 +11,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+use tracing::debug;
 use tracing::debug_span;
 
 use super::fold::Fold;
@@ -371,7 +372,7 @@ impl OpenOptions {
                 let span = debug_span!("Log::open", dir = &fs_dir.to_string_lossy().as_ref());
                 let _guard = span.enter();
                 self.open_internal(&dir, None, None)
-                    .context(|| format!("in log::OpenOptions::open({:?})", &dir))
+                    .context(|| format!("in log::OpenOptions::open({dir:?})"))
             }
         }
     }
@@ -446,7 +447,7 @@ impl OpenOptions {
                     Log::load_or_create_meta(dir, true)
                 }
             } else {
-                Err(err).context(|| format!("cannot open Log at {:?}", &dir))
+                Err(err).context(|| format!("cannot open Log at {dir:?}"))
             }
         })?;
 
@@ -469,21 +470,41 @@ impl OpenOptions {
             change_detector,
             prev_btrfs_metadata: None,
         };
+        let _catch_up_span = debug_span!("catch_up_indexes").entered();
         log.update_indexes_for_on_disk_entries()?;
         log.update_and_flush_disk_folds()?;
         log.all_folds = log.disk_folds.clone();
-        let lagging_index_ids = log.lagging_index_ids();
-        if !lagging_index_ids.is_empty() {
+        drop(_catch_up_span);
+        let stale_index_ids = log.stale_index_ids();
+        let force_flush_due_to_timeout =
+            log.should_force_flush_lagging_indexes_on_open(&stale_index_ids);
+        let flush_index_ids = if force_flush_due_to_timeout {
+            stale_index_ids
+        } else {
+            log.lagging_index_ids()
+        };
+        if !flush_index_ids.is_empty() {
             // Update indexes.
             // NOTE: Consider ignoring failures if they are caused by permission
             // issues.
             if let Some(lock) = lock {
-                log.flush_lagging_indexes(&lagging_index_ids, lock)?;
+                let _flush_span = debug_span!(
+                    "flush_lagging_indexes",
+                    lagging_index_count = flush_index_ids.len()
+                )
+                .entered();
+                log.flush_lagging_indexes(&flush_index_ids, lock)?;
+                let stale_index_ids = log.stale_index_ids();
+                log.update_index_lag_since_unix_secs(&stale_index_ids);
                 log.dir.write_meta(&log.meta, self.fsync)?;
-            } else {
-                let lock = dir.lock()?;
+            } else if let Some(lock) = dir.try_lock()? {
                 // At this time the Log might be changed on-disk. Reload them.
                 return self.open_internal(dir, reuse_indexes, Some(&lock));
+            } else {
+                debug!(
+                    lagging_index_count = flush_index_ids.len(),
+                    "skipping lagging index flush because the write lock is held"
+                );
             }
         }
         log.update_change_detector_to_match_meta();

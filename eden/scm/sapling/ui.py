@@ -299,6 +299,11 @@ class ui:
                 val = str(bool(get(opt)))
                 self.setconfig("ui", opt, val, "--" + opt)
 
+        if get("agent_quiet_ignored"):
+            # A lone --quiet from an agent was ignored; also override any
+            # ui.quiet value the native dispatch pinned from the same flag.
+            self.setconfig("ui", "quiet", "False", "--quiet")
+
         if get("traceback"):
             self.setconfig("ui", "traceback", "on", "--traceback")
 
@@ -511,6 +516,11 @@ class ui:
         - True otherwise
         """
         return bindings.util.is_plain(feature)
+
+    @staticmethod
+    def agent():
+        """is run by a coding agent?"""
+        return bindings.agentdetect.is_agent()
 
     def username(self, acceptempty=False):
         """Return default username to be used in commits.

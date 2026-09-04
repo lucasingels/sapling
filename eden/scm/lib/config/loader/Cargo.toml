@@ -18,8 +18,8 @@ name = "bench"
 harness = false
 
 [dependencies]
-anyhow = "1.0.103"
-base64 = { version = "0.22.1", features = ["alloc"], optional = true }
+anyhow = "1.0.104"
+base64 = { version = "0.23.1", features = ["alloc"], optional = true }
 dirs = "6.0"
 faccess = "0.2.4"
 filetime = { version = "0.2.29", optional = true }
@@ -39,14 +39,15 @@ sapling-metrics = { version = "0.1.0", path = "../../metrics" }
 sapling-minibytes = { version = "0.1.0", path = "../../minibytes" }
 sapling-repo-minimal-info = { version = "0.1.0", path = "../../repo/repo-minimal-info" }
 sapling-repourl = { version = "0.1.0", path = "../../repo/url" }
+sapling-sampling = { version = "0.1.0", path = "../../sampling" }
 sapling-spawn-ext = { version = "0.1.0", path = "../../spawn-ext" }
 sapling-staticconfig = { version = "0.1.0", path = "../static" }
 sapling-types = { version = "0.1.0", path = "../../types", optional = true }
 sapling-unionconfig = { version = "0.1.0", path = "../union" }
 sapling-util = { version = "0.1.0", path = "../../util" }
 sapling-version = { version = "0.1.0", path = "../../version" }
-serde = { version = "1.0.219", features = ["derive", "rc"], optional = true }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"], optional = true }
+serde = { version = "1.0.229", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 url = "2.5.8"

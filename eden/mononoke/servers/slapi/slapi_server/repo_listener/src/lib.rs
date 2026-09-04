@@ -6,7 +6,6 @@
  */
 
 #![cfg_attr(not(fbcode_build), allow(unused_crate_dependencies))]
-#![feature(never_type)]
 #![recursion_limit = "256"]
 
 mod connection_acceptor;
@@ -31,7 +30,6 @@ use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
 use mononoke_api::Repo;
 use mononoke_app::monitoring::ReadyFlagService;
-use mononoke_configs::MononokeConfigs;
 use ods_counters::OdsCounterManager;
 use openssl::ssl::SslAcceptor;
 use permission_checker::AclProvider;
@@ -44,7 +42,6 @@ pub use crate::connection_acceptor::wait_for_connections_closed;
 
 pub async fn create_repo_listeners<'a>(
     fb: FacebookInit,
-    configs: Arc<MononokeConfigs>,
     common_config: CommonConfig,
     mononoke: Arc<Mononoke<Repo>>,
     sockname: String,
@@ -63,6 +60,7 @@ pub async fn create_repo_listeners<'a>(
     is_shadow_tier: bool,
     tls_ca_path: Option<&Path>,
     rate_limit_config_path: Option<String>,
+    rim_backend: Option<i32>,
 ) -> Result<()> {
     let rate_limiter = {
         let handle = config_store
@@ -92,20 +90,19 @@ pub async fn create_repo_listeners<'a>(
             false,
             None,
             rate_limiter.clone(),
-            configs.clone(),
             &common_config,
             readonly,
             mtls_disabled,
             config_store,
             is_shadow_tier,
             tls_ca_path,
+            rim_backend,
         )
         .context("Error instantiating SaplingRemoteAPI")?
     };
 
     connection_acceptor(
         fb,
-        configs,
         common_config,
         sockname,
         service,

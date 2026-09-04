@@ -108,6 +108,17 @@ export function firstLine(s: string): string {
 }
 
 /**
+ * Split a serialized commit message into its title and description.
+ *
+ * The title and description are normally separated by a blank line. Remove that structural
+ * separator while preserving any additional leading blank lines that are part of the description.
+ */
+export function splitCommitMessage(message: string): [title: string, description: string] {
+  const title = firstLine(message);
+  return [title, message.slice(title.length).replace(/^\n\n?/, '')];
+}
+
+/**
  * Applies a function to each key & value in an Object.
  * ```
  * mapObject(
@@ -233,4 +244,43 @@ export function base64Decode(data: string): ArrayBuffer {
 /** Deduplicate items in an array. */
 export function dedup<T>(arr: Array<T>): Array<T> {
   return Array.from(new Set(arr));
+}
+
+/** Normalize a filesystem path for comparison (slash, trailing slash). */
+export function normalizeForComparison(p: string): string {
+  // Drive root `C:/` must stay `C:/` (or `C:\`) — not `C:` — so Windows
+  // detection `^[A-Za-z]:/` still matches after trailing-slash removal.
+  const slashed = p.replace(/\\/g, '/');
+  if (/^[A-Za-z]:\/$/.test(slashed)) {
+    return slashed;
+  }
+  return slashed.replace(/\/+$/, '') || '/';
+}
+
+/**
+ * Compare two filesystem paths for equality, tolerating '/' vs '\\' separators,
+ * trailing slashes, and (on Windows-style absolute paths only) drive-letter
+ * case differences.
+ */
+export function pathsAreIdentical(path1: string, path2: string): boolean {
+  const normalizedPath1 = normalizeForComparison(path1);
+  const normalizedPath2 = normalizeForComparison(path2);
+
+  const isWindowsAbsolutePath = (path: string) => /^[A-Za-z]:\//.test(path);
+  if (isWindowsAbsolutePath(normalizedPath1) && isWindowsAbsolutePath(normalizedPath2)) {
+    return normalizedPath1.toLowerCase() === normalizedPath2.toLowerCase();
+  }
+
+  return normalizedPath1 === normalizedPath2;
+}
+
+/** Whether a string looks like a Sapling commit hash (hex, 6-40 chars). */
+export const HEX_HASH_RE = /^[0-9a-f]{6,40}$/i;
+export function isHexHash(s: string): boolean {
+  return HEX_HASH_RE.test(s);
+}
+
+/** Guess whether a path uses '/' or '\\' as its separator, based on its contents. */
+export function guessPathSep(path: string): '/' | '\\' {
+  return path.includes('\\') ? '\\' : '/';
 }

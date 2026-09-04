@@ -11,6 +11,7 @@ mod list;
 mod remove;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clidispatch::ReqCtx;
 use clidispatch::abort;
@@ -50,13 +51,6 @@ define_flags! {
 }
 
 pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
-    // This command only exists when sl is built with the `eden` feature, so
-    // defaulting to enabled here (users can still opt out with
-    // --config worktree.enabled=false) is safe.
-    if !repo.config().get_or("worktree", "enabled", || true)? {
-        abort!("worktree command requires --config worktree.enabled=true");
-    }
-
     let subcmd = ctx.opts.args.first().map(|s| s.as_str()).unwrap_or("");
     if !ctx.opts.rev.is_empty() && subcmd != "add" {
         abort!("--rev can only be used with 'worktree add'");
@@ -80,6 +74,17 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
 pub(crate) struct CurrentGroup {
     pub(crate) shared_store_path: PathBuf,
     pub(crate) group_id: String,
+}
+
+/// Read the configured slot-reservation TTL in seconds. Reservations older than
+/// this are treated as orphaned by a crashed `worktree add` and pruned. Defaults
+/// to [`worktree::DEFAULT_RESERVATION_TTL_SECONDS`] (1 hour); override with the
+/// `worktree.reservation-ttl` config (accepts durations like `30m` or `2h`).
+pub(crate) fn reservation_ttl_seconds(repo: &Repo) -> Result<i64> {
+    let ttl: Duration = repo.config().get_or("worktree", "reservation-ttl", || {
+        Duration::from_secs(worktree::DEFAULT_RESERVATION_TTL_SECONDS as u64)
+    })?;
+    Ok(ttl.as_secs() as i64)
 }
 
 pub(crate) fn require_group(repo: &Repo) -> Result<CurrentGroup> {
@@ -116,6 +121,14 @@ pub fn doc() -> &'static str {
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path.
+
+    Config options::
+
+      worktree.max-count=N                     Hard limit on linked worktrees per repo group (0 = unlimited, the default)
+      worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
+      worktree.require-generated-path=true     Require path generator, disallow manual PATH
+      worktree.path-generator=CMD              Shell command to generate PATH when omitted
+      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot
 
     Currently only EdenFS-backed repositories are supported."#
 }

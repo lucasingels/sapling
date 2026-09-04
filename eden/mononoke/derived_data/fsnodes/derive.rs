@@ -53,10 +53,12 @@ use mononoke_types::fsnode::FsnodeSummary;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
 use mononoke_types::path::MPath;
+use restricted_paths_common::ManifestIdStoreWriteCallsite;
 use restricted_paths_common::ManifestType;
 use restricted_paths_common::RestrictedManifestId;
 use restricted_paths_common::RestrictedPathManifestIdEntry;
 use restricted_paths_common::RestrictedPathsConfigBased;
+use restricted_paths_common::maybe_propagate_manifest_id_store_write_error;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::FsnodeDerivationError;
@@ -400,13 +402,17 @@ async fn create_fsnode(
                     .manifest_id_store()
                     .add_entry(ctx, entry)
                     .await
+                    .with_context(|| format!("Failed to track restricted path at {path}"))
                 {
-                    // Log error but don't fail manifest derivation
-                    tracing::warn!(
+                    tracing::error!(
                         path = %path,
                         error = %e,
                         "Failed to track restricted path"
                     );
+                    maybe_propagate_manifest_id_store_write_error(
+                        e,
+                        ManifestIdStoreWriteCallsite::CreateFsnode,
+                    )?;
                 }
             }
         }
@@ -484,13 +490,9 @@ async fn check_fsnode_leaf(
             .into());
         }
         let mut iter = leaf_info.parents.into_iter();
-        let fsnode_file = iter.next().and_then(|first_elem| {
-            if iter.all(|next_elem| next_elem == first_elem) {
-                Some(first_elem)
-            } else {
-                None
-            }
-        });
+        let fsnode_file = iter
+            .next()
+            .filter(|&first_elem| iter.all(|next_elem| next_elem == first_elem));
         if let Some(fsnode_file) = fsnode_file {
             Ok((None, fsnode_file))
         } else {

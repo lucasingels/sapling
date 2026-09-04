@@ -25,7 +25,7 @@ import {
   useState,
 } from 'react';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
-import {getTracker} from './analytics/globalTracker';
+import {tracker} from './analytics';
 import {featureFlagLoadable} from './featureFlags';
 import {t, T} from './i18n';
 import {Internal} from './Internal';
@@ -34,7 +34,7 @@ import {useModal} from './useModal';
 
 import './ISLShortcuts.css';
 
-const CMD = isMac ? Modifier.CMD : Modifier.CTRL;
+export const CMD = isMac ? Modifier.CMD : Modifier.CTRL;
 
 /* eslint-disable no-bitwise */
 export const [ISLCommandContext, useCommand, dispatchCommand, allCommands, setCommands] =
@@ -59,15 +59,15 @@ export const [ISLCommandContext, useCommand, dispatchCommand, allCommands, setCo
       ToggleDownloadCommitsDropdown: [Modifier.ALT, KeyCode.D],
       ToggleCwdDropdown: [Modifier.ALT, KeyCode.C],
       ToggleBulkActionsDropdown: [Modifier.ALT, KeyCode.B],
-      ToggleFocusMode: [Modifier.ALT, KeyCode.F],
+      ToggleFocusMode: [[Modifier.ALT, Modifier.SHIFT], KeyCode.F],
       ToggleBookmarksManagerDropdown: [Modifier.ALT, KeyCode.M],
       RebaseOntoCurrentStackBase: [Modifier.ALT, KeyCode.R],
-      ToggleFilterDropdown: [Modifier.CMD, KeyCode.F],
+      ToggleFilterDropdown: [CMD, KeyCode.F],
       Pull: [Modifier.ALT, KeyCode.P],
       ArcPull: [[Modifier.ALT, Modifier.SHIFT], KeyCode.P],
     },
     ({command, key, modifiers}) => {
-      getTracker()?.track('KeyboardShortcutUsed', {extras: {command, key, modifiers}});
+      tracker.track('KeyboardShortcutUsed', {extras: {command, key, modifiers}});
     },
   );
 

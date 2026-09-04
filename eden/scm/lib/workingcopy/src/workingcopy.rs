@@ -26,8 +26,8 @@ use journal::Journal;
 use manifest::FileType;
 use manifest::FsNodeMetadata;
 use manifest::Manifest;
-use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
+use manifest_tree::TreeResolver;
 use parking_lot::Mutex;
 use pathmatcher::DynMatcher;
 use pathmatcher::GitignoreMatcher;
@@ -73,7 +73,7 @@ use crate::filesystem::grepo::parse_grepo_manifest;
 use crate::manifest::apply_status;
 use crate::status::compute_status;
 use crate::util::added_files;
-use crate::util::fast_path_wdir_parents;
+use crate::util::fast_path_wdir_parents_with_config;
 use crate::util::walk_treestate;
 use crate::watchman_client::DeferredWatchmanClient;
 
@@ -88,7 +88,7 @@ impl EdenFsClient {
 }
 
 type ArcFileStore = Arc<dyn FileStore>;
-type ArcReadTreeManifest = Arc<dyn ReadTreeManifest>;
+type ArcTreeResolver = Arc<dyn TreeResolver>;
 type BoxFileSystem = Box<dyn FileSystem + Send>;
 
 pub struct WorkingCopy {
@@ -96,7 +96,7 @@ pub struct WorkingCopy {
     config: Arc<dyn Config>,
     ident: Identity,
     treestate: Arc<Mutex<TreeState>>,
-    tree_resolver: ArcReadTreeManifest,
+    tree_resolver: ArcTreeResolver,
     filestore: ArcFileStore,
     pub(crate) filesystem: Mutex<BoxFileSystem>,
     pub ignore_matcher: Arc<GitignoreMatcher>,
@@ -115,7 +115,7 @@ impl WorkingCopy {
     pub fn new(
         path: &Path,
         config: &Arc<dyn Config>,
-        tree_resolver: ArcReadTreeManifest,
+        tree_resolver: ArcTreeResolver,
         filestore: ArcFileStore,
         locker: Arc<RepoLocker>,
         // For dirstate
@@ -265,13 +265,13 @@ impl WorkingCopy {
         self.filestore.clone()
     }
 
-    pub fn tree_resolver(&self) -> ArcReadTreeManifest {
+    pub fn tree_resolver(&self) -> ArcTreeResolver {
         self.tree_resolver.clone()
     }
 
     pub(crate) fn current_manifests(
         treestate: &TreeState,
-        tree_resolver: &ArcReadTreeManifest,
+        tree_resolver: &ArcTreeResolver,
     ) -> Result<Vec<Arc<TreeManifest>>> {
         let mut parents = treestate.parents().peekable();
         if parents.peek_mut().is_some() {
@@ -308,7 +308,7 @@ impl WorkingCopy {
         shared_dot_dir: &Path,
         config: Arc<dyn Config>,
         file_system_type: FileSystemType,
-        tree_resolver: ArcReadTreeManifest,
+        tree_resolver: ArcTreeResolver,
         store: ArcFileStore,
         locker: Arc<RepoLocker>,
         watchman_client: Arc<DeferredWatchmanClient>,
@@ -616,9 +616,13 @@ impl WorkingCopy {
                         FsNodeMetadata::Directory(_) => None,
                     });
                     // The submodule working copy should use the same dotdir.
-                    let file_node = fast_path_wdir_parents(&subm_path, self.ident)?
-                        .p1()
-                        .copied();
+                    let file_node = fast_path_wdir_parents_with_config(
+                        &subm_path,
+                        self.ident,
+                        self.config.as_ref(),
+                    )?
+                    .p1()
+                    .copied();
                     if file_node == tree_node {
                         status_builder.forget(path);
                         continue;

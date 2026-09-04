@@ -235,10 +235,18 @@ type LabelInfo = {
  * Returns Gerrit's precedence-resolved decision for a label.
  */
 function labelDecision(label: LabelInfo | undefined): 'approved' | 'rejected' | 'recommended' | 'disliked' | null {
-  if (label?.rejected != null) return 'rejected';
-  if (label?.approved != null) return 'approved';
-  if (label?.disliked != null) return 'disliked';
-  if (label?.recommended != null) return 'recommended';
+  if (label?.rejected != null) {
+    return 'rejected';
+  }
+  if (label?.approved != null) {
+    return 'approved';
+  }
+  if (label?.disliked != null) {
+    return 'disliked';
+  }
+  if (label?.recommended != null) {
+    return 'recommended';
+  }
   return null;
 }
 

@@ -9,7 +9,7 @@ edition = "2024"
 name = "cpython_ext"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
 libc = "0.2.186"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
@@ -17,8 +17,8 @@ python3-sys = "0.7.2"
 sapling-backtrace-ext = { version = "0.1.0", path = "../backtrace-ext" }
 sapling-types = { version = "0.1.0", path = "../types" }
 sapling-util = { version = "0.1.0", path = "../util" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-thiserror = "2.0.18"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

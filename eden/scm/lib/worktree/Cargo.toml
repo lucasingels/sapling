@@ -13,13 +13,13 @@ license = "GPL-2.0-only"
 name = "worktree"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blake2 = "0.10"
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 fs-err = { version = "3.3.1", features = ["tokio"] }
 sapling-util = { version = "0.1.0", path = "../util" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

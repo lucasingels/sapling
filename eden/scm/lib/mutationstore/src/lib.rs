@@ -201,7 +201,7 @@ impl MutationStore {
                 let op = if copy_entry.op.ends_with("-copy") {
                     copy_entry.op.clone()
                 } else {
-                    format!("{}-copy", &copy_entry.op)
+                    format!("{}-copy", copy_entry.op)
                 };
                 // The new entry will be the one returned by `get(y)`.
                 // It overrides the "x -> y" entry.
@@ -305,6 +305,16 @@ impl MutationStore {
             successors_sets.push(successors);
         }
         Ok(successors_sets)
+    }
+
+    /// Return whether a node has any recorded successors.
+    pub fn has_successors(&self, node: Node) -> Result<bool> {
+        Ok(self
+            .log
+            .lookup(INDEX_PRED, node)?
+            .next()
+            .transpose()?
+            .is_some())
     }
 
     /// Query predecessors by a successor. Consider split.
@@ -509,6 +519,8 @@ mod tests {
                     .expect("can get successors sets"),
                 Vec::<Vec<Node>>::new()
             );
+            assert!(ms.has_successors(nodes[0]).expect("can check successors"));
+            assert!(!ms.has_successors(nodes[1]).expect("can check successors"));
             assert_eq!(
                 ms.get_predecessors(nodes[1]).expect("can get predecessors"),
                 vec![nodes[0], nodes[2], nodes[3]]
@@ -718,7 +730,7 @@ mod tests {
 
         // The set evaluated.
         // (0x42 == b'B', 0x58 == b'X')
-        assert_eq!(format!("{:.2?}", &obsolete), "<static [42, 58]>");
+        assert_eq!(format!("{obsolete:.2?}"), "<static [42, 58]>");
 
         // E does not have a successor.
         assert!(!r(obsolete.contains(&v("E")))?);

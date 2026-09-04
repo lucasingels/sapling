@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(once_cell_try)]
-
 pub mod client;
 pub mod config;
 mod errors;
@@ -23,4 +21,5 @@ mod watchman_client;
 pub mod workingcopy;
 
 pub use util::fast_path_wdir_parents;
+pub use util::fast_path_wdir_parents_with_config;
 pub use workingcopy::WorkingCopy;

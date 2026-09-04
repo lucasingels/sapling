@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blobrepo_hg = { version = "0.1.0", path = "../blobrepo/blobrepo_hg" }
 blobstore = { version = "0.1.0", path = "../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../repo_attributes/bonsai_git_mapping" }
@@ -26,10 +26,10 @@ dbbookmarks = { version = "0.1.0", path = "../repo_attributes/bookmarks/dbbookma
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
+futures-old = { package = "futures", version = "0.1.31" }
 futures_01_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-futures_old = { package = "futures", version = "0.1.31" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 getbundle_response = { version = "0.1.0", path = "getbundle_response" }
 git_source_of_truth = { version = "0.1.0", path = "../repo_attributes/git_source_of_truth" }
@@ -59,8 +59,8 @@ repo_identity = { version = "0.1.0", path = "../repo_attributes/repo_identity" }
 repo_lock = { version = "0.1.0", path = "../repo_attributes/repo_lock/repo_lock" }
 repo_permission_checker = { version = "0.1.0", path = "../repo_attributes/repo_permission_checker" }
 scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sql_query_config = { version = "0.1.0", path = "../repo_attributes/sql_query_config" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

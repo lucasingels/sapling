@@ -402,7 +402,7 @@ impl MetaLog {
 
     /// Generate an error.
     pub fn error(&self, message: impl fmt::Display) -> Error {
-        Error(format!("{:?}: {}", &self.path, message))
+        Error(format!("{:?}: {}", self.path, message))
     }
 
     /// Block until the on-disk metalog gets changed.
@@ -458,9 +458,9 @@ impl Repair<()> for MetaLog {
         // Repair indexedlog without considering their dependencies.
         let mut message = format!(
             "Checking blobs at {:?}:\n{}\nChecking roots at {:?}:\n{}\n",
-            &store_path,
+            store_path,
             Zstore::repair(&blobs_path)?,
-            &store_path,
+            store_path,
             Self::ilog_open_options().repair(&roots_path)?,
         );
 
@@ -482,8 +482,7 @@ impl Repair<()> for MetaLog {
                         Ok(Some(_)) => true,
                         _ => {
                             let desc = format!("Root {} ({})", root_id.to_hex(), root.message);
-                            message +=
-                                &format!("Key {:?} referred by {} cannot be read.\n", key, &desc);
+                            message += &format!("Key {key:?} referred by {desc} cannot be read.\n");
                             false
                         }
                     }),
@@ -1176,7 +1175,7 @@ mod tests {
     fn test_repair() {
         let dir = TempDir::new().unwrap();
         let repair = || {
-            let path = format!("{:?}", &dir.path());
+            let path = format!("{:?}", dir.path());
             let path = &path[1..path.len() - 1]; // strip leading and trailing '"'
             format!(
                 "\n{}",

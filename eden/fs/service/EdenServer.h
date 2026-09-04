@@ -352,14 +352,14 @@ class EdenServer : private TakeoverHandler {
       CheckoutMode checkoutMode);
 
   /**
-   * Garbage collect the working copy of the passed in mount.
+   * Garbage collect inodes in the passed-in mount.
    */
-  ImmediateFuture<uint64_t> garbageCollectWorkingCopy(
+  ImmediateFuture<uint64_t> garbageCollectInodes(
       EdenMount& mount,
       TreeInodePtr rootInode,
       std::chrono::system_clock::time_point cutoff,
       const ObjectFetchContextPtr& context,
-      bool pressureBased = false);
+      bool pressureBased);
 
   /**
    * Stop all garbage collection tasks and wait for any running GC to finish.
@@ -377,7 +377,7 @@ class EdenServer : private TakeoverHandler {
       uint8_t maxRetries,
       std::chrono::seconds retryInterval);
 
-  bool isWorkingCopyGCRunningForAnyMount() const;
+  bool isInodeGCRunningForAnyMount() const;
 
   const std::shared_ptr<BlobCache>& getBlobCache() const {
     return blobCache_;
@@ -800,6 +800,20 @@ class EdenServer : private TakeoverHandler {
   };
   folly::Synchronized<RunStateData> runningState_;
 
+  /**
+   * Move the server into RunState::SHUTTING_DOWN.
+   *
+   * The single entry point for that transition, so that everything which has
+   * to happen once a shutdown is intended happens on every path that intends
+   * one.
+   *
+   * Caller must hold runningState_ write-locked.
+   */
+  void markShuttingDownLocked(RunStateData& state);
+
+  /** Remove this daemon's restart sentinel. Idempotent. */
+  void removeRestartSentinel();
+
 #ifdef __APPLE__
   folly::dynamic nfsStatOutput_;
   std::optional<std::string> mapCounterNameForNFSStat(
@@ -850,16 +864,16 @@ class EdenServer : private TakeoverHandler {
   /**
    * Cross-platform structured logger for file access, events, and error
    * telemetry. Owns the EdenTelemetryIdentity used for all log entries.
-   * Declared before errorLogger_ so it can be passed to it, and before
-   * serverState_ so it outlives InodeAccessLogger.
+   * Shared with InodeAccessLogger so it remains alive for its asynchronous
+   * worker. Declared before errorLogger_ and edenFsEventsLogger_ so their
+   * borrowed pointers remain valid.
    */
-  std::unique_ptr<XplatLogger> xplatLogger_;
+  std::shared_ptr<XplatLogger> xplatLogger_;
 #endif
 
   /**
-   * Structured logger for error telemetry. When scribe binary and
-   * error category are configured, this is an ErrorLogger instance;
-   * Always created; no-ops internally when scribe is not configured.
+   * XplatLogger-backed structured logger for error telemetry. Always created;
+   * no-ops internally when XplatLogger is unavailable.
    */
   std::shared_ptr<ErrorLogger> errorLogger_;
 
@@ -1021,7 +1035,7 @@ class EdenServer : private TakeoverHandler {
   PeriodicFnTask<&EdenServer::manageOverlay> overlayTask_{this, "overlay"};
   PeriodicFnTask<&EdenServer::garbageCollectAllMounts> gcTask_{
       this,
-      "working_copy_gc"};
+      "inode_gc"};
   PeriodicFnTask<&EdenServer::detectNfsCrawl> detectNfsCrawlTask_{
       this,
       "detect_nfs_crawl"};

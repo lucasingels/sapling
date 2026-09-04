@@ -13,7 +13,7 @@ license = "MIT"
 name = "clidispatch"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 erased-serde = "0.4.10"
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sapling-agentdetect = { version = "0.1.0", path = "../agentdetect" }
@@ -40,7 +40,7 @@ sapling-thrift-types = { version = "0.1.0", path = "../thrift-types", optional =
 sapling-types = { version = "0.1.0", path = "../types" }
 sapling-util = { version = "0.1.0", path = "../util" }
 sapling-workingcopy = { version = "0.1.0", path = "../workingcopy" }
-thiserror = "2.0.18"
+thiserror = "2.0.20"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

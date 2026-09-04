@@ -883,11 +883,13 @@ def is_atlas() -> bool:
     return "ATLAS" in os.environ
 
 
-def is_apple_silicon() -> bool:
-    if sys.platform == "darwin":
-        return "ARM64" in os.uname().version
+def get_platform_default_mount_protocol() -> str:
+    if sys.platform == "win32":
+        return PRJFS_MOUNT_PROTOCOL_STRING
+    elif sys.platform == "darwin":
+        return NFS_MOUNT_PROTOCOL_STRING
     else:
-        return False
+        return FUSE_MOUNT_PROTOCOL_STRING
 
 
 def get_protocol(nfs: bool) -> str:
@@ -1108,7 +1110,15 @@ def maybe_edensparse_migration(
         """
         SL_CONFIG_TO_ALLOW_MIGRATION = "experimental.allow-edensparse-migration"
         sl_args = ["config", "-Tjson", SL_CONFIG_TO_ALLOW_MIGRATION]
-        output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        try:
+            output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        except Exception as ex:
+            log(
+                f"failed to determine whether to migrate {checkout.name}: {ex}; "
+                "skipping migration"
+            )
+            return False
+
         if len(output) == 0:
             log(
                 f"{SL_CONFIG_TO_ALLOW_MIGRATION} not set for {checkout.name}, skipping migration"

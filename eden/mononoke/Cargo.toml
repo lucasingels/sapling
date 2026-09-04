@@ -1,19 +1,34 @@
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
-audio_streams = { git = "https://github.com/google/crosvm", rev = "299c1e7c3d5a1b98106212c20f58b9fdb7b1b1ea" }
+arrow = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-arith = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-array = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-buffer = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-cast = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-csv = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-data = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-ipc = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-json = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-ord = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-pyarrow = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-row = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-schema = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-select = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+arrow-string = { version = "57", git = "https://github.com/apache/arrow-rs", rev = "fcfe2b4160f6c99107dc89edecdfcd3ff9a4c867" }
+audio_streams = { git = "https://github.com/google/crosvm", rev = "379428d1e2b6a09b9e05325df112c76a9455867d" }
 backtrace = { git = "https://github.com/rust-lang/backtrace-rs", rev = "df979dcf80027eb047d7bb9e0874710c15009f31" }
 base64urlsafedata = { git = "https://github.com/kanidm/webauthn-rs.git", rev = "d278c56adfa39a0723c79bdcd461644194bc5138" }
 bf-tree = { git = "https://github.com/fbsource/bf-tree", rev = "da3f2364e8f9fe002a85c19de8a879fc2c05f12c" }
 bindgen = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 bindgen-cli = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 c2pa = { git = "https://github.com/peekmoar/c2pa-rs", rev = "bc2e763f3333eb7aaa1f169b045c9bbf60b146f7" }
-cxx = { git = "https://github.com/facebookexperimental/cxx.git", rev = "d98f6c434f8e6a018533c31a7a4cf7cdc7252210" }
-cxx-build = { git = "https://github.com/facebookexperimental/cxx.git", rev = "d98f6c434f8e6a018533c31a7a4cf7cdc7252210" }
+cxx = { git = "https://github.com/facebookexperimental/cxx.git", rev = "b835645da52253df462725516fbd460ef000d496" }
+cxx-build = { git = "https://github.com/facebookexperimental/cxx.git", rev = "b835645da52253df462725516fbd460ef000d496" }
+darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
 gimli = { git = "https://github.com/gimli-rs/gimli.git", rev = "ebad63b48e960270b8d8d0dec74f5b2e54cad13f" }
 imgui = { git = "https://github.com/imgui-rs/imgui-rs.git", rev = "2abba18c08fb5e70c699ba7992342e7ff8573b09" }
 imgui-sys = { git = "https://github.com/imgui-rs/imgui-rs.git", rev = "2abba18c08fb5e70c699ba7992342e7ff8573b09" }
 k = { git = "https://github.com/prnthp-meta/k", rev = "f06b504c563a4763dbf2d47366b868f67d5c9dd2" }
-libcras = { git = "https://github.com/google/crosvm", rev = "299c1e7c3d5a1b98106212c20f58b9fdb7b1b1ea" }
 lru-disk-cache = { git = "https://github.com/mozilla/sccache", rev = "fdbf843d174c6796d736b2b61dab0297670390f8" }
 minijail = { git = "https://chromium.googlesource.com/chromiumos/platform/minijail", rev = "fc020fd4672b3340ee706e192d043e12df8c8578" }
 modcholesky = { git = "https://github.com/argmin-rs/modcholesky", rev = "0ef5ed8f589ec77ff348d98747431aefa369f942" }
@@ -35,7 +50,6 @@ postgres-types = { git = "https://github.com/neondatabase/rust-postgres.git", re
 prettytable-rs = { git = "https://github.com/asm89/prettytable-rs", rev = "d5e2a480c02b0c4be8d61f4f3a9039c841376433" }
 protobuf-build = { git = "https://github.com/fbsource/protobuf-build", rev = "ee1de946ce2fd7d06a7a4fab7141e02c49f0981f" }
 quickcheck_async = { git = "https://github.com/markbt/quickcheck_async", rev = "76b13525ca93e0725e757f841fc6ccab8bae1913" }
-ratatui = { git = "https://github.com/fbsource/ratatui", rev = "e49703b568262fceffcb8b95456a47926ebabf33" }
 rinja = { git = "https://github.com/fbsource/askama", rev = "2fc6173c98034c148f46330fc39a006cf0b09efe" }
 riscv = { git = "https://github.com/rust-embedded/riscv", rev = "c2c9c7b77091a43b64bf0fd6a876c81a29438cf5" }
 riscv-types = { git = "https://github.com/rust-embedded/riscv", rev = "c2c9c7b77091a43b64bf0fd6a876c81a29438cf5" }
@@ -47,7 +61,13 @@ rust-embed-utils = { git = "https://github.com/fbsource/rust-embed", rev = "59bd
 rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }
 rustls-native-certs = { git = "https://github.com/rustls/rustls-native-certs", rev = "9734b4cc0bfa88224e0fc49867abafa1c56fa28d" }
 spm_precompiled = { version = "0.1.4", git = "https://github.com/huggingface/spm_precompiled", rev = "6e3ffb3ef2504f38e66273002fca0661da4121cc" }
-sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "24317d5eab40fbc33caf1142946e2f39caad73ea" }
+sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-core = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-macros = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-macros-core = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-mysql = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-postgres = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
+sqlx-sqlite = { git = "https://github.com/transact-rs/sqlx", rev = "1998c0a2f343d6a61a87531d26b43004f755a19f" }
 stabby = { git = "https://github.com/nitinsingh-meta/stabby", rev = "304c895c34e502fc635b85df6d4f22f746747ed4" }
 tokio-postgres = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
 tonic = { git = "https://github.com/grpc/grpc-rust", rev = "de65d0a48783869d89b7d8d4a65ce703f1612249" }
@@ -60,6 +80,29 @@ zbus = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e
 zbus_macros = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
 zvariant = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
 zvariant_derive = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+
+[patch."https://github.com/lance-format/lance.git"]
+fsst = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-arrow = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-arrow-scalar = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-arrow-stats = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-bitpacking = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-core = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-datafusion = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-datagen = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-derive = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-encoding = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-file = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-index = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-index-core = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-io = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-linalg = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-namespace = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-namespace-impls = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-select = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-table = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
+lance-tokenizer = { git = "https://github.com/fbsource/lance", rev = "f7d475539cefbd140cc46a828f3d843e68cd10f1" }
 
 [patch."https://github.com/milvus-io/rust-stemmers.git"]
 rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }
@@ -206,6 +249,7 @@ members = [
   "derived_data/constants",
   "derived_data/content_manifest_derivation",
   "derived_data/deleted_manifest",
+  "derived_data/derivation_pipeline_driver",
   "derived_data/derivation_pipeline_test_harness",
   "derived_data/derivation_pipeline_utils",
   "derived_data/directory_branch_cluster_manifest",
@@ -276,6 +320,7 @@ members = [
   "features/microwave/if/clients",
   "features/microwave/if/mocks",
   "features/microwave/if/services",
+  "features/multi_repo_land_lib",
   "features/pushrebase",
   "features/pushrebase/pushrebase_client",
   "features/pushrebase/pushrebase_hook",
