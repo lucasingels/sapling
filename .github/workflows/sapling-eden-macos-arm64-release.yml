@@ -9,9 +9,10 @@ on:
         description: 'Rebuild and re-publish even if this version already has a release asset'
         type: boolean
         default: false
+  # Deliberately not on v* tags: a plain `sl` release must not start the
+  # multi-hour EdenFS build. Run it by hand or push an eden-test-* tag.
   push:
     tags:
-      - v*
       - eden-test-*
 
 env:
