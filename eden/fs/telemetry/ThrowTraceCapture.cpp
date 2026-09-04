@@ -7,19 +7,6 @@
 
 #include "eden/fs/telemetry/ThrowTraceCapture.h"
 
-// backtrace_ffi compiles fine in OSS, but linking a second cxx-based Rust
-// staticlib into edenfs duplicates the cxx runtime symbols that
-// libedenfs_ffi.a already carries, so the capture is fbsource-only.
-#ifndef EDEN_HAVE_BACKTRACE_FFI
-
-namespace facebook::eden {
-std::optional<std::string> getThrowSiteStackTrace() {
-  return std::nullopt;
-}
-} // namespace facebook::eden
-
-#else
-
 #include <cstdlib>
 
 #ifdef __APPLE__
@@ -134,5 +121,3 @@ std::optional<std::string> getThrowSiteStackTrace() {
 }
 
 } // namespace facebook::eden
-
-#endif // EDEN_HAVE_BACKTRACE_FFI

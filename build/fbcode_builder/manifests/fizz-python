@@ -11,10 +11,7 @@ repo_url = https://github.com/facebookincubator/fizz.git
 builder = cmake
 subdir = fizz
 
-# Linux-only upstream; enabled on darwin for this fork so fbthrift-python
-# (edenfsctl.real's thrift-python runtime) can link against the shared
-# folly-python instead of a brew keg built against a different folly.
-[build.os=windows]
+[build.not(os=linux)]
 builder = nop
 
 [cmake.defines]
@@ -23,10 +20,6 @@ BUILD_EXAMPLES = OFF
 [cmake.defines.os=linux]
 CMAKE_POSITION_INDEPENDENT_CODE = ON
 BUILD_SHARED_LIBS = ON
-
-# darwin: static PIC archives; they get linked into libthrift_python_cpp.dylib.
-[cmake.defines.os=darwin]
-CMAKE_POSITION_INDEPENDENT_CODE = ON
 
 [cmake.defines.test=on]
 BUILD_TESTS = ON

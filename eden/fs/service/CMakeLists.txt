@@ -24,33 +24,6 @@ add_fbthrift_library(
     eden_service_thrift
 )
 
-# thrift-python (mstch_python) codegen for the modern CLI imports
-# (eden.fs.service.eden.thrift_types / thrift_clients). eden.thrift includes
-# fb303_core.thrift, whose python module must exist too; its thrift file
-# comes from the installed fb303 dependency.
-find_path(FB303_THRIFT_INCLUDE_DIR
-  NAMES fb303/thrift/fb303_core.thrift
-  PATH_SUFFIXES include/thrift-files
-)
-if(FB303_THRIFT_INCLUDE_DIR)
-  add_fbthrift_python_library(
-    fb303_core_thrift_python
-    "${FB303_THRIFT_INCLUDE_DIR}/fb303/thrift/fb303_core.thrift"
-    SERVICES BaseService
-    EXTRA_INCLUDE_DIRS "${FB303_THRIFT_INCLUDE_DIR}"
-  )
-  add_fbthrift_python_library(
-    eden_service_thrift_python
-    eden.thrift
-    NAMESPACE eden.fs.service
-    SERVICES EdenService
-    DEPENDS
-      eden_config_thrift_python
-      fb303_core_thrift_python
-    EXTRA_INCLUDE_DIRS "${FB303_THRIFT_INCLUDE_DIR}"
-  )
-endif()
-
 file(GLOB SERVICE_SRCS "*.cpp")
 
 # A couple utility files our split out into a separate lower-level library
@@ -63,14 +36,13 @@ list(
   ${CMAKE_CURRENT_SOURCE_DIR}/PrettyPrinters.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/PrivHelperMain.cpp
 )
-# PrettyPrinters is header-only: PrettyPrinters.cpp was deleted in "avoid
-# allocation in PrettyPrinter formatters", and BUCK agrees (cpp_library
-# "pretty_printers" declares headers with no srcs). ThriftUtil.cpp, despite this
-# target's name, is already compiled into eden_service via the SERVICE_SRCS glob.
-add_library(eden_service_thrift_util INTERFACE)
+add_library(
+  eden_service_thrift_util STATIC
+  PrettyPrinters.cpp
+)
 target_link_libraries(
   eden_service_thrift_util
-  INTERFACE
+  PUBLIC
     eden_model
     Folly::folly
 )
@@ -105,11 +77,6 @@ target_link_libraries(
     cpptoml
     edencommon::edencommon_utils
 )
-
-if (EDEN_HAVE_RUST_THRIFT_CLIENTS)
-  target_link_libraries(eden_service PUBLIC redirect_ffi)
-  target_compile_definitions(eden_service PUBLIC EDEN_HAVE_REDIRECT_FFI)
-endif()
 
 if (NOT WIN32)
   target_link_libraries(

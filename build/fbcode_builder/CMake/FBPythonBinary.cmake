@@ -28,13 +28,6 @@ include(FBCMakeParseArgs)
 # add_fb_python_executable() or add_fb_python_library() will fatal out if they
 # are used.
 if(NOT TARGET Python3::Interpreter)
-  # Honor an explicit interpreter from the environment. FindPython3's own
-  # Python3_ROOT_DIR env hint is ignored while CMP0074 is OLD (the top-level
-  # cmake_minimum_required predates 3.12), and the default search prefers the
-  # newest python on the system over the one the build is pinned to.
-  if(DEFINED ENV{Python3_EXECUTABLE} AND NOT Python3_EXECUTABLE)
-    set(Python3_EXECUTABLE "$ENV{Python3_EXECUTABLE}")
-  endif()
   # CMake 3.12+ ships with a FindPython3.cmake module.  Try using it first.
   # We find with QUIET here, since otherwise this generates some noisy warnings
   # on versions of CMake before 3.12

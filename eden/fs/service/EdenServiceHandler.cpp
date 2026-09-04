@@ -76,10 +76,8 @@
 #endif
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/prjfs/PrjfsChannel.h"
-#ifdef EDEN_HAVE_REDIRECT_FFI
 #include "eden/fs/rust/redirect_ffi/include/ffi.h"
 #include "eden/fs/rust/redirect_ffi/src/lib.rs.h"
-#endif
 #include "eden/fs/service/EdenServer.h"
 #include "eden/fs/service/ThriftGetObjectImpl.h"
 #include "eden/fs/service/ThriftGlobImpl.h"
@@ -7118,7 +7116,6 @@ EdenServiceHandler::co_getActiveRequests(apache::thrift::RequestParams params) {
 void EdenServiceHandler::listRedirections(
     ListRedirectionsResponse& response,
     std::unique_ptr<ListRedirectionsRequest> request) {
-#ifdef EDEN_HAVE_REDIRECT_FFI
   auto mountId = request->mount();
   auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *mountId);
 
@@ -7138,16 +7135,6 @@ void EdenServiceHandler::listRedirections(
       });
 
   response.redirections() = std::move(redirs);
-#else
-  // The redirect_ffi crate needs thrift_thriftclients, an autocargo-generated
-  // Rust thrift client that only exists inside fbsource.
-  (void)response;
-  (void)request;
-  throw newEdenError(
-      ENOTSUP,
-      EdenErrorType::GENERIC_ERROR,
-      "listRedirections is not available in this build");
-#endif
 }
 
 void EdenServiceHandler::getStatInfo(

@@ -62,41 +62,10 @@ endif()
 find_package(Re2 MODULE REQUIRED)
 include_directories(${RE2_INCLUDE_DIR})
 
-# re2's public headers include abseil headers. When re2 comes from a package
-# manager (e.g. a keg-only Homebrew re2), its abseil dependency lives in a
-# prefix the compiler does not search by default and no imported target adds.
-# Only the abseil keg may be added here: the general Homebrew include dir
-# (/opt/homebrew/include) also holds folly/glog headers that would shadow the
-# getdeps-built ones, since -I dirs are searched before -isystem dirs.
-find_path(ABSL_INCLUDE_DIR NAMES absl/base/call_once.h
-          PATHS /opt/homebrew/opt/abseil/include /usr/local/opt/abseil/include
-          NO_DEFAULT_PATH)
-if(ABSL_INCLUDE_DIR)
-  include_directories(${ABSL_INCLUDE_DIR})
-endif()
-
-# BUCK exports eden/scm/lib/backingstore's include/SaplingBackingStoreError.h
-# under the path eden/scm/lib/backingstore/SaplingBackingStoreError.h (see the
-# headers map in its BUCK file), and eden/fs/utils/EdenError.h includes it by
-# that name. Mirror the BUCK header layout with a forwarding shim — it must
-# not be a copy, since #pragma once dedupes by file identity and TUs that
-# also include the real header via ffi.h would see a redefinition.
-file(GENERATE
-  OUTPUT "${CMAKE_BINARY_DIR}/buck-hdrs/eden/scm/lib/backingstore/SaplingBackingStoreError.h"
-  CONTENT "#pragma once\n#include \"eden/scm/lib/backingstore/include/SaplingBackingStoreError.h\"\n")
-include_directories("${CMAKE_BINARY_DIR}/buck-hdrs")
-
 find_package(edencommon CONFIG REQUIRED)
 
 # The following packages ship with their own CMake configuration files
 find_package(cpptoml CONFIG REQUIRED)
-# Some test targets include eden/fs/config headers (which pull in cpptoml.h)
-# without linking the cpptoml target; on Linux the header sits in /usr/include
-# but a Homebrew keg is invisible to them. Surface the include dir globally.
-get_target_property(CPPTOML_INTERFACE_INCLUDES cpptoml INTERFACE_INCLUDE_DIRECTORIES)
-if(CPPTOML_INTERFACE_INCLUDES)
-  include_directories(${CPPTOML_INTERFACE_INCLUDES})
-endif()
 find_package(gflags CONFIG REQUIRED)
 
 find_package(BLAKE3 REQUIRED CONFIG)

@@ -25,15 +25,14 @@ list(
   ${CMAKE_CURRENT_SOURCE_DIR}/InodeTimestamps.cpp
 )
 
-# InodeNumber is header-only: InodeNumber.cpp was deleted in "delete
-# InodeNumber::toAppend", and BUCK agrees (cpp_library "inode_number" declares
-# headers with no srcs). An INTERFACE library keeps the target name so that
-# dependents such as eden/fs/nfs need no change.
-add_library(eden_inodes_inodenumber INTERFACE)
+add_library(
+  eden_inodes_inodenumber STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/InodeNumber.cpp
+)
 
 target_link_libraries(
   eden_inodes_inodenumber
-  INTERFACE
+  PUBLIC
     Folly::folly
 )
 
@@ -80,7 +79,6 @@ else()
     PUBLIC
       eden_fuse
       eden_fscatalog
-      eden_fscatalog_dev
       eden_lmdb_catalog
       eden_overlay_checker
   )
@@ -118,10 +116,7 @@ target_link_libraries(
 
 add_subdirectory(overlay)
 add_subdirectory(fscatalog)
-add_subdirectory(fscatalog_dev)
 add_subdirectory(memcatalog)
 add_subdirectory(sqlitecatalog)
 add_subdirectory(lmdbcatalog)
-if(BUILD_TESTS)
-  add_subdirectory(test)
-endif()
+add_subdirectory(test)

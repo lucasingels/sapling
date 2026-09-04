@@ -924,14 +924,9 @@ if __name__ == "__main__":
             # keg (e.g. an x86_64 openssl@1.1 on an arm64 host) over the OpenSSL
             # getdeps built. Point it at our OpenSSL so dependents like liboqs
             # link the right libcrypto.
-            # The install dir only exists when getdeps built OpenSSL itself;
-            # with --allow-system-packages it is satisfied from Homebrew
-            # instead and buildopts records the keg prefix in the env.
             openssl_dir = self._dep_install_dir("openssl")
-            if openssl_dir and os.path.exists(openssl_dir):
+            if openssl_dir:
                 defines["OPENSSL_ROOT_DIR"] = openssl_dir
-            elif "OPENSSL_ROOT_DIR" in env:
-                defines["OPENSSL_ROOT_DIR"] = env["OPENSSL_ROOT_DIR"]
 
         if self.build_opts.is_windows():
             # Use embedded debug info (/Z7) instead of MSVC's default /Zi, which

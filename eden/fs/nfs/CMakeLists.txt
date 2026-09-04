@@ -121,7 +121,5 @@ target_link_libraries(
 add_subdirectory(portmap)
 add_subdirectory(rpc)
 add_subdirectory(xdr)
-if(BUILD_TESTS)
-  add_subdirectory(test)
-endif()
+add_subdirectory(test)
 add_subdirectory(testharness)

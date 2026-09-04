@@ -94,7 +94,6 @@
 #include "eden/fs/privhelper/PrivHelperImpl.h"
 #include "eden/fs/service/EdenCPUThreadPool.h"
 #include "eden/fs/service/EdenServiceHandler.h"
-#include "eden/fs/service/PrettyPrinters.h"
 #include "eden/fs/service/StartupLogger.h"
 #include "eden/fs/service/StartupStatusSubscriber.h"
 #include "eden/fs/service/ThriftStreamStartupStatusSubscriber.h"

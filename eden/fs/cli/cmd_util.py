@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
-from . import config as config_mod, daemon_util, subcmd as subcmd_mod
+from . import config as config_mod, subcmd as subcmd_mod
 from .config import EdenCheckout, EdenInstance
 
 
@@ -49,8 +49,4 @@ def get_fsck_command() -> Path:
     try:
         return Path(os.environ["EDENFS_FSCK"])
     except KeyError:
-        pass
-    sibling = daemon_util.find_libexec_eden_sibling("eden_fsck")
-    if sibling is not None:
-        return Path(sibling)
-    return Path("/usr/local/libexec/eden/eden_fsck")
+        return Path("/usr/local/libexec/eden/eden_fsck")

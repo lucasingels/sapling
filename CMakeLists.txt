@@ -121,7 +121,6 @@ include(EdenCompilerSettings)
 include(EdenConfigChecks)
 include(FBPythonBinary)
 include(FBThriftLibrary)
-include(FBThriftPythonLibrary)
 include(RustStaticLibrary)
 
 include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR})
@@ -135,17 +134,7 @@ set_property(
   "FOLLY_XLOG_STRIP_PREFIXES=\"${CMAKE_SOURCE_DIR}:${CMAKE_BINARY_DIR}\""
 )
 add_subdirectory(eden/fs)
-# eden/integration's python unittests depend on Folly::folly.py_lib,
-# FBThrift::thriftcpp2.py_lib and FBThrift::thrift_python_cpp.py_lib, which only
-# exist when folly/fbthrift are built with python bindings. Configuring them
-# unconditionally therefore breaks any build without those, and getdeps'
-# --no-tests only prunes the dependency graph, it does not reach CMake. Gate them
-# the way folly gates its own tests (option(BUILD_TESTS ...)). Default ON to keep
-# existing behaviour; pass -DBUILD_TESTS=OFF to skip.
-option(BUILD_TESTS "If enabled, compile the tests." ON)
-if (BUILD_TESTS)
-  add_subdirectory(eden/integration)
-endif()
+add_subdirectory(eden/integration)
 add_subdirectory(eden/scm)
 add_subdirectory(eden/scm/lib)
 add_subdirectory(eden/test_support)

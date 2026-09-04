@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from eden.fs.cli.config import EdenCheckout, EdenInstance
-from eden.fs.cli.util import get_environment_suitable_for_subprocess, get_hg_binary
+from eden.fs.cli.util import get_environment_suitable_for_subprocess
 from eden.fs.service.eden.thrift_types import (
     GetStatInfoParams,
     MountInodeInfo,
@@ -91,7 +91,7 @@ def hg_doctor_in_backing_repo(
         return
     checked_backing_repos.add(str(backing_repo))
 
-    hg = get_hg_binary()
+    hg = os.environ.get("EDEN_HG_BINARY", "hg")
 
     env = get_environment_suitable_for_subprocess()
     env["HG_DOCTOR_SKIP_EDEN_DOCTOR"] = "1"

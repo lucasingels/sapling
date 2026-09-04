@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List
 
 from eden.fs.cli.doctor.problem import Problem, ProblemSeverity, ProblemTracker
-from eden.fs.cli.util import get_environment_suitable_for_subprocess, get_hg_binary
+from eden.fs.cli.util import get_environment_suitable_for_subprocess
 
 try:
     from .facebook.internal_consts import get_netinfo_link
@@ -128,7 +128,7 @@ class NetworkChecker:
         if str(checkout_backing_repo) in checked_network_backing_repos:
             return
         checked_network_backing_repos.add(str(checkout_backing_repo))
-        hg = get_hg_binary()
+        hg = os.environ.get("EDEN_HG_BINARY", "hg")
         try:
             self.run_command([hg, "debugnetworkdoctor"], checkout_backing_repo)
         except subprocess.CalledProcessError as ex:
