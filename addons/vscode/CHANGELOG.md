@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.5
+
+### 4 September 2026
+
+- New worktrees default to a hidden `.worktrees/<label>` directory inside the repository instead of a `<repo>.worktrees` sibling; the path follows the label as you type (needs Sapling 0.3.4)
+- Opening a folder inside a nested worktree no longer attributes it to the enclosing repository
+
 ## 0.2.4
 
 ### 4 September 2026
