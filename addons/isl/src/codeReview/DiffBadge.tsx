@@ -19,7 +19,7 @@ import {Component, lazy, Suspense, useRef, useState} from 'react';
 import {useShowConfirmSubmitStack} from '../ConfirmSubmitStack';
 import {Internal} from '../Internal';
 import {Link} from '../Link';
-import {clipboardCopyLink, clipboardCopyText} from '../clipboard';
+import {clipboardCopyText, clipboardCopyUrl} from '../clipboard';
 import {useFeatureFlagSync} from '../featureFlags';
 import {T, t} from '../i18n';
 import {CircleExclamationIcon} from '../icons/CircleExclamationIcon';
@@ -298,11 +298,18 @@ function DiffNumber({
   }
 
   return (
-    <Tooltip trigger="manual" shouldShow={showing} title={t(`Copied ${children} to the clipboard`)}>
+    <Tooltip
+      trigger="manual"
+      shouldShow={showing}
+      title={
+        url == null
+          ? t('Copied $number to the clipboard', {replace: {$number: children}})
+          : t('Copied link to $number to the clipboard', {replace: {$number: children}})
+      }>
       <span
         className="diff-number"
         onClick={e => {
-          url == null ? clipboardCopyText(children) : clipboardCopyLink(children, url);
+          url == null ? clipboardCopyText(children) : clipboardCopyUrl(url, children);
           setShowing(true);
           setTimeout(() => setShowing(false), 2000);
           e.stopPropagation();

@@ -22,6 +22,15 @@ export function clipboardCopyLink(text: string, url: string) {
 }
 
 /**
+ * Copy a URL to the clipboard.
+ * If pasted into a plain text input, it will paste the URL itself.
+ * If pasted into a rich text input, it will paste as `text` linking to the URL.
+ */
+export function clipboardCopyUrl(url: string, text: string) {
+  return platform.clipboardCopy(url, clipboardLinkHtml(text, url));
+}
+
+/**
  * HTML <a> tag for `text` pointing to `url`. Useful for copying rich text links.
  */
 export function clipboardLinkHtml(text: string, url: string): string {
