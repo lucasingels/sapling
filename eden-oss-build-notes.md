@@ -474,7 +474,7 @@ sudo chown root:wheel $EDEN_INST/bin/edenfs_privhelper && sudo chmod 4755 $EDEN_
 printf '#!/bin/sh\nexec %s/eden/fs/cli/edenfsctl.real/__main__.py "$@"\n' "$EDEN_BUILD" > ~/bin/edenfsctl && chmod +x ~/bin/edenfsctl
 export EDENFS_SERVER_PATH=$EDEN_INST/bin/edenfs EDENFS_PRIVHELPER_PATH=$EDEN_INST/bin/edenfs_privhelper \
        EDENFS_CLI_PATH=~/bin/edenfsctl EDEN_HG_BINARY=$SL_INST/bin/sl
-# ~/.edenrc: [clone] default-mount-protocol = "NFS"; [redirections] darwin-redirection-type = "symlink"
+# ~/.edenrc: [redirections] darwin-redirection-type = "symlink"   (NFS is the macOS default since upstream 3448caede55; no [clone] default-mount-protocol needed)
 # sapling.conf: [edenfs] command = ~/bin/edenfsctl ; legacy_command = ~/bin/edenfsctl
 edenfsctl start --foreground   # first run; then: edenfsctl start && edenfsctl doctor
 $SL_INST/bin/sl clone --git <url> ~/repos/<name>-backing && ls -d ~/repos/<name>-backing/.sl/store

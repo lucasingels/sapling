@@ -42,9 +42,6 @@ rust
 [dependencies.not(os=darwin)]
 sqlite3
 
-[dependencies.os=darwin]
-osxfuse
-
 [dependencies.not(os=windows)]
 # TODO: teach getdeps to compile curl on Windows.
 # Enabling curl on Windows requires us to find a way to compile libcurl with
