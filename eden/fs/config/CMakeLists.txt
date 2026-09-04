@@ -10,14 +10,6 @@ add_fbthrift_library(
   PY_NAMESPACE facebook.eden.eden_config
 )
 
-# thrift-python (mstch_python) codegen for the modern CLI imports
-# (eden.fs.config.eden_config.thrift_types).
-add_fbthrift_python_library(
-  eden_config_thrift_python
-  eden_config.thrift
-  NAMESPACE eden.fs.config
-)
-
 file(GLOB CONFIG_SRCS "*.cpp")
 add_library(
   eden_config STATIC
@@ -37,8 +29,4 @@ target_link_libraries(
     ${RE2_LIBRARY}
 )
 
-if(BUILD_TESTS)
-
-  add_subdirectory(test)
-
-endif()
+add_subdirectory(test)

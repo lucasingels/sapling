@@ -17,8 +17,4 @@ target_link_libraries(
     streamingeden_thrift_cpp
 )
 
-if(BUILD_TESTS)
-
-  add_subdirectory(test)
-
-endif()
+add_subdirectory(test)

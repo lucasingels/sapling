@@ -667,20 +667,6 @@ def get_edenfsctl_cmd() -> str:
     if env:
         return env
 
-    # Self-contained release/package layout: edenfsctl.real/ lives a few
-    # directories below the install prefix (e.g.
-    # <prefix>/libexec/eden/bin/edenfsctl.real/), and the CLI wrapper users
-    # invoke is at <prefix>/bin/eden. Walk upward looking for that wrapper
-    # rather than hardcoding the exact nesting depth.
-    cli_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    wrapper_name = "eden.exe" if sys.platform == "win32" else "eden"
-    ancestor = cli_dir
-    for _ in range(5):
-        ancestor = os.path.dirname(ancestor)
-        prefix_wrapper = os.path.join(ancestor, "bin", wrapper_name)
-        if os.access(prefix_wrapper, os.R_OK | os.X_OK):
-            return prefix_wrapper
-
     edenfsctl_real = os.path.abspath(sys.argv[0])
     if sys.platform == "win32":
         edenfsctl = os.path.join(edenfsctl_real, "../edenfsctl.exe")
@@ -712,16 +698,8 @@ def get_edenfs_cmd(
     # TODO(cuev): Avoid hardcoding the privhelper path. Instead, we should
     # share candidate paths with FindExe (which is used in integration tests)
     if privhelper_path is None:
-        # Prefer a privhelper installed as a sibling of the daemon binary
-        # (self-contained release/package layout) before falling back to
-        # Meta's system install location.
-        sibling_privhelper = os.path.join(
-            os.path.dirname(daemon_binary), "edenfs_privhelper"
-        )
-        if os.access(sibling_privhelper, os.R_OK | os.X_OK):
-            privhelper_path = sibling_privhelper
-        else:
-            privhelper_path = "/usr/local/libexec/eden/edenfs_privhelper"
+        # Default to using the system privhelper. See explanation below.
+        privhelper_path = "/usr/local/libexec/eden/edenfs_privhelper"
 
     cmd += ["--privhelper_path", privhelper_path]
 

@@ -32,7 +32,6 @@ from eden.fs.cli.doctor.problem import (
 from eden.fs.cli.doctor.util import CheckoutInfo, get_mount_inode_info
 from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
-from eden.fs.cli.util import get_hg_binary
 from eden.fs.service.eden.thrift_types import (
     DebugInvalidateRequest,
     DebugInvalidateResponse,
@@ -1051,7 +1050,7 @@ def get_hg_diff(checkout: EdenCheckout, modified_files: List[str]) -> Set[Path]:
     if not modified_files:
         return set()
 
-    hg = get_hg_binary()
+    hg = os.environ.get("EDEN_HG_BINARY", "hg")
     # An unscoped `hg diff` reads every modified and added file in the working
     # copy. Only modified files can mismatch with status, so scope the diff to
     # them. The patterns are passed on stdin rather than in argv as there may be

@@ -10,8 +10,3 @@ license = "GPLv2+"
 [dependencies]
 backtrace = "0.3"
 cxx = "1.0.194"
-
-# staticlib so the CMake build can link the crate into eden_telemetry;
-# BUCK links it via its own rust_library/cpp_library glue instead.
-[lib]
-crate-type = ["lib", "staticlib"]

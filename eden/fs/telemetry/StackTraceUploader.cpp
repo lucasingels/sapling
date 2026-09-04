@@ -12,15 +12,10 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/logging/xlog.h>
 
-// The manifold_ffi crate does not build outside fbsource (and Manifold is
-// only reachable from there anyway), so the upload becomes a no-op without it.
-#ifdef EDEN_HAVE_MANIFOLD_FFI
 #include "eden/fs/rust/manifold_ffi/src/lib.rs.h"
-#endif
 
 namespace facebook::eden {
 
-#ifdef EDEN_HAVE_MANIFOLD_FFI
 namespace {
 constexpr size_t kUploadPoolSize = 4;
 
@@ -31,7 +26,6 @@ folly::CPUThreadPoolExecutor& getUploadPool() {
   return pool;
 }
 } // namespace
-#endif
 
 std::string StackTraceUploader::generateKey() {
   auto hi = folly::Random::rand64();
@@ -44,11 +38,6 @@ std::string StackTraceUploader::keyToUrl(const std::string& key) {
 }
 
 std::string StackTraceUploader::uploadToManifold(std::string content) {
-#ifndef EDEN_HAVE_MANIFOLD_FFI
-  (void)content;
-  XLOG(DBG4) << "Manifold upload skipped: manifold_ffi is not in this build";
-  return "Upload skipped: manifold_ffi not built";
-#else
   auto key = generateKey();
   auto url = keyToUrl(key);
 
@@ -81,7 +70,6 @@ std::string StackTraceUploader::uploadToManifold(std::string content) {
   });
 
   return url;
-#endif
 }
 
 } // namespace facebook::eden

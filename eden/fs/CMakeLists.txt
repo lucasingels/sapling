@@ -50,15 +50,7 @@ if (WIN32)
   add_compile_definitions(_UNICODE UNICODE)
 endif()
 
-# The Rust edenfsctl wrapper and redirect_ffi both depend (via edenfs-client)
-# on thrift_thriftclients, an autocargo-generated Rust thrift client for
-# eden.thrift that only exists inside fbsource. The Python CLI
-# (edenfsctl.real, from eden/fs/cli) is installed regardless.
-option(EDEN_HAVE_RUST_THRIFT_CLIENTS
-  "Build Rust components that need fbsource-generated thrift clients" OFF)
-if(EDEN_HAVE_RUST_THRIFT_CLIENTS)
-  add_subdirectory(cli_rs/edenfsctl)
-endif()
+add_subdirectory(cli_rs/edenfsctl)
 add_subdirectory(cli)
 add_subdirectory(config)
 add_subdirectory(digest)
@@ -72,9 +64,6 @@ add_subdirectory(nfs)
 add_subdirectory(notifications)
 add_subdirectory(prjfs)
 add_subdirectory(py)
-if(EDEN_HAVE_RUST_THRIFT_CLIENTS)
-  add_subdirectory(rust/redirect_ffi)
-endif()
 add_subdirectory(service)
 add_subdirectory(sqlite)
 add_subdirectory(store)

@@ -14,8 +14,4 @@ target_link_libraries(
     eden_model
 )
 
-if(BUILD_TESTS)
-
-  add_subdirectory(test)
-
-endif()
+add_subdirectory(test)

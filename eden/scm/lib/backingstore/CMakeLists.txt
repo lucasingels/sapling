@@ -7,11 +7,10 @@ if (IS_FB_BUILD)
   rust_static_library(
     rust_backingstore
     CRATE backingstore
-    PACKAGE sapling-backingstore
     USE_CXX_INCLUDE
     FEATURES fb)
 else()
-  rust_static_library(rust_backingstore CRATE backingstore PACKAGE sapling-backingstore USE_CXX_INCLUDE)
+  rust_static_library(rust_backingstore CRATE backingstore USE_CXX_INCLUDE)
 endif()
 
 install_rust_static_library(
@@ -85,24 +84,6 @@ if (APPLE)
     PRIVATE
     "-framework Security"
   )
-
-  # CURL::libcurl is CMake's builtin FindCURL module, which just locates
-  # libcurl.a/.dylib -- it knows nothing of curl's own dependencies. When
-  # curl is built static (as getdeps does), the reqwest crate's linked-in
-  # curl symbols need nghttp2 too (curl was built with HTTP/2 support), and
-  # unlike Linux's more lenient handling of undefined symbols pulled in from
-  # a static archive, macOS's linker requires everything resolved at link
-  # time: "ld: symbol(s) not found for architecture arm64" for every
-  # nghttp2_* symbol libcurl.a references. No manifests/*/[homebrew] entry
-  # exists for nghttp2 (it's always built from source by getdeps), and no
-  # CMake target for it exists anywhere in this tree or curl's own (unused
-  # here) CMake build, so find it directly via getdeps' CMAKE_PREFIX_PATH.
-  find_library(NGHTTP2_LIBRARY NAMES nghttp2 REQUIRED)
-  target_link_libraries(
-    backingstore
-    PRIVATE
-    ${NGHTTP2_LIBRARY}
-  )
 endif()
 
 install(
@@ -111,10 +92,3 @@ install(
   LIBRARY DESTINATION lib
   PUBLIC_HEADER DESTINATION eden/scm/lib/backingstore/include
 )
-
-if(APPLE)
-  # The "git" constructors feature vendors libgit2 into the Rust crate, and
-  # libgit2's path code (fs_path.c) calls iconv_open/iconv/iconv_close for
-  # filename normalization on macOS.
-  target_link_libraries(backingstore PUBLIC iconv)
-endif()

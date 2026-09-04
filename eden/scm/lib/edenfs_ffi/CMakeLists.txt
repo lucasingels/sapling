@@ -5,7 +5,7 @@
 
 # Due to some tools changing '-' to '_' when building,
 # this library/crate is named using an '_' so that it can link successfully.
-rust_static_library(rust_edenfs_ffi CRATE edenfs_ffi PACKAGE sapling-edenfs_ffi USE_CXX_INCLUDE)
+rust_static_library(rust_edenfs_ffi CRATE edenfs_ffi USE_CXX_INCLUDE)
 
 install_rust_static_library(
   rust_edenfs_ffi
@@ -68,28 +68,6 @@ else()
     edenfs_ffi
     PRIVATE
       CURL::libcurl
-  )
-endif()
-
-# The whoami crate calls SCDynamicStoreCopyComputerName and the vendored curl
-# calls SCDynamicStoreCopyProxies; PUBLIC because the framework must reach the
-# final binaries that link this static library.
-if (APPLE)
-  target_link_libraries(
-    edenfs_ffi
-    PUBLIC
-    "-framework SystemConfiguration"
-  )
-
-  # See the matching comment in eden/scm/lib/backingstore/CMakeLists.txt:
-  # CURL::libcurl (CMake's builtin FindCURL) doesn't know curl needs nghttp2
-  # too when statically linked, and macOS's linker (unlike Linux's) requires
-  # every symbol resolved at link time.
-  find_library(NGHTTP2_LIBRARY NAMES nghttp2 REQUIRED)
-  target_link_libraries(
-    edenfs_ffi
-    PRIVATE
-    ${NGHTTP2_LIBRARY}
   )
 endif()
 

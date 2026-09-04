@@ -14,7 +14,7 @@ import subprocess
 import sys
 from typing import List, Union
 
-from . import daemon_util, subcmd as subcmd_mod
+from . import subcmd as subcmd_mod
 from .cmd_util import require_checkout
 from .subcmd import Subcmd
 
@@ -27,13 +27,9 @@ def get_trace_stream_command() -> pathlib.Path:
     try:
         return pathlib.Path(os.environ["EDENFS_TRACE_STREAM"])
     except KeyError:
-        pass
-    if sys.platform == "win32":
-        return pathlib.Path("C:/tools/eden/libexec/trace_stream.exe")
-    sibling = daemon_util.find_libexec_eden_sibling("eden_trace_stream")
-    if sibling is not None:
-        return pathlib.Path(sibling)
-    return pathlib.Path("/usr/local/libexec/eden/eden_trace_stream")
+        if sys.platform == "win32":
+            return pathlib.Path("C:/tools/eden/libexec/trace_stream.exe")
+        return pathlib.Path("/usr/local/libexec/eden/eden_trace_stream")
 
 
 def execute_cmd(arg_list: List[Union[pathlib.Path, str]]) -> int:

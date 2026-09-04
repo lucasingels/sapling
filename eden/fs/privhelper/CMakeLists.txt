@@ -3,8 +3,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# priority/ sources are platform-guarded internally (#ifdef __linux__/__APPLE__)
-file(GLOB PRIVHELPER_SRCS "*.cpp" "priority/*.cpp")
+file(GLOB PRIVHELPER_SRCS "*.cpp")
 
 add_library(
   eden_fuse_privhelper STATIC
@@ -43,7 +42,5 @@ if (SELINUX_INCLUDE_DIR)
 endif()
 
 if(NOT WIN32)
-  if(BUILD_TESTS)
-    add_subdirectory(test)
-  endif()
+  add_subdirectory(test)
 endif()

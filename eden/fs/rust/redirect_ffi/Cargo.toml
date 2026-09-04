@@ -13,8 +13,3 @@ cxx = "1.0.194"
 cxxerror = { version = "0.1.0", path = "../../../scm/lib/edenfs_ffi/cxxerror" }
 edenfs-client = { version = "0.1.0", path = "../../cli_rs/edenfs-client" }
 tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
-
-# staticlib so the CMake build can link the crate into eden_service;
-# BUCK links it via its own rust_library/cpp_library glue instead.
-[lib]
-crate-type = ["lib", "staticlib"]

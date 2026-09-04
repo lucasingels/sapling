@@ -6,9 +6,6 @@ shipit_fbcode_builder = true
 
 [git]
 repo_url = https://github.com/facebook/fb303.git
-# Pinned to match eden/scm/Cargo.lock (gitignored -- see the fbthrift
-# manifest's comment for why this needs to live here too).
-rev = 26f849146652b0a2ce927ce0396facfbc12b9580
 
 [cargo]
 cargo_config_file = source/fb303/thrift/.cargo/config.toml
