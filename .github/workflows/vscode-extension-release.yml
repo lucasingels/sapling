@@ -3,8 +3,22 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (defaults to addons/vscode/package.json)'
+        description: 'Version to release (defaults to the VSCODE_VERSION file)'
         required: false
+      force:
+        description: 'Rebuild and re-publish even if this version already has a .vsix'
+        type: boolean
+        default: false
+  # Releasing on a push to main, rather than on a tag, matches the sl release
+  # workflow: GitHub scopes the Actions cache by ref and prefixes it with
+  # `refs/heads/`, so a tag push gets a private scope no later run can read.
+  # VSCODE_VERSION is the extension's counterpart to SAPLING_VERSION, so a bump
+  # to it is the release trigger. The release itself creates the tag.
+  push:
+    branches:
+      - main
+    paths:
+      - VSCODE_VERSION
 
 jobs:
   build-and-publish:
@@ -19,32 +33,96 @@ jobs:
     - uses: actions/setup-node@v7
       with:
         node-version: 22
+        cache: yarn
+        cache-dependency-path: addons/yarn.lock
     - name: Enable Corepack (yarn)
       run: corepack enable
     - name: Resolve version
       run: |
+        # A push to main is triggered by VSCODE_VERSION itself, so the file is
+        # the version. A dispatch may name one explicitly.
         VERSION="${{ github.event.inputs.version }}"
         if [ -z "$VERSION" ]; then
-          VERSION=$(node -p "require('./addons/vscode/package.json').version")
+          VERSION="$(cat VSCODE_VERSION)"
         fi
+        VERSION="${VERSION#v}"
         echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
         echo "TAG=extension-v${VERSION}" >> "$GITHUB_ENV"
+        # The per-version release keeps a versioned filename so a download is
+        # identifiable; vscode-latest also gets an unversioned copy, which is
+        # what makes the install command a fixed URL needing no gh and no auth.
+        # (`gh release download -p '*.vsix'` finds an asset within a release,
+        # but cannot pick the release, so a stable tag is needed regardless.)
         echo "VSIX=sapling-scm-${VERSION}.vsix" >> "$GITHUB_ENV"
+        echo "VSIX_LATEST=sapling-scm.vsix" >> "$GITHUB_ENV"
+    - name: Check package.json agrees
+      # vsce takes the version from package.json, so a disagreement would ship a
+      # .vsix whose version contradicts the release it is attached to. Bump both
+      # in the same commit.
+      run: |
+        PKG=$(node -p "require('./addons/vscode/package.json').version")
+        if [ "$PKG" != "$VERSION" ]; then
+          echo "VSCODE_VERSION says ${VERSION} but addons/vscode/package.json says ${PKG}." >&2
+          exit 1
+        fi
+    - name: Skip if already published (unless forced)
+      # So re-running the workflow, or a push that touches VSCODE_VERSION
+      # without changing it, does not rebuild and re-publish.
+      run: |
+        if [ "${{ github.event.inputs.force }}" = "true" ]; then
+          echo "force=true requested; building v${VERSION}."
+        elif gh release view "$TAG" --repo lucasingels/sapling \
+               --json assets --jq '.assets[].name' 2>/dev/null | grep -q '\.vsix$'; then
+          echo "Release ${TAG} already has a .vsix; skipping (dispatch with force=true to rebuild)."
+          echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+        fi
     - name: Install dependencies
+      if: env.SKIP_BUILD != 'true'
       working-directory: ./addons
       run: yarn install --frozen-lockfile
     - name: Package extension (.vsix)
+      if: env.SKIP_BUILD != 'true'
       # vsce runs the `vscode:prepublish` script (buildForPublish.js), which does
       # the production extension + webview build. --no-dependencies because the
       # bundle is self-contained (node_modules is excluded via .vscodeignore).
       working-directory: ./addons/vscode
       run: npx --yes @vscode/vsce package --no-dependencies -o "$VSIX"
-    - name: Publish to its own GitHub release
+    - name: Publish the versioned release
+      if: env.SKIP_BUILD != 'true'
       working-directory: ./addons/vscode
       run: |
         gh release create "$TAG" \
           --repo lucasingels/sapling \
+          --target "$GITHUB_SHA" \
           --title "Sapling ISL VS Code Extension v${VERSION}" \
-          --notes "Sapling ISL VS Code extension v${VERSION}. Download the .vsix below and install with: code --install-extension ${VSIX}" \
+          --notes "Sapling ISL VS Code extension v${VERSION}.
+
+        Install or update:
+
+            curl -fsSL -o /tmp/${VSIX_LATEST} https://github.com/lucasingels/sapling/releases/download/vscode-latest/${VSIX_LATEST} && code --install-extension /tmp/${VSIX_LATEST} --force" \
           "$VSIX" 2>/dev/null || \
         gh release upload "$TAG" --repo lucasingels/sapling --clobber "$VSIX"
+    - name: Move the vscode-latest release
+      if: env.SKIP_BUILD != 'true'
+      # A stable tag carrying an unversioned asset, so installing is one command
+      # that needs no version. --latest=false keeps the repo's "latest release"
+      # pointer on the sl bottle releases.
+      working-directory: ./addons/vscode
+      run: |
+        cp "$VSIX" "$VSIX_LATEST"
+        NOTES="Always carries the newest build of the extension, under a stable filename, so installing does not need a version.
+
+        Install or update:
+
+            curl -fsSL -o /tmp/${VSIX_LATEST} https://github.com/lucasingels/sapling/releases/download/vscode-latest/${VSIX_LATEST} && code --install-extension /tmp/${VSIX_LATEST} --force
+
+        Currently: v${VERSION}. Per-version releases with changelogs are tagged \`extension-v*\`."
+        gh release create vscode-latest \
+          --repo lucasingels/sapling \
+          --latest=false \
+          --title "Sapling ISL VS Code Extension (latest)" \
+          --notes "$NOTES" \
+          "$VSIX_LATEST" 2>/dev/null || {
+          gh release edit vscode-latest --repo lucasingels/sapling --notes "$NOTES"
+          gh release upload vscode-latest --repo lucasingels/sapling --clobber "$VSIX_LATEST"
+        }
