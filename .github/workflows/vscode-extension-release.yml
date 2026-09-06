@@ -48,13 +48,10 @@ jobs:
         VERSION="${VERSION#v}"
         echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
         echo "TAG=extension-v${VERSION}" >> "$GITHUB_ENV"
-        # The per-version release keeps a versioned filename so a download is
-        # identifiable; vscode-latest also gets an unversioned copy, which is
-        # what makes the install command a fixed URL needing no gh and no auth.
-        # (`gh release download -p '*.vsix'` finds an asset within a release,
-        # but cannot pick the release, so a stable tag is needed regardless.)
+        # A versioned filename, so a downloaded .vsix is identifiable. Nothing
+        # needs a fixed name: vscode.sh resolves the newest extension-v*
+        # release through the API and reads the asset URL from it.
         echo "VSIX=sapling-scm-${VERSION}.vsix" >> "$GITHUB_ENV"
-        echo "VSIX_LATEST=sapling-scm.vsix" >> "$GITHUB_ENV"
     - name: Check package.json agrees
       # vsce takes the version from package.json, so a disagreement would ship a
       # .vsix whose version contradicts the release it is attached to. Bump both
@@ -99,30 +96,6 @@ jobs:
 
         Install or update:
 
-            curl -fsSL -o /tmp/${VSIX_LATEST} https://github.com/lucasingels/sapling/releases/download/vscode-latest/${VSIX_LATEST} && code --install-extension /tmp/${VSIX_LATEST} --force" \
+            curl -fsSL https://raw.githubusercontent.com/lucasingels/sapling/main/vscode.sh | sh" \
           "$VSIX" 2>/dev/null || \
         gh release upload "$TAG" --repo lucasingels/sapling --clobber "$VSIX"
-    - name: Move the vscode-latest release
-      if: env.SKIP_BUILD != 'true'
-      # A stable tag carrying an unversioned asset, so installing is one command
-      # that needs no version. --latest=false keeps the repo's "latest release"
-      # pointer on the sl bottle releases.
-      working-directory: ./addons/vscode
-      run: |
-        cp "$VSIX" "$VSIX_LATEST"
-        NOTES="Always carries the newest build of the extension, under a stable filename, so installing does not need a version.
-
-        Install or update:
-
-            curl -fsSL -o /tmp/${VSIX_LATEST} https://github.com/lucasingels/sapling/releases/download/vscode-latest/${VSIX_LATEST} && code --install-extension /tmp/${VSIX_LATEST} --force
-
-        Currently: v${VERSION}. Per-version releases with changelogs are tagged \`extension-v*\`."
-        gh release create vscode-latest \
-          --repo lucasingels/sapling \
-          --latest=false \
-          --title "Sapling ISL VS Code Extension (latest)" \
-          --notes "$NOTES" \
-          "$VSIX_LATEST" 2>/dev/null || {
-          gh release edit vscode-latest --repo lucasingels/sapling --notes "$NOTES"
-          gh release upload vscode-latest --repo lucasingels/sapling --clobber "$VSIX_LATEST"
-        }
