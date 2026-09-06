@@ -105,7 +105,13 @@ def wrapui(ui) -> None:
             vfs = None
             repo = getattr(self, "_bbrepo", lambda: None)()
             if repo:
-                vfs = repo.localvfs
+                # A dotgit linked worktree logs to the main checkout's dot dir, where the
+                # native blackbox (see dispatch._initblackbox) already writes, so a
+                # worktree's activity is not hidden in a log that dies with it.
+                if repo.ui.identity.dotdir().startswith(".git"):
+                    vfs = repo.sharedvfs
+                else:
+                    vfs = repo.localvfs
                 if not vfs.isdir():
                     vfs = None
             return vfs

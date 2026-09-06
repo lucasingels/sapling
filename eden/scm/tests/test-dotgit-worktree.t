@@ -43,6 +43,48 @@ at the main checkout's shared store:
   $ test -f $(sl root --dotdir)/dirstate && echo dirstate-ok
   dirstate-ok
 
+The worktree has no repo config of its own: it reads the main checkout's, the way
+git shares `.git/config`:
+
+  $ cat >> $TESTTMP/git-repo/.git/sl/config <<EOF
+  > [paths]
+  > default-push = no-push
+  > [test]
+  > shared = from-main
+  > EOF
+  $ sl config paths.default-push
+  no-push
+  $ sl config test.shared
+  from-main
+
+A stray config left in the worktree's own dot dir by an older `sl` is ignored,
+so a setting cannot silently disappear with the worktree:
+
+  $ cat >> $(sl root --dotdir)/config <<EOF
+  > [test]
+  > shared = from-worktree
+  > EOF
+  $ sl config test.shared
+  from-main
+  $ rm $(sl root --dotdir)/config
+
+`--local` reads and writes the shared config file, like `git config --local`,
+so config set from the worktree is visible in the main checkout:
+
+  $ sl configfile --local
+  $TESTTMP/git-repo/.git/sl/config
+  $ sl config --local test.written=from-worktree
+  updated config in $TESTTMP/git-repo/.git/sl/config
+  $ sl -R $TESTTMP/git-repo config test.written
+  from-worktree
+  $ test -e $(sl root --dotdir)/config && echo per-worktree-config || echo none
+  none
+
+The reponame file is written to the shared dot dir, not once per worktree:
+
+  $ test -e $(sl root --dotdir)/reponame && echo per-worktree-reponame || echo none
+  none
+
 `sl log` in the worktree sees the full history, and the worktree's own git
 branch shows up as a bookmark:
 

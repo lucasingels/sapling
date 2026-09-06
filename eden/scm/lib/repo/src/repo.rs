@@ -270,8 +270,15 @@ impl Repo {
         self.repo_name.as_ref().map(|s| s.as_ref())
     }
 
+    /// The repo config file `--local` refers to. A dotgit linked worktree shares it with
+    /// the main checkout, the way git shares `.git/config`.
     pub fn config_path(&self) -> PathBuf {
-        self.dot_hg_path.join(self.ident.config_repo_file())
+        let dot_path = if self.ident.is_dot_git() {
+            &self.shared_dot_hg_path
+        } else {
+            &self.dot_hg_path
+        };
+        dot_path.join(self.ident.config_repo_file())
     }
 
     /// Identity used by the working copy.

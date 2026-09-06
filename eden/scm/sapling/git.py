@@ -515,7 +515,10 @@ def calculate_new_config(old_config: str, maintained_config: str):
 def update_and_persist_config(repo, section, name, value):
     """edit config and save it to the repo's config file"""
     configfilename = repo.ui.identity.configrepofile()
-    configfilepath = repo.localvfs.join(configfilename)
+    # A dotgit linked worktree has no config of its own - it shares the main checkout's,
+    # the way git shares `.git/config`. Write where the config loader reads.
+    vfs = repo.sharedvfs if repo.ui.identity.dotdir().startswith(".git") else repo.localvfs
+    configfilepath = vfs.join(configfilename)
     rcutil.editconfig(repo.ui, configfilepath, section, name, value)
 
 

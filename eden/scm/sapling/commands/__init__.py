@@ -1997,7 +1997,10 @@ def editconfig(ui, repo, *values, **opts):
     if target == "local":
         if not repo:
             raise error.Abort(_("can't use --local outside a repository"))
-        paths = [repo.localvfs.join(ident.configrepofile())]
+        # A dotgit linked worktree shares the main checkout's config, the way git shares
+        # `.git/config`, so `--local` edits that file rather than a worktree-only one.
+        vfs = repo.sharedvfs if ident.dotdir().startswith(".git") else repo.localvfs
+        paths = [vfs.join(ident.configrepofile())]
     elif target == "system":
         paths = ident.systemconfigpaths()
         if not paths:

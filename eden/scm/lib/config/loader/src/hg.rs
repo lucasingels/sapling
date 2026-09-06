@@ -414,7 +414,10 @@ impl ConfigSetHgExt for ConfigSet {
                 errors.append(&mut local.load_repo(info, opts.clone()));
                 layers.push(Arc::new(local));
                 Some(
-                    read_set_repo_name(&layers, self, &info.dot_hg_path)
+                    // The reponame file lives in the shared dot dir, where
+                    // `read_repo_name_from_disk` looks for it. A linked git worktree that
+                    // used its own dot dir here just wrote a redundant copy.
+                    read_set_repo_name(&layers, self, &info.shared_dot_hg_path)
                         .map_err(|e| Errors(vec![e]))?,
                 )
             }
@@ -566,7 +569,17 @@ impl ConfigSetHgExt for ConfigSet {
 
         let opts = opts.source("repo").process_hgplain();
 
-        let repo_config_path = info.dot_hg_path.join(info.ident.config_repo_file());
+        // A linked git worktree keeps only per-worktree state (dirstate, bookmarks.current)
+        // in its own dot dir; the repo config is not per-worktree state. git shares
+        // `.git/config` across worktrees, so share `.git/sl/config` the same way. Worktrees
+        // are throwaway, so there is deliberately no per-worktree override: a setting made
+        // in one would disappear with it.
+        let dot_hg_path = if info.ident.is_dot_git() {
+            &info.shared_dot_hg_path
+        } else {
+            &info.dot_hg_path
+        };
+        let repo_config_path = dot_hg_path.join(info.ident.config_repo_file());
         errors.append(&mut self.load_path(repo_config_path, &opts));
 
         errors
@@ -580,15 +593,15 @@ impl ConfigSetHgExt for ConfigSet {
 
 /// Read repo name from various places (remotefilelog.reponame, paths.default, .hg/reponame).
 ///
-/// Try to write the reponame back to `.hg/reponame`, and set `remotefilelog.reponame`
-/// for code paths using them.
+/// Try to write the reponame back to `.hg/reponame` in the shared dot dir, and set
+/// `remotefilelog.reponame` for code paths using them.
 ///
 /// If `configs.forbid-empty-reponame` is `true`, raise if the repo name is empty
 /// and `paths.default` is set.
 fn read_set_repo_name(
     input_config: &dyn Config,
     output_config: &mut ConfigSet,
-    repo_path: &Path,
+    shared_dot_hg_path: &Path,
 ) -> crate::Result<String> {
     let (repo_name, source): (String, &str) = {
         let mut name: String = input_config.get_or_default("remotefilelog", "reponame")?;
@@ -603,7 +616,7 @@ fn read_set_repo_name(
             source = "paths.default";
         }
         if name.is_empty() {
-            match read_repo_name_from_disk(repo_path) {
+            match read_repo_name_from_disk(shared_dot_hg_path) {
                 Ok(s) => {
                     name = s;
                     source = "reponame file";
@@ -619,12 +632,12 @@ fn read_set_repo_name(
     if !repo_name.is_empty() {
         tracing::debug!("repo name: {:?} (from {})", &repo_name, source);
         if source != "reponame file" {
-            let need_rewrite = match read_repo_name_from_disk(repo_path) {
+            let need_rewrite = match read_repo_name_from_disk(shared_dot_hg_path) {
                 Ok(s) => s != repo_name,
                 Err(_) => true,
             };
             if need_rewrite {
-                let path = get_repo_name_path(repo_path);
+                let path = get_repo_name_path(shared_dot_hg_path);
                 match fs::write(path, &repo_name) {
                     Ok(_) => tracing::debug!("repo name: written to reponame file"),
                     Err(e) => tracing::warn!("repo name: cannot write to reponame file: {:?}", e),
@@ -1359,6 +1372,50 @@ mod tests {
         let mut cfg = ConfigSet::new();
         cfg.load(RepoInfo::NoRepo, Default::default()).unwrap();
         assert_eq!(cfg.get("treestate", "repackfactor").unwrap(), "3");
+    }
+
+    #[test]
+    fn test_load_dotgit_linked_worktree_shares_repo_config() {
+        let mut env = lock_env();
+
+        // Skip real dynamic config.
+        env.set("TESTTMP", Some("1"));
+
+        let dir = TempDir::with_prefix("test_load_worktree.").unwrap();
+        let main = dir.path().join("main");
+        let wt = dir.path().join("wt");
+        let main_git = main.join(".git");
+        let wt_git = main_git.join("worktrees/wt");
+
+        // Main checkout: a dotgit repo whose repo config sets two values.
+        write_file(main_git.join("HEAD"), "ref: refs/heads/main\n");
+        write_file(main_git.join("sl/config"), "[s]\nshared=main\nlocal=main\n");
+        write_file(main_git.join("sl/requires"), "store\ndotgit\n");
+
+        // Linked worktree: `.git` file pointing at the admin dir, which names the
+        // main `.git` as its common dir.
+        write_file(wt.join(".git"), &format!("gitdir: {}\n", wt_git.display()));
+        write_file(wt_git.join("commondir"), "../..\n");
+        write_file(wt_git.join("HEAD"), "ref: refs/heads/agent\n");
+        write_file(wt_git.join("sl/requires"), "store\ndotgit\nshared\n");
+
+        let info = RepoMinimalInfo::from_repo_root(wt.clone()).unwrap();
+        assert_eq!(info.shared_dot_hg_path, main_git.join("sl"));
+
+        // The worktree inherits the main checkout's repo config.
+        let cfg = load(RepoInfo::Disk(&info), &[]).unwrap();
+        assert_eq!(cfg.get("s", "shared"), Some("main".into()));
+        assert_eq!(cfg.get("s", "local"), Some("main".into()));
+
+        // A worktree has no config of its own: a stray file left in its dot dir by an
+        // older `sl` does not shadow the shared config.
+        write_file(wt_git.join("sl/config"), "[s]\nlocal=wt\n");
+        let cfg = load(RepoInfo::Disk(&info), &[]).unwrap();
+        assert_eq!(cfg.get("s", "shared"), Some("main".into()));
+        assert_eq!(cfg.get("s", "local"), Some("main".into()));
+
+        // The reponame file is written to the shared dot dir, not per worktree.
+        assert!(!wt_git.join("sl/reponame").exists());
     }
 
     #[test]
