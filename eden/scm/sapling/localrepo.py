@@ -2827,6 +2827,9 @@ class localrepository:
         user = ctx.user()
 
         isgit = git.isgitformat(self)
+        message = rewriteutil.newcommitmessage(self, ctx, ctx.description())
+        if message != ctx.description():
+            ctx.setdescription(message)
         rewriteutil.commitcheck(self, ctx)
         lock = self.lock()
         try:

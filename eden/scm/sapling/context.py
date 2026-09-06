@@ -1727,6 +1727,10 @@ class committablectx(basectx):
     def description(self):
         return self._text
 
+    def setdescription(self, text):
+        """Replace the description. Only valid before the commit is written."""
+        self._text = text
+
     def files(self):
         return sorted(self._status.modified + self._status.added + self._status.removed)
 

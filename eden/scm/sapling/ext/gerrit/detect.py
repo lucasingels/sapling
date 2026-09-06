@@ -32,7 +32,10 @@ def isgerrit(ui, repo):
         # Persist gerrit.url — single source of truth for CLI and ISL
         from sapling import rcutil
 
-        configfile = repo.localvfs.join(ui.identity.configrepofile())
+        # A dotgit linked worktree has no config of its own; it shares the main
+        # checkout's, so write there or the probe result is never read back.
+        vfs = repo.sharedvfs if ui.identity.dotdir().startswith(".git") else repo.localvfs
+        configfile = vfs.join(ui.identity.configrepofile())
         rcutil.editconfig(ui, configfile, "gerrit", "url", gerrit_url)
     return bool(gerrit_url)
 

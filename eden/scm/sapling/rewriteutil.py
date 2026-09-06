@@ -30,6 +30,17 @@ def copycommitmessage(repo, message, operation, source):
     return message
 
 
+def newcommitmessage(repo, ctx, message):
+    """Allow extensions to adjust the message of a commit being written.
+
+    The counterpart to ``copycommitmessage`` for commits that are not copies.
+    Runs before ``commitcheck``, so a check sees the final message. ``ctx`` is
+    the commit about to be written; its mutation info names the commits it
+    rewrites, if any. Returns the message to use.
+    """
+    return message
+
+
 def precheckmessage(repo, predecessors, message):
     """Allow extensions to validate a rewrite's final message upfront."""
 
