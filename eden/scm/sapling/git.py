@@ -42,6 +42,11 @@ DOTGIT_REQUIREMENT = "dotgit"
 # ref to push to when doing commit cloud uploads
 COMMIT_CLOUD_UPLOAD_REF = "refs/commitcloud/upload"
 
+# The refs a Gerrit change is uploaded to. A push to one of these is turned into
+# a code review change; the server never creates the ref itself, so there is
+# nothing for a remote bookmark to track.
+GERRIT_UPLOAD_REFS = ("refs/for/", "refs/drafts/")
+
 
 class GitCommandError(error.Abort):
     def __init__(self, git_command, git_exitcode, git_output, **kwargs):
@@ -847,9 +852,8 @@ def push(repo, dest, pushnode_to_pairs, force=False):
                 name = refname.withremote(remote).remotename
                 if pushnode is None:
                     namenodes.pop(name, None)
-                else:
-                    if not str(refname).startswith(COMMIT_CLOUD_UPLOAD_REF):
-                        namenodes[name] = pushnode
+                elif not _isuploadref(repo, refname):
+                    namenodes[name] = pushnode
             metalog.set_remotenames(namenodes)
             # Sync metalog changes back to git references from metalog.
             # This is also called at the end of a transaction, but that
@@ -860,6 +864,24 @@ def push(repo, dest, pushnode_to_pairs, force=False):
             # git refs sync here.
             repo.changelog.inner.updatereferences(metalog)
     return ret
+
+
+def _isuploadref(repo, refname):
+    """Whether ``refname`` is an upload ref rather than one the server keeps.
+
+    Recording a remote bookmark for one leaves a name pointing at a ref the
+    server will never have, which reads as if the commit had landed.
+    """
+    ref = str(refname)
+    if ref.startswith(COMMIT_CLOUD_UPLOAD_REF):
+        return True
+    # Only in a Gerrit repo: elsewhere `refs/for/x` is an ordinary ref that a
+    # push really does create. `gerrit.url` is the same gate the gerrit
+    # extension uses, and covers `sl gerrit publish` whether or not the
+    # extension is enabled.
+    if repo.ui.config("gerrit", "url"):
+        return ref.startswith(GERRIT_UPLOAD_REFS)
+    return False
 
 
 def listremote(repo, url, patterns):
