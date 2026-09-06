@@ -17,3 +17,6 @@ target/
 /build/Testing/Temporary/LastTest.log
 
 bin
+
+# Editor tooling
+/tombi.toml
