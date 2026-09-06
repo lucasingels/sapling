@@ -9,10 +9,17 @@ on:
         description: 'Rebuild and re-publish even if this version already has a bottle'
         type: boolean
         default: false
+  # Releasing on a push to main, rather than on a tag, is deliberate: GitHub
+  # scopes the Actions cache by ref and prefixes it with `refs/heads/`, so a tag
+  # push gets a private scope named `refs/heads/refs/tags/v1.2.3` that no later
+  # run can read. Every tagged release therefore started from a cold cache and
+  # threw its own away. Runs on the default branch share one scope, so the
+  # compile caches actually carry over. The release itself creates the tag.
   push:
-    tags:
-      - v*
-      - test-release-*
+    branches:
+      - main
+    paths:
+      - SAPLING_VERSION
 
 jobs:
   build-and-publish:
@@ -26,23 +33,20 @@ jobs:
     - uses: actions/checkout@v7
     - name: Set version
       run: |
+        # A push to main is triggered by SAPLING_VERSION itself, so the file is
+        # the version. A dispatch may name one explicitly.
         VERSION="${{ github.event.inputs.version }}"
-        if [ -z "$VERSION" ] && [ "${{ github.event_name }}" = "push" ]; then
-          VERSION="${{ github.ref_name }}"
-        fi
-        VERSION="${VERSION#v}"
-        # Fall back to the SAPLING_VERSION file when dispatched without a version.
         if [ -z "$VERSION" ]; then
           VERSION="$(cat SAPLING_VERSION)"
         fi
+        VERSION="${VERSION#v}"
         echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
         echo "TAG=v${VERSION}" >> "$GITHUB_ENV"
     - name: Skip if already published (unless forced)
-      # Creating the release from a dispatch run also creates the tag, which fires
-      # this workflow again as a tag push; that self-triggered run would rebuild
-      # pointlessly. Skip when the release already has a bottle asset. Pass
-      # force=true on manual dispatch to rebuild/re-publish an existing version
-      # anyway (e.g. to replace a bad bottle).
+      # Skip when the release already has a bottle asset, so re-running the
+      # workflow, or a push that touches SAPLING_VERSION without changing it,
+      # does not rebuild and re-publish. Pass force=true on manual dispatch to
+      # rebuild an existing version anyway (e.g. to replace a bad bottle).
       run: |
         if [ "${{ github.event.inputs.force }}" = "true" ]; then
           echo "force=true requested; building v${VERSION}."
@@ -75,7 +79,11 @@ jobs:
         path: |
           ${{ env.BREW_CACHE }}/cargo_cache/registry/index
           ${{ env.BREW_CACHE }}/cargo_cache/registry/cache
-        key: ${{ runner.os }}-${{ runner.arch }}-brew-cargo-registry-${{ hashFiles('eden/scm/Cargo.lock') }}
+        # Not Cargo.lock: it is gitignored (eden/scm/.gitignore) and so never
+        # checked out, which made hashFiles return empty and the key a constant
+        # that actions/cache would never overwrite once saved, leaving the
+        # registry frozen at whatever the first run downloaded.
+        key: ${{ runner.os }}-${{ runner.arch }}-brew-cargo-registry-${{ hashFiles('eden/scm/**/Cargo.toml') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-brew-cargo-registry-
     - name: Restore the yarn cache

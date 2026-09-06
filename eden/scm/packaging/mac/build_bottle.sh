@@ -56,8 +56,12 @@ git commit -m "sapling $VERSION"
 git push
 
 cd "$REPO_ROOT"
+# Pin the tag to the commit that was built. Without --target, gh tags the
+# default branch's HEAD, which may have moved on since this run started.
+TARGET_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 gh release create "v${VERSION}" \
   --repo lucasingels/sapling \
+  --target "$TARGET_SHA" \
   --title "Sapling v${VERSION}" \
   --generate-notes \
   "$BOTTLE_FILE" \
