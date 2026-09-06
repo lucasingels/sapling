@@ -39,7 +39,19 @@ dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT INT TERM
 vsix="$dir/${url##*/}"
 
-echo "downloading ${url##*/}"
-curl -fsSL -o "$vsix" "$url"
-"$cli" --install-extension "$vsix" --force
-"$cli" --list-extensions --show-versions 2>/dev/null | grep -i '^meta\.sapling-scm@' || true
+curl -fsSL -o "$vsix" "$url" || { echo "could not download $url" >&2; exit 1; }
+
+# Quiet unless something breaks. VS Code writes its progress to stderr, along
+# with a url.parse() deprecation warning of its own that cannot be silenced
+# through NODE_OPTIONS -- bin/code unsets it before running Electron as node.
+# Holding all of it back beats filtering the warning out by pattern, which
+# would rot as soon as the wording changes.
+if ! "$cli" --install-extension "$vsix" --force >"$dir/log" 2>&1; then
+  cat "$dir/log" >&2
+  exit 1
+fi
+
+version=$("$cli" --list-extensions --show-versions 2>/dev/null \
+  | grep -i 'sapling-scm@' | head -n 1 | sed 's/.*@//')
+[ -n "$version" ] || version=$(echo "$url" | sed -n 's|.*/extension-v\([^/]*\)/.*|\1|p')
+echo "Installed sapling vscode extension v${version}"
