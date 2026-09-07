@@ -70,6 +70,8 @@ describe('run-proxy', () => {
   });
 
   const killMock = jest.spyOn(process, 'kill').mockImplementation(() => true);
+  // process.kill is mocked to always succeed, so the exit poll would never see the process go away
+  jest.spyOn(lifecycle, 'waitForProcessToExit').mockResolvedValue(true);
   const exitMock = jest.spyOn(process, 'exit').mockImplementation((): never => {
     throw new Error('exited');
   });

@@ -205,8 +205,18 @@ def isl_cmd(ui, repo, **opts):
 
     force_no_app = ui.configbool("web", "force-no-app")
 
-    isl_args, server_cwd = get_dev_isl_args_cwd(ui) if dev else get_isl_args_cwd(ui)
+    isl_args, server_cwd, isl_replaced = (
+        get_dev_isl_args_cwd(ui) if dev else get_isl_args_cwd(ui)
+    )
     nodepath, entrypoint = isl_args
+    if isl_replaced and not kill and not force:
+        # The extracted ISL files were just replaced by a newer build. A server
+        # started from the old files may still be running (an open tab keeps it
+        # alive) and, because it reads its asset list once at startup, it would
+        # serve the new index.html but 404 every new asset, leaving a blank page.
+        # Restart it regardless of what the version check says.
+        ui.note_err(_("ISL files were updated; restarting any running server\n"))
+        force = True
     webview.open_isl(
         {
             "repoCwd": repo.root,
@@ -237,9 +247,14 @@ def isl_cmd(ui, repo, **opts):
     )
 
 
-def untar(tar_path, dest_dir) -> Dict[str, str]:
-    """untar to the destination directory, return the tar metadata (dict)"""
+def untar(tar_path, dest_dir) -> Tuple[Dict[str, str], bool]:
+    """untar to the destination directory
+
+    Return the tar metadata (dict) and whether a previous extraction in
+    dest_dir was replaced by this call.
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    replaced = False
     with tarfile.open(tar_path, "r", format=tarfile.PAX_FORMAT) as tar:
         # build-tar.py sets the "source_hash" but if it doesn't, use the file
         # size as an approx.
@@ -255,6 +270,7 @@ def untar(tar_path, dest_dir) -> Dict[str, str]:
             pass
         # extract if changed
         if source_hash != existing_source_hash:
+            replaced = bool(existing_source_hash)
             # Delete the existing directory. Rename first for better
             # compatibility on Windows.
             if os.path.isdir(dest_dir):
@@ -277,7 +293,7 @@ def untar(tar_path, dest_dir) -> Dict[str, str]:
             # write source_hash so we can skip extractall() next time
             with open(existing_source_hash_path, "wb") as f:
                 f.write(source_hash.encode())
-        return tar.pax_headers or {}
+        return tar.pax_headers or {}, replaced
 
 
 def resolve_path(candidates, which=shutil.which) -> Optional[str]:
@@ -299,7 +315,8 @@ def find_nodejs(ui) -> str:
     return node_path
 
 
-def get_isl_args_cwd(ui) -> Tuple[List[str], str]:
+def get_isl_args_cwd(ui) -> Tuple[List[str], str, bool]:
+    """Return (node args, server cwd, whether an older ISL extraction was replaced)"""
     # find "isl-dist.tar.xz"
     isl_dist_name = "isl-dist.tar.xz"
     candidates = ui.configlist("web", "isl-dist-path") + [
@@ -319,19 +336,20 @@ def get_isl_args_cwd(ui) -> Tuple[List[str], str]:
     dest_dir = os.path.join(data_dir, "Sapling", "ISL")
     ui.note_err(_("extracting %s to %s\n") % (isl_tar_path, dest_dir))
     try:
-        tar_metadata = untar(isl_tar_path, dest_dir)
+        tar_metadata, replaced = untar(isl_tar_path, dest_dir)
     except Exception as e:
         raise error.Abort(_("cannot extract ISL: %s") % (e,))
 
     # the args are: node entry_point ...
     node_path = find_nodejs(ui)
     entry_point = tar_metadata.get("entry_point") or "isl-server/dist/run-proxy.js"
-    return [node_path, entry_point], dest_dir
+    return [node_path, entry_point], dest_dir, replaced
 
 
-def get_dev_isl_args_cwd(ui) -> Tuple[List[str], str]:
+def get_dev_isl_args_cwd(ui) -> Tuple[List[str], str, bool]:
     node_path = find_nodejs(ui)
     entry_point = "isl-server/dist/run-proxy.js"
-    return [node_path, entry_point], os.path.normpath(
+    cwd = os.path.normpath(
         os.path.join(os.path.dirname(sys.executable), "..", "addons")
     )
+    return [node_path, entry_point], cwd, False

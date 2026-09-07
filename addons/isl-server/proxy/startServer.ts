@@ -731,6 +731,11 @@ export async function killServerIfItExists(
       `could not kill previous Sapling Web server process with PID ${pid}. This instance may no longer be running.`,
     );
   }
+  // process.kill only sends the signal. Wait for the old server to actually release the port,
+  // otherwise the fresh server we start right after this may fail to bind to it.
+  if (!(await lifecycle.waitForProcessToExit(pid))) {
+    info(`warning: previous Sapling Web server process ${pid} has not exited yet`);
+  }
   return pid;
 }
 

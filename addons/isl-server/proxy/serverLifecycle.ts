@@ -114,3 +114,35 @@ export function validateServerChallengeResponse(v: unknown): v is ServerChalleng
     typeof (v as ServerChallengeResponse).pid === 'number'
   );
 }
+
+/**
+ * Wait for a process to exit, polling with signal 0.
+ * Resolves true once the process is gone, false if it is still alive after `timeoutMs`.
+ */
+export function waitForProcessToExit(
+  pid: number,
+  timeoutMs = 3000,
+  intervalMs = 50,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const isAlive = (): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return new Promise(resolve => {
+    const poll = () => {
+      if (!isAlive()) {
+        resolve(true);
+      } else if (Date.now() >= deadline) {
+        resolve(false);
+      } else {
+        setTimeout(poll, intervalMs);
+      }
+    };
+    poll();
+  });
+}

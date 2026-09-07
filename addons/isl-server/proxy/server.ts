@@ -69,6 +69,23 @@ export function startServer({
     ? ossSmartlogDir
     : path.join(originalProcessCwd, ossSmartlogDir);
 
+  // `sl web` extracts isl-dist.tar.xz into the directory containing serverRoot and records the
+  // tarball's hash in `.source_hash` there. When a newer sl re-extracts, the files under serverRoot
+  // are replaced in place while this process keeps running. Our asset allowlist is read once at
+  // startup, so we would serve the new index.html but 404 all of its new assets. Detect the swap and
+  // shut down so the next `sl web` starts a fresh server. In dev mode there is no `.source_hash`,
+  // which disables this check.
+  const sourceHashPath = path.join(serverRoot, '..', '.source_hash');
+  const initialSourceHash = readSourceHash(sourceHashPath);
+  const islFilesWereReplaced = (): boolean =>
+    initialSourceHash != null && readSourceHash(sourceHashPath) !== initialSourceHash;
+  const exitBecauseIslFilesWereReplaced = () => {
+    logInfo(
+      'ISL files on disk were replaced since this server started; exiting so the next `sl web` starts a fresh server',
+    );
+    process.exit(0);
+  };
+
   return new Promise(resolve => {
     try {
       const files = JSON.parse(
@@ -116,6 +133,14 @@ export function startServer({
      * Create HTTP(S) server.
      */
     const requestHandler: http.RequestListener = async (req, res) => {
+      if (islFilesWereReplaced()) {
+        res.writeHead(503, {'Content-Type': 'text/html'});
+        res.end(
+          '<html><body>Sapling Web was updated. Run <code>sl web</code> again to start a fresh server.</body></html>',
+          exitBecauseIslFilesWereReplaced,
+        );
+        return;
+      }
       if (req.url) {
         // Only the websocket is sensitive and requires the token.
         // Normal resource requests don't need to check the token.
@@ -175,6 +200,11 @@ export function startServer({
     const httpServer = server.listen(port, bind);
     const wsServer = new WebSocket.Server({noServer: true, path: '/ws'});
     wsServer.on('connection', async (socket, connectionRequest) => {
+      if (islFilesWereReplaced()) {
+        socket.once('close', exitBecauseIslFilesWereReplaced);
+        socket.close(CLOSED_AND_SHOULD_NOT_RECONNECT_CODE, 'Sapling Web was updated; run `sl web` again');
+        return;
+      }
       // We require websocket connections to contain the token as a URL search parameter.
       let providedToken: string | undefined;
       let cwd: string | undefined;
@@ -293,6 +323,14 @@ export function startServer({
 function checkIfServerShouldCleanItselfUp() {
   if (repositoryCache.numberOfActiveServers() === 0) {
     process.exit(0);
+  }
+}
+
+function readSourceHash(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, 'utf-8').trim();
+  } catch {
+    return undefined;
   }
 }
 
