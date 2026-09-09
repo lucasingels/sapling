@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6
+
+### 9 September 2026
+
+- Switching to a worktree from the worktree panel or a "checked out elsewhere" label now adds it to the current workspace and shows it in ISL, instead of reloading the window or replacing the workspace; right-click the switch button to open a new window. The command palette's switch command offers the same "Add to Workspace" choice, and removing a worktree drops it from the workspace
+- Creating a worktree no longer asks where to open it, in ISL or the command palette: it only creates the worktree, and the worktree panel is the way to switch to it
+
 ## 0.2.5
 
 ### 4 September 2026
