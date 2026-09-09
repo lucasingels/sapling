@@ -210,11 +210,3 @@
   background-color: var(--button-primary-background);
   color: var(--button-primary-foreground);
 }
-
-.worktreeSpinner {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: var(--pad);
-  padding: var(--pad);
-}

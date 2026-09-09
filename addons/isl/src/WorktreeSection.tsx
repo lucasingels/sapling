@@ -5,23 +5,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ReactNode} from 'react';
 import type {WorktreeEntry} from './types';
 
 import {Badge} from 'isl-components/Badge';
 import {Button} from 'isl-components/Button';
-import {Checkbox} from 'isl-components/Checkbox';
 import {Icon} from 'isl-components/Icon';
-import {RadioGroup} from 'isl-components/Radio';
 import {Subtle} from 'isl-components/Subtle';
 import {TextField} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useCallback, useState} from 'react';
+import {useContextMenu} from 'shared/ContextMenu';
 import {basename, dirname, guessPathSep, pathsAreIdentical} from 'shared/utils';
 import {defaultWorktreesDir, pickWorktreeDirName} from 'shared/worktreePaths';
 import serverAPI from './ClientToServerAPI';
-import {Column, Row} from './ComponentUtils';
+import {Row} from './ComponentUtils';
 import css from './CwdSelector.module.css';
 import {DropdownField, DropdownFields} from './DropdownFields';
 import {Internal} from './Internal';
@@ -169,6 +167,13 @@ function WorktreeRowWithHover({
   dismiss: () => unknown;
 }) {
   const appInfo = useAtomValue(applicationinfo);
+  const isBasecamp = appInfo?.isBasecamp === true;
+  // Right-click on the switch button offers a separate window instead.
+  const switchMenu = useContextMenu<HTMLButtonElement>(() =>
+    platform.platformName === 'vscode' && !isBasecamp
+      ? [{label: t('Open in New Window'), onClick: () => openWorktreeInWindow(wt.path, true)}]
+      : [],
+  );
   return (
     <div
       key={wt.path}
@@ -209,49 +214,23 @@ function WorktreeRowWithHover({
               <Icon icon="edit" />
             </Button>
           </Tooltip>
-          <Tooltip title={t('Switch to this worktree')}>
+          <Tooltip
+            title={
+              isBasecamp ? t('Open this worktree in a new tile') : t('Switch to this worktree')
+            }>
             <Button
               icon
               data-testid="worktree-switch-button"
-              onClick={async () => {
+              onClick={() => {
                 dismiss();
-                if (platform.platformName !== 'vscode') {
-                  changeCwd(wt.path);
+                if (isBasecamp) {
+                  // Basecamp has no shared workspace to add the worktree to.
+                  openWorktreeInWindow(wt.path, true);
                   return;
                 }
-                const isBasecamp = appInfo?.isBasecamp === true;
-                const newWindowLabel = isBasecamp ? t('Open in New Tile') : t('Open in New Window');
-                const choice = await showModal({
-                  type: 'confirm',
-                  title: <T>Switch Worktree</T>,
-                  icon: 'worktree',
-                  message: (
-                    <Column alignStart style={{gap: 'var(--pad)'}}>
-                      <Row>
-                        <T replace={{$path: <code>{wtBasename}</code>}}>
-                          Switch to worktree $path?
-                        </T>
-                      </Row>
-                      {!isBasecamp && (
-                        <Row>
-                          <Subtle>
-                            <T>Opening in current window will reload the editor.</T>
-                          </Subtle>
-                        </Row>
-                      )}
-                    </Column>
-                  ),
-                  buttons: isBasecamp
-                    ? [{label: newWindowLabel, primary: true}]
-                    : [
-                        {label: t('Open in Current Window')},
-                        {label: newWindowLabel, primary: true},
-                      ],
-                });
-                if (choice != null) {
-                  openWorktreeInWindow(wt.path, choice.label === newWindowLabel);
-                }
-              }}>
+                switchToWorktree(wt.path);
+              }}
+              onContextMenu={switchMenu}>
               <Icon icon="arrow-swap" />
             </Button>
           </Tooltip>
@@ -293,6 +272,7 @@ function WorktreeRowWithHover({
                   });
                   if (confirmed?.label === t('Remove')) {
                     await runOperation(new RemoveWorktreeOperation(wt.path), true);
+                    forgetWorktreeInWorkspace(wt.path);
                   }
                 }}>
                 <Icon icon="trash" />
@@ -357,40 +337,9 @@ function AddWorktreeButton({
       ),
     });
     if (result != null) {
-      // Only show the creating dialog if we're going to open the worktree after creation
-      const showSpinner = result.openIn !== 'none';
-      let spinnerDismiss: (() => void) | undefined;
-      if (showSpinner) {
-        spinnerDismiss = await new Promise<() => void>(resolve => {
-          showModal({
-            type: 'custom',
-            title: <T>Creating Worktree</T>,
-            icon: 'worktree',
-            component: ({returnResultAndDismiss}) => {
-              resolve(() => returnResultAndDismiss(undefined));
-              return (
-                <div className={css.worktreeSpinner}>
-                  <Icon icon="loading" />
-                  <T>Creating worktree at</T> <code>{result.destPath}</code>
-                </div>
-              );
-            },
-          });
-        });
-      }
-      try {
-        await runOperation(
-          new AddWorktreeOperation(result.destPath, result.label || undefined),
-          true,
-        );
-      } finally {
-        spinnerDismiss?.();
-      }
-      if (result.openIn === 'current') {
-        changeCwd(result.destPath);
-      } else if (result.openIn === 'new') {
-        serverAPI.postMessage({type: 'platform/openInNewWindow', path: result.destPath});
-      }
+      // Creating a worktree never opens or switches to it: the worktree panel is
+      // the way in, and the operation list already shows the progress.
+      await runOperation(new AddWorktreeOperation(result.destPath, result.label || undefined), true);
     }
   }, [dismiss, showModal, runOperation, defaultDestForLabel]);
 
@@ -407,7 +356,6 @@ function AddWorktreeButton({
 type AddWorktreeResult = {
   destPath: string;
   label: string;
-  openIn: 'current' | 'new' | 'none';
 };
 
 function AddWorktreeModal({
@@ -421,10 +369,6 @@ function AddWorktreeModal({
   const [customDest, setCustomDest] = useState<string | null>(null);
   const [label, setLabel] = useState('');
   const destPath = customDest ?? defaultDestForLabel(label);
-  const appInfo = useAtomValue(applicationinfo);
-  const isVSCode = platform.platformName === 'vscode';
-  const [openIn, setOpenIn] = useState<AddWorktreeResult['openIn']>(isVSCode ? 'new' : 'none');
-  const [activate, setActivate] = useState(false);
   const [isEditingPath, setIsEditingPath] = useState(false);
 
   return (
@@ -459,38 +403,6 @@ function AddWorktreeModal({
           </div>
         )}
       </div>
-      {isVSCode ? (
-        <RadioGroup
-          choices={
-            [
-              {
-                title: (
-                  <Row>
-                    {appInfo?.isBasecamp ? <T>Open in new tile</T> : <T>Open in new window</T>}
-                    <Badge>Recommended</Badge>
-                  </Row>
-                ),
-                value: 'new',
-              },
-              ...(appInfo?.isBasecamp
-                ? []
-                : [{title: <T>Open in current window</T>, value: 'current'}]),
-              {title: <T>Don't open</T>, value: 'none'},
-            ] as Array<{value: AddWorktreeResult['openIn']; title: ReactNode}>
-          }
-          current={openIn}
-          onChange={setOpenIn}
-        />
-      ) : (
-        <Checkbox
-          checked={activate}
-          onChange={checked => {
-            setActivate(checked);
-            setOpenIn(checked ? 'current' : 'none');
-          }}>
-          <T>Activate</T>
-        </Checkbox>
-      )}
       <div className={css.addWorktreeFormActions}>
         <Button
           primary
@@ -500,7 +412,6 @@ function AddWorktreeModal({
             returnResultAndDismiss({
               destPath: destPath.trim(),
               label: label.trim(),
-              openIn,
             })
           }>
           <T>Create</T>
@@ -551,6 +462,25 @@ export function changeCwd(newCwd: string) {
     cwd: newCwd,
   });
   serverAPI.cwdChanged();
+}
+
+/**
+ * Show the worktree at `path` in this ISL. In VS Code the worktree is first added
+ * to the current workspace as a folder (a no-op if it already is one), so the
+ * editor keeps its windows and workspace instead of reloading onto a bare folder.
+ */
+export function switchToWorktree(path: string) {
+  if (platform.platformName === 'vscode') {
+    serverAPI.postMessage({type: 'platform/addToWorkspace', path});
+  }
+  changeCwd(path);
+}
+
+/** After a worktree is removed, drop its folder from the VS Code workspace too. */
+export function forgetWorktreeInWorkspace(path: string) {
+  if (platform.platformName === 'vscode') {
+    serverAPI.postMessage({type: 'platform/removeFromWorkspace', path});
+  }
 }
 
 /** Ask the host platform to open `path` either in the current window or a new one. */

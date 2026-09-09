@@ -72,9 +72,7 @@ export type DiffId = string;
  * Short info about a Diff fetched in bulk for all diffs to render an overview
  */
 export type DiffSummary =
-  | GitHubDiffSummary
-  | GerritDiffSummary
-  | InternalTypes['PhabricatorDiffSummary'];
+  GitHubDiffSummary | GerritDiffSummary | InternalTypes['PhabricatorDiffSummary'];
 
 export type DiffCommentReaction = {
   name: string;
@@ -794,6 +792,8 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/openInNewWindow'; path: AbsolutePath}
   | {type: 'platform/openFolder'; path: AbsolutePath}
+  | {type: 'platform/addToWorkspace'; path: AbsolutePath}
+  | {type: 'platform/removeFromWorkspace'; path: AbsolutePath}
   | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}

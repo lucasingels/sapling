@@ -23,7 +23,12 @@ import type {CodeReviewIssue} from 'isl/src/firstPassCodeReview/types';
 import {arraysEqual} from 'isl/src/utils';
 import * as pathModule from 'node:path';
 import * as vscode from 'vscode';
-import {executeVSCodeCommand, openFolderInWindowOrTile} from './commands';
+import {
+  addFolderToWorkspace,
+  executeVSCodeCommand,
+  openFolderInWindowOrTile,
+  removeFolderFromWorkspace,
+} from './commands';
 import {PERSISTED_STORAGE_KEY_PREFIX, shouldOpenBeside} from './config';
 import {encodeSaplingDiffUri} from './DiffContentProvider';
 import {t} from './i18n';
@@ -148,6 +153,14 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
         case 'platform/openFolder': {
           const folderUri = vscode.Uri.file(message.path);
           vscode.commands.executeCommand('vscode.openFolder', folderUri, {forceNewWindow: false});
+          break;
+        }
+        case 'platform/addToWorkspace': {
+          addFolderToWorkspace(message.path);
+          break;
+        }
+        case 'platform/removeFromWorkspace': {
+          removeFolderFromWorkspace(message.path);
           break;
         }
         case 'platform/changeTitle': {

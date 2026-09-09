@@ -27,6 +27,7 @@ import {
   currRevsetForComparison,
   labelForComparison,
 } from 'shared/Comparison';
+import {pathsAreIdentical} from 'shared/utils';
 import {pickWorktreeDirName, WORKTREES_DIR_NAME} from 'shared/worktreePaths';
 import * as vscode from 'vscode';
 import {shouldOpenBeside} from './config';
@@ -69,6 +70,46 @@ export async function openFolderInWindowOrTile(
       t('Failed to open folder ($path)').replace('$path', path) + `: ${err}`,
     );
   }
+}
+
+/**
+ * Add `path` to the current workspace as another folder, keeping every folder already
+ * there. Unlike `vscode.openFolder` this neither reloads the window nor replaces a
+ * multi-root workspace. Returns false if VS Code refused the change.
+ */
+export function addFolderToWorkspace(path: string, label?: string): boolean {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const uri = vscode.Uri.file(path);
+  if (folders.some(folder => pathsAreIdentical(folder.uri.fsPath, uri.fsPath))) {
+    return true;
+  }
+  const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, {
+    uri,
+    name: label || undefined,
+  });
+  if (!added) {
+    vscode.window.showErrorMessage(
+      t('Failed to add $path to the workspace').replace('$path', path),
+    );
+  }
+  return added;
+}
+
+/** Remove `path` from the current workspace, if it is one of its folders. */
+export function removeFolderFromWorkspace(path: string): void {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const index = folders.findIndex(folder => pathsAreIdentical(folder.uri.fsPath, path));
+  if (index >= 0) {
+    vscode.workspace.updateWorkspaceFolders(index, 1);
+  }
+}
+
+/** Add the worktree to the workspace and show it in ISL, without reloading the window. */
+async function switchToWorktreeInWorkspace(path: string, label?: string): Promise<void> {
+  if (!addFolderToWorkspace(path, label)) {
+    return;
+  }
+  await vscode.commands.executeCommand('sapling.open-isl', vscode.Uri.file(path));
 }
 
 /**
@@ -134,24 +175,39 @@ export const vscodeCommands = {
       return;
     }
     const isBasecamp = Internal.isBasecamp?.() === true;
-    let forceNewWindow: boolean;
     if (isBasecamp) {
-      // Basecamp always opens worktrees as a new tile; there's no "current window" to switch.
-      forceNewWindow = true;
-    } else {
-      const choice = await vscode.window.showQuickPick(
-        [
-          {label: t('Open in Current Window'), forceNewWindow: false},
-          {label: t('Open in New Window'), forceNewWindow: true},
-        ],
-        {placeHolder: t('Opening in current window will reload the editor.')},
-      );
-      if (choice == null) {
-        return;
-      }
-      forceNewWindow = choice.forceNewWindow;
+      // Basecamp always opens worktrees as a new tile; there's no shared workspace to add to.
+      await openFolderInWindowOrTile(picked.worktree.path, true, picked.worktree.label);
+      return;
     }
-    await openFolderInWindowOrTile(picked.worktree.path, forceNewWindow, picked.worktree.label);
+    const choice = await vscode.window.showQuickPick(
+      [
+        {
+          label: t('Add to Workspace'),
+          description: t('Keeps the current window and workspace'),
+          action: 'workspace' as const,
+        },
+        {label: t('Open in New Window'), action: 'new' as const},
+        {
+          label: t('Open in Current Window'),
+          description: t('Reloads the window and replaces the workspace'),
+          action: 'current' as const,
+        },
+      ],
+      {placeHolder: t('How do you want to open the worktree?')},
+    );
+    if (choice == null) {
+      return;
+    }
+    if (choice.action === 'workspace') {
+      await switchToWorktreeInWorkspace(picked.worktree.path, picked.worktree.label);
+      return;
+    }
+    await openFolderInWindowOrTile(
+      picked.worktree.path,
+      choice.action === 'new',
+      picked.worktree.label,
+    );
   },
 
   ['sapling.worktree.add']: async function (this: RepositoryContext) {
@@ -212,29 +268,6 @@ export const vscodeCommands = {
       new AddWorktreeOperation(trimmedDestPath, label.trim() || undefined),
       t('Creating worktree...'),
     );
-
-    const isBasecamp = Internal.isBasecamp?.() === true;
-    const openChoice = await vscode.window.showQuickPick(
-      [
-        {
-          label: isBasecamp ? t('Open in New Tile') : t('Open in New Window'),
-          action: 'open' as const,
-          forceNewWindow: true,
-        },
-        ...(isBasecamp
-          ? []
-          : [{label: t('Open in Current Window'), action: 'open' as const, forceNewWindow: false}]),
-        {label: t("Don't open"), action: 'skip' as const, forceNewWindow: false},
-      ],
-      {placeHolder: t('Open the new worktree?')},
-    );
-    if (openChoice?.action === 'open') {
-      await openFolderInWindowOrTile(
-        trimmedDestPath,
-        openChoice.forceNewWindow,
-        label.trim() || undefined,
-      );
-    }
   },
 
   ['sapling.worktree.remove']: async function (this: RepositoryContext) {
@@ -269,12 +302,13 @@ export const vscodeCommands = {
     if (choice !== t('Remove')) {
       return;
     }
-    return runOperationWithProgress(
+    await runOperationWithProgress(
       this,
       repo,
       new RemoveWorktreeOperation(picked.worktree.path),
       t('Removing worktree...'),
     );
+    removeFolderFromWorkspace(picked.worktree.path);
   },
 
   ['sapling.worktree.rename']: async function (this: RepositoryContext) {

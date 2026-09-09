@@ -42,7 +42,12 @@ import {SubmitSingleCommitButton} from './SubmitSingleCommitButton';
 import {getSuggestedRebaseOperation, suggestedRebaseDestinations} from './SuggestedRebase';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
-import {changeCwd, openWorktreeInWindow, RenameWorktreeModal} from './WorktreeSection';
+import {
+  forgetWorktreeInWorkspace,
+  openWorktreeInWindow,
+  RenameWorktreeModal,
+  switchToWorktree,
+} from './WorktreeSection';
 import {tracker} from './analytics';
 import {clipboardLinkHtml} from './clipboard';
 import {
@@ -875,46 +880,38 @@ export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
 }
 
 /**
- * On VS Code, opens a menu to choose current vs. new window; elsewhere (no
- * concept of "windows") it switches cwd directly.
+ * Switches this ISL to the worktree. In VS Code the worktree is added to the
+ * current workspace first, so nothing reloads; right-click offers a new window
+ * instead. Basecamp has no shared workspace, so there it opens a new tile.
  */
 function OpenWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
   const appInfo = useAtomValue(applicationinfo);
   const isVSCode = platform.platformName === 'vscode';
-  const openMenu = useContextMenu<HTMLButtonElement>((): Array<ContextMenuItem> => [
-    ...(appInfo?.isBasecamp
-      ? []
-      : [
-          {
-            label: t('Open in Current Window'),
-            onClick: () => openWorktreeInWindow(wt.path, false),
-          } as ContextMenuItem,
-        ]),
-    {
-      label: appInfo?.isBasecamp ? t('Open in New Tile') : t('Open in New Window'),
-      onClick: () => openWorktreeInWindow(wt.path, true),
-    },
-  ]);
-  const title = isVSCode
-    ? t('Open worktree $name', {replace: {$name: name}})
+  const isBasecamp = appInfo?.isBasecamp === true;
+  const openMenu = useContextMenu<HTMLButtonElement>((): Array<ContextMenuItem> =>
+    isVSCode && !isBasecamp
+      ? [{label: t('Open in New Window'), onClick: () => openWorktreeInWindow(wt.path, true)}]
+      : [],
+  );
+  const title = isBasecamp
+    ? t('Open worktree $name in a new tile', {replace: {$name: name}})
     : t('Switch to worktree $name', {replace: {$name: name}});
   return (
     <Tooltip title={title} delayMs={250}>
       <Button
         icon
         aria-label={title}
-        aria-haspopup={isVSCode ? 'menu' : undefined}
         data-testid="checked-out-elsewhere-open-button"
         onClick={e => {
-          if (isVSCode) {
-            // useContextMenu already stops propagation and prevents default.
-            openMenu(e);
-            return;
-          }
           e.stopPropagation();
           e.preventDefault();
-          changeCwd(wt.path);
-        }}>
+          if (isBasecamp) {
+            openWorktreeInWindow(wt.path, true);
+            return;
+          }
+          switchToWorktree(wt.path);
+        }}
+        onContextMenu={openMenu}>
         <Icon icon="arrow-swap" />
       </Button>
     </Tooltip>
@@ -991,6 +988,7 @@ function RemoveWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
           });
           if (confirmed?.label === t('Remove')) {
             await runOperation(new RemoveWorktreeOperation(wt.path), true);
+            forgetWorktreeInWorkspace(wt.path);
           }
         }}>
         <Icon icon="trash" />
