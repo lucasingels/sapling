@@ -38,6 +38,7 @@ pyfail = { version = "0.1.0", path = "modules/pyfail" }
 pyfilelint = { version = "0.1.0", path = "modules/pyfilelint" }
 pyfilewalk = { version = "0.1.0", path = "modules/pyfilewalk" }
 pyformatutil = { version = "0.1.0", path = "modules/pyformatutil" }
+pygerrit = { version = "0.1.0", path = "modules/pygerrit" }
 pyfs = { version = "0.1.0", path = "modules/pyfs" }
 pygitcompat = { version = "0.1.0", path = "modules/pygitcompat" }
 pygitstore = { version = "0.1.0", path = "modules/pygitstore" }
