@@ -17,7 +17,7 @@ import {Logger} from 'isl-server/src/logger';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {nextTick} from 'shared/testUtils';
 import * as vscode from 'vscode';
-import {VSCodeReposList} from '../VSCodeRepo';
+import {VSCodeRepo, VSCodeReposList} from '../VSCodeRepo';
 
 export class MockLogger extends Logger {
   write() {
@@ -330,5 +330,78 @@ describe('subscribeWithinAllRepos', () => {
     expect(cb).not.toHaveBeenCalled();
 
     reposList.dispose();
+  });
+});
+
+describe('SCM commit input box', () => {
+  let foldersEmitter: TypedEventEmitter<'value', vscode.WorkspaceFoldersChangeEvent>;
+  beforeEach(() => {
+    foldersEmitter = new TypedEventEmitter();
+    (vscode.workspace.onDidChangeWorkspaceFolders as jest.Mock).mockImplementation(cb => {
+      foldersEmitter.on('value', cb);
+      return {dispose: () => foldersEmitter.off('value', cb)};
+    });
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    repositoryCache.clearCache();
+    foldersEmitter.removeAllListeners();
+  });
+
+  const ENABLED = new Set<EnabledSCMApiFeature>(['blame', 'sidebar']);
+
+  const addRepo = (path: string) => {
+    foldersEmitter.emit('value', {
+      added: [{name: 'folder', index: 0, uri: vscode.Uri.file(path)}],
+      removed: [],
+    });
+  };
+
+  const createdSourceControl = () =>
+    (vscode.scm.createSourceControl as jest.Mock).mock.results[0].value as vscode.SourceControl;
+
+  it('enables the input box with a placeholder', async () => {
+    const repos = new VSCodeReposList(mockLogger, mockTracker, ENABLED);
+    addRepo('/path/to/repo1');
+    await nextTick();
+
+    const sourceControl = createdSourceControl();
+    expect(sourceControl.inputBox.enabled).toBe(true);
+    expect(sourceControl.inputBox.visible).toBe(true);
+    expect(sourceControl.inputBox.placeholder).toBe('Commit message');
+
+    repos.dispose();
+  });
+
+  it('wires acceptInputCommand to sapling.commit with the source control as an argument', async () => {
+    const repos = new VSCodeReposList(mockLogger, mockTracker, ENABLED);
+    addRepo('/path/to/repo1');
+    await nextTick();
+
+    const sourceControl = createdSourceControl();
+    expect(sourceControl.acceptInputCommand).toEqual({
+      command: 'sapling.commit',
+      title: 'Commit',
+      arguments: [sourceControl],
+    });
+
+    repos.dispose();
+  });
+
+  it('resolves the VSCodeRepo for its source control, and forgets it on dispose', async () => {
+    const repos = new VSCodeReposList(mockLogger, mockTracker, ENABLED);
+    addRepo('/path/to/repo1');
+    await nextTick();
+
+    const sourceControl = createdSourceControl();
+    const vscodeRepo = VSCodeRepo.repoForSourceControl(sourceControl);
+    expect(vscodeRepo).not.toBeUndefined();
+    expect(vscodeRepo?.rootPath).toBe('/path/to/repo1');
+    expect(VSCodeRepo.repoForRepository(vscodeRepo!.repo)).toBe(vscodeRepo);
+
+    repos.dispose();
+
+    expect(VSCodeRepo.repoForSourceControl(sourceControl)).toBeUndefined();
   });
 });

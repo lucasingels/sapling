@@ -7,14 +7,20 @@
 
 import type {Repository} from 'isl-server/src/Repository';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
-import type {Operation} from 'isl/src/operations/Operation';
 import type {PartiallySelectedDiffCommit} from 'isl/src/stackEdit/diffSplitTypes';
-import type {AbsolutePath, OperationProgress, RepoRelativePath, WorktreeInfo} from 'isl/src/types';
+import type {
+  AbsolutePath,
+  CommandArg,
+  OperationProgress,
+  RepoRelativePath,
+  WorktreeInfo,
+} from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 
 import {repoRelativePathForAbsolutePath} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {findPublicAncestor} from 'isl-server/src/utils';
+import {Operation} from 'isl/src/operations/Operation';
 import {AddWorktreeOperation} from 'isl/src/operations/AddWorktreeOperation';
 import {RemoveWorktreeOperation} from 'isl/src/operations/RemoveWorktreeOperation';
 import {RenameWorktreeOperation} from 'isl/src/operations/RenameWorktreeOperation';
@@ -42,6 +48,7 @@ import {
 } from './DiffContentProvider';
 import {t} from './i18n';
 import {Internal} from './Internal';
+import {VSCodeRepo} from './VSCodeRepo';
 
 /**
  * Open a folder in the current window, a new window, or (inside Basecamp) a new tile
@@ -113,6 +120,136 @@ async function switchToWorktreeInWorkspace(path: string, label?: string): Promis
 }
 
 /**
+ * Runs `sl commit`, committing all (or a subset of) uncommitted changes.
+ *
+ * This deliberately does NOT reuse `isl/src/operations/CommitOperation`: that class (via
+ * `CommitBaseOperation`) reads jotai atoms transitively through `isl/src/serverAPIState`,
+ * which imports `isl/src/platform`. `platform.ts` reads `window.islPlatform` at module load
+ * time, and there is no `window` global in the extension host - importing it crashes the
+ * extension outright (verified: `ReferenceError: location is not defined` from
+ * `BrowserPlatform.ts`, pulled in transitively). `getArgs()` itself doesn't depend on any of
+ * that state, but the import graph does, so we mirror the command construction here instead.
+ */
+class VSCodeCommitOperation extends Operation {
+  constructor(
+    private message: string,
+    private filePathsToCommit?: Array<RepoRelativePath>,
+  ) {
+    super(filePathsToCommit ? 'CommitFileSubsetOperation' : 'CommitOperation');
+  }
+
+  getArgs(): Array<CommandArg> {
+    const args: Array<CommandArg> = ['commit', '--addremove', '--message', this.message];
+    if (this.filePathsToCommit != null) {
+      args.push(
+        ...this.filePathsToCommit.map(file => ({type: 'repo-relative-file' as const, path: file})),
+      );
+    }
+    return args;
+  }
+}
+
+/**
+ * Runs `sl amend`, amending all (or a subset of) uncommitted changes into the current commit.
+ *
+ * Same import-safety reasoning as `VSCodeCommitOperation` applies to
+ * `isl/src/operations/AmendOperation`. It's worth calling out specifically here because,
+ * unlike `CommitOperation`, its `getArgs()` DOES depend on the atom it reads
+ * (`restackBehaviorAtom`, surfaced as `--config amend.autorestack=...`). Reusing the class
+ * would silently apply ISL's hardcoded default restack behavior instead of the user's actual
+ * `sl` config, changing real amend behavior. So this omits that flag entirely and lets `sl
+ * amend` fall back to whatever the user has configured (or its own default).
+ */
+class VSCodeAmendOperation extends Operation {
+  constructor(
+    private message: string | undefined,
+    private filePathsToAmend?: Array<RepoRelativePath>,
+  ) {
+    super(filePathsToAmend ? 'AmendFileSubsetOperation' : 'AmendOperation');
+  }
+
+  getArgs(): Array<CommandArg> {
+    const args: Array<CommandArg> = ['amend', '--addremove'];
+    if (this.filePathsToAmend != null) {
+      args.push(
+        ...this.filePathsToAmend.map(file => ({type: 'repo-relative-file' as const, path: file})),
+      );
+    }
+    // `this.message == null` means "keep the existing commit message" - not the same as `''`.
+    if (this.message != null) {
+      args.push('--message', this.message);
+    }
+    return args;
+  }
+}
+
+function hasUnresolvedConflicts(repo: Repository): boolean {
+  return repo.getMergeConflicts()?.files?.some(file => file.status === 'U') ?? false;
+}
+
+/**
+ * Wrap a command implementation invoked from the SCM input box (`acceptInputCommand`) or the
+ * `scm/title` menu, both of which VS Code invokes with the relevant `vscode.SourceControl`.
+ */
+function commandWithSourceControl(
+  handler: (this: RepositoryContext, vscodeRepo: VSCodeRepo) => unknown | Thenable<unknown>,
+) {
+  return function (this: RepositoryContext, sourceControl: vscode.SourceControl | undefined) {
+    if (sourceControl == null) {
+      return;
+    }
+    const vscodeRepo = VSCodeRepo.repoForSourceControl(sourceControl);
+    if (vscodeRepo == null) {
+      return;
+    }
+    return handler.apply(this, [vscodeRepo]);
+  };
+}
+
+/**
+ * Wrap a command implementation invoked from `scm/resourceState/context`. VS Code invokes the
+ * command once with the clicked resource state plus the full array of selected resource
+ * states (which includes the clicked one).
+ */
+function commandWithResourceStates(
+  handler: (
+    this: RepositoryContext,
+    repo: Repository,
+    vscodeRepo: VSCodeRepo,
+    filePaths: Array<RepoRelativePath>,
+  ) => unknown | Thenable<unknown>,
+) {
+  return function (
+    this: RepositoryContext,
+    resourceState: vscode.SourceControlResourceState | undefined,
+    resourceStates: Array<vscode.SourceControlResourceState> | undefined,
+  ) {
+    const states = resourceStates?.length
+      ? resourceStates
+      : resourceState != null
+        ? [resourceState]
+        : [];
+    if (states.length === 0) {
+      return;
+    }
+    const {fsPath} = states[0].resourceUri;
+    const repo = repositoryCache.cachedRepositoryForPath(fsPath);
+    if (repo == null) {
+      vscode.window.showErrorMessage(t(`No repository found for file ${fsPath}`));
+      return;
+    }
+    const vscodeRepo = VSCodeRepo.repoForRepository(repo);
+    if (vscodeRepo == null) {
+      return;
+    }
+    const filePaths = states.map(state =>
+      repoRelativePathForAbsolutePath(state.resourceUri.fsPath, repo),
+    );
+    return handler.apply(this, [repo, vscodeRepo, filePaths]);
+  };
+}
+
+/**
  * VS Code Commands registered by the Sapling extension.
  */
 export const vscodeCommands = {
@@ -150,6 +287,94 @@ export const vscodeCommands = {
       return;
     }
     return runOperation(this, repo, new RevertOperation([path]));
+  }),
+
+  ['sapling.commit']: commandWithSourceControl(async function (
+    this: RepositoryContext,
+    vscodeRepo: VSCodeRepo,
+  ) {
+    const {repo} = vscodeRepo;
+    const message = vscodeRepo.getCommitMessage().trim();
+    if (message === '') {
+      vscode.window.showWarningMessage(t('Cannot commit with an empty commit message'));
+      return;
+    }
+    if (hasUnresolvedConflicts(repo)) {
+      vscode.window.showWarningMessage(
+        t('Cannot commit while there are unresolved merge conflicts'),
+      );
+      return;
+    }
+    if (vscodeRepo.getUncommittedChanges().length === 0) {
+      vscode.window.showWarningMessage(t('There are no uncommitted changes to commit'));
+      return;
+    }
+    await runOperation(this, repo, new VSCodeCommitOperation(message));
+    vscodeRepo.setCommitMessage('');
+  }),
+
+  ['sapling.amend']: commandWithSourceControl(async function (
+    this: RepositoryContext,
+    vscodeRepo: VSCodeRepo,
+  ) {
+    const {repo} = vscodeRepo;
+    if (hasUnresolvedConflicts(repo)) {
+      vscode.window.showWarningMessage(
+        t('Cannot amend while there are unresolved merge conflicts'),
+      );
+      return;
+    }
+    if (vscodeRepo.getUncommittedChanges().length === 0) {
+      vscode.window.showWarningMessage(t('There are no uncommitted changes to amend'));
+      return;
+    }
+    const inputMessage = vscodeRepo.getCommitMessage().trim();
+    const message = inputMessage === '' ? undefined : inputMessage;
+    await runOperation(this, repo, new VSCodeAmendOperation(message));
+    if (message != null) {
+      vscodeRepo.setCommitMessage('');
+    }
+  }),
+
+  ['sapling.commit-selected-files']: commandWithResourceStates(async function (
+    this: RepositoryContext,
+    repo: Repository,
+    vscodeRepo: VSCodeRepo,
+    filePaths: Array<RepoRelativePath>,
+  ) {
+    const message = vscodeRepo.getCommitMessage().trim();
+    if (message === '') {
+      vscode.window.showWarningMessage(t('Cannot commit with an empty commit message'));
+      return;
+    }
+    if (hasUnresolvedConflicts(repo)) {
+      vscode.window.showWarningMessage(
+        t('Cannot commit while there are unresolved merge conflicts'),
+      );
+      return;
+    }
+    await runOperation(this, repo, new VSCodeCommitOperation(message, filePaths));
+    vscodeRepo.setCommitMessage('');
+  }),
+
+  ['sapling.amend-selected-files']: commandWithResourceStates(async function (
+    this: RepositoryContext,
+    repo: Repository,
+    vscodeRepo: VSCodeRepo,
+    filePaths: Array<RepoRelativePath>,
+  ) {
+    if (hasUnresolvedConflicts(repo)) {
+      vscode.window.showWarningMessage(
+        t('Cannot amend while there are unresolved merge conflicts'),
+      );
+      return;
+    }
+    const inputMessage = vscodeRepo.getCommitMessage().trim();
+    const message = inputMessage === '' ? undefined : inputMessage;
+    await runOperation(this, repo, new VSCodeAmendOperation(message, filePaths));
+    if (message != null) {
+      vscodeRepo.setCommitMessage('');
+    }
   }),
 
   ['sapling.worktree.switch']: async function (this: RepositoryContext) {

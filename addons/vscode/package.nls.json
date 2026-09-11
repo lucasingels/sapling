@@ -37,5 +37,9 @@
   "sapling.worktree.switch-command": "Switch Worktree",
   "sapling.worktree.add-command": "Add Worktree",
   "sapling.worktree.remove-command": "Remove Worktree",
-  "sapling.worktree.rename-command": "Rename Worktree"
+  "sapling.worktree.rename-command": "Rename Worktree",
+  "sapling.commit-command": "Commit",
+  "sapling.amend-command": "Amend",
+  "sapling.commit-selected-files-command": "Commit Selected Files",
+  "sapling.amend-selected-files-command": "Amend Selected Files"
 }

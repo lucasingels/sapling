@@ -6,7 +6,7 @@
   "publisher": "meta",
   "license": "MIT",
   "engines": {
-    "vscode": "^1.63.0"
+    "vscode": "^1.105.0"
   },
   "categories": [
     "SCM Providers"
@@ -255,6 +255,30 @@
         "icon": "$(file-symlink-file)"
       },
       {
+        "command": "sapling.commit",
+        "title": "%sapling.commit-command%",
+        "category": "%sapling.command-category%",
+        "icon": "$(check)"
+      },
+      {
+        "command": "sapling.amend",
+        "title": "%sapling.amend-command%",
+        "category": "%sapling.command-category%",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "sapling.commit-selected-files",
+        "title": "%sapling.commit-selected-files-command%",
+        "category": "%sapling.command-category%",
+        "when": false
+      },
+      {
+        "command": "sapling.amend-selected-files",
+        "title": "%sapling.amend-selected-files-command%",
+        "category": "%sapling.command-category%",
+        "when": false
+      },
+      {
         "command": "sapling.worktree.switch",
         "title": "%sapling.worktree.switch-command%",
         "category": "%sapling.command-category%"
@@ -351,9 +375,29 @@
           "command": "sapling.revert-file",
           "group": "inline",
           "when": "scmProvider == sapling && scmResourceGroup == changes"
+        },
+        {
+          "command": "sapling.commit-selected-files",
+          "group": "1_modification",
+          "when": "scmProvider == sapling && scmResourceGroup == changes"
+        },
+        {
+          "command": "sapling.amend-selected-files",
+          "group": "1_modification",
+          "when": "scmProvider == sapling && scmResourceGroup == changes"
         }
       ],
       "scm/title": [
+        {
+          "command": "sapling.commit",
+          "group": "navigation",
+          "when": "scmProvider == sapling"
+        },
+        {
+          "command": "sapling.amend",
+          "group": "navigation",
+          "when": "scmProvider == sapling"
+        },
         {
           "command": "sapling.open-isl",
           "group": "navigation",
@@ -382,7 +426,7 @@
     "@types/jest": "29.5.12",
     "@types/node": "^16.11.7",
     "@types/react-dom": "^19",
-    "@types/vscode": "^1.34.0",
+    "@types/vscode": "1.105.0",
     "@vitejs/plugin-react": "^6.0.1",
     "cross-env": "7.0.3",
     "isl": "0.1.0",

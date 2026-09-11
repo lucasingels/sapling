@@ -227,6 +227,11 @@ export type SaplingResourceGroup = vscode.SourceControlResourceGroup & {
  * This handles vscode-api integrations, but defers to Repository for any actual work.
  */
 export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
+  /** Every `VSCodeRepo` that has a `SourceControl`, keyed by that `SourceControl`.
+   * Lets `sapling.commit`/`sapling.amend` map the `vscode.SourceControl` they're invoked
+   * with (from `acceptInputCommand` or the `scm/title` menu) back to a `VSCodeRepo`. */
+  private static bySourceControl = new Map<vscode.SourceControl, VSCodeRepo>();
+
   private disposables: Array<vscode.Disposable> = [];
   private sourceControl?: vscode.SourceControl;
   private resourceGroups?: Record<
@@ -258,8 +263,13 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
       vscode.Uri.file(repo.info.repoRoot),
     );
     this.sourceControl.quickDiffProvider = this;
-    this.sourceControl.inputBox.enabled = false;
-    this.sourceControl.inputBox.visible = false;
+    this.sourceControl.inputBox.placeholder = t('Commit message');
+    this.sourceControl.acceptInputCommand = {
+      command: 'sapling.commit',
+      title: t('Commit'),
+      arguments: [this.sourceControl],
+    };
+    VSCodeRepo.bySourceControl.set(this.sourceControl, this);
     this.resourceGroups = {
       changes: this.sourceControl.createResourceGroup('changes', t('Uncommitted Changes')),
       untracked: this.sourceControl.createResourceGroup('untracked', t('Untracked Changes')),
@@ -394,7 +404,37 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
     return this.resourceGroups;
   }
 
+  /** Find the `VSCodeRepo` that owns a given `vscode.SourceControl`, e.g. from an
+   * `acceptInputCommand` or `scm/title` menu invocation. */
+  public static repoForSourceControl(sourceControl: vscode.SourceControl): VSCodeRepo | undefined {
+    return VSCodeRepo.bySourceControl.get(sourceControl);
+  }
+
+  /** Find the `VSCodeRepo` for a given `Repository`, e.g. from a `scm/resourceState/context`
+   * menu invocation, which only gives us a file uri to resolve a `Repository` from. */
+  public static repoForRepository(repo: Repository): VSCodeRepo | undefined {
+    for (const vscodeRepo of VSCodeRepo.bySourceControl.values()) {
+      if (vscodeRepo.repo === repo) {
+        return vscodeRepo;
+      }
+    }
+    return undefined;
+  }
+
+  public getCommitMessage(): string {
+    return this.sourceControl?.inputBox.value ?? '';
+  }
+
+  public setCommitMessage(value: string): void {
+    if (this.sourceControl != null) {
+      this.sourceControl.inputBox.value = value;
+    }
+  }
+
   public dispose() {
+    if (this.sourceControl != null) {
+      VSCodeRepo.bySourceControl.delete(this.sourceControl);
+    }
     this.disposables.forEach(d => d?.dispose());
   }
 

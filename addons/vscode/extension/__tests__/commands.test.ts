@@ -8,6 +8,7 @@
 import {Set as ImSet} from 'immutable';
 import type {Repository} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
+import {Logger} from 'isl-server/src/logger';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
 import type {RunnableOperation, WorktreeInfo} from 'isl/src/types';
 import fs from 'node:fs';
@@ -18,6 +19,14 @@ import {shouldOpenBeside} from '../config';
 import {encodeDeletedFileUri} from '../DeletedFileContentProvider';
 import {encodeSaplingDiffUri} from '../DiffContentProvider';
 import {Internal} from '../Internal';
+import {VSCodeRepo} from '../VSCodeRepo';
+
+class MockLogger extends Logger {
+  write() {
+    // noop
+  }
+}
+const mockLogger = new MockLogger();
 
 // Mock vscode command
 jest.mock('vscode', () => {
@@ -971,5 +980,256 @@ describe('worktree commands', () => {
       vscode.Uri.file(siblingWorktree.path),
       {forceNewWindow: true},
     );
+  });
+});
+
+describe('commit and amend commands', () => {
+  const repoRoot = '/repo/root';
+  const ctx = {} as never;
+
+  const mockShowWarningMessage = vscode.window.showWarningMessage as jest.MockedFunction<
+    typeof vscode.window.showWarningMessage
+  >;
+
+  const makeMockRepo = (overrides: Partial<jest.Mocked<Repository>> = {}) =>
+    ({
+      info: {repoRoot},
+      onDidDispose: jest.fn(),
+      subscribeToUncommittedChanges: jest.fn().mockReturnValue({dispose: jest.fn()}),
+      onChangeConflictState: jest.fn().mockReturnValue({dispose: jest.fn()}),
+      // Empty by default so constructing `VSCodeRepo` doesn't populate resource groups
+      // (which needs a real `vscode.Uri.joinPath`, unavailable in the vscode-uri-backed mock).
+      // Tests that need uncommitted changes set this again before invoking a command, since
+      // the commit/amend guards call `repo.getUncommittedChanges()` fresh, not from the cache.
+      getUncommittedChanges: jest.fn().mockReturnValue({files: {value: []}}),
+      getMergeConflicts: jest.fn().mockReturnValue(undefined),
+      runOrQueueOperation: jest.fn(
+        (
+          _ctx: RepositoryContext,
+          operation: RunnableOperation,
+          onProgress: (progress: {
+            id: string;
+            kind: 'exit';
+            exitCode: number;
+            timestamp: number;
+          }) => void,
+        ) => {
+          onProgress({id: operation.id, kind: 'exit', exitCode: 0, timestamp: Date.now()});
+          return Promise.resolve('ran' as const);
+        },
+      ),
+      ...overrides,
+    }) as unknown as jest.Mocked<Repository>;
+
+  let mockRepo: jest.Mocked<Repository>;
+  let vscodeRepo: VSCodeRepo;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockRepo = makeMockRepo();
+    vscodeRepo = new VSCodeRepo(mockRepo, mockLogger, new Set(['sidebar']));
+  });
+
+  afterEach(() => {
+    vscodeRepo.dispose();
+  });
+
+  const getSourceControl = () =>
+    (vscode.scm.createSourceControl as jest.Mock).mock.results[0].value as vscode.SourceControl;
+
+  describe('sapling.commit', () => {
+    const commitCommand = vscodeCommands['sapling.commit'];
+
+    it('runs commit with the input box message and clears it', async () => {
+      mockRepo.getUncommittedChanges.mockReturnValue({
+        files: {value: [{path: 'a.txt', status: 'M'}]},
+      } as unknown as ReturnType<Repository['getUncommittedChanges']>);
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = 'my commit message';
+
+      await commitCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: ['commit', '--addremove', '--message', 'my commit message'],
+        }),
+        expect.anything(),
+      );
+      expect(sourceControl.inputBox.value).toBe('');
+    });
+
+    it('refuses to commit with an empty message', async () => {
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = '   ';
+
+      await commitCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Cannot commit with an empty commit message',
+      );
+    });
+
+    it('refuses to commit when there are no uncommitted changes', async () => {
+      mockRepo.getUncommittedChanges.mockReturnValue({
+        files: {value: []},
+      } as unknown as ReturnType<Repository['getUncommittedChanges']>);
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = 'my commit message';
+
+      await commitCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'There are no uncommitted changes to commit',
+      );
+    });
+
+    it('refuses to commit while there are unresolved merge conflicts', async () => {
+      mockRepo.getMergeConflicts.mockReturnValue({
+        state: 'loaded',
+        files: [{path: 'a.txt', status: 'U', conflictType: 'both_changed'}],
+      } as unknown as ReturnType<Repository['getMergeConflicts']>);
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = 'my commit message';
+
+      await commitCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Cannot commit while there are unresolved merge conflicts',
+      );
+    });
+
+    it('does nothing when invoked without a known source control', async () => {
+      await commitCommand.apply(ctx, [undefined]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sapling.amend', () => {
+    const amendCommand = vscodeCommands['sapling.amend'];
+
+    it('amends with the input box message and clears it', async () => {
+      mockRepo.getUncommittedChanges.mockReturnValue({
+        files: {value: [{path: 'a.txt', status: 'M'}]},
+      } as unknown as ReturnType<Repository['getUncommittedChanges']>);
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = 'new message';
+
+      await amendCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: ['amend', '--addremove', '--message', 'new message'],
+        }),
+        expect.anything(),
+      );
+      expect(sourceControl.inputBox.value).toBe('');
+    });
+
+    it('amends keeping the existing message when the input box is empty', async () => {
+      mockRepo.getUncommittedChanges.mockReturnValue({
+        files: {value: [{path: 'a.txt', status: 'M'}]},
+      } as unknown as ReturnType<Repository['getUncommittedChanges']>);
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = '';
+
+      await amendCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: ['amend', '--addremove'],
+        }),
+        expect.anything(),
+      );
+      // Nothing was consumed from the input box, so it's left alone.
+      expect(sourceControl.inputBox.value).toBe('');
+    });
+
+    it('refuses to amend when there are no uncommitted changes', async () => {
+      mockRepo.getUncommittedChanges.mockReturnValue({
+        files: {value: []},
+      } as unknown as ReturnType<Repository['getUncommittedChanges']>);
+      const sourceControl = getSourceControl();
+
+      await amendCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'There are no uncommitted changes to amend',
+      );
+    });
+
+    it('refuses to amend while there are unresolved merge conflicts', async () => {
+      mockRepo.getMergeConflicts.mockReturnValue({
+        state: 'loaded',
+        files: [{path: 'a.txt', status: 'U', conflictType: 'both_changed'}],
+      } as unknown as ReturnType<Repository['getMergeConflicts']>);
+      const sourceControl = getSourceControl();
+
+      await amendCommand.apply(ctx, [sourceControl]);
+
+      expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Cannot amend while there are unresolved merge conflicts',
+      );
+    });
+  });
+
+  describe('sapling.commit-selected-files / sapling.amend-selected-files', () => {
+    const commitSelected = vscodeCommands['sapling.commit-selected-files'];
+    const amendSelected = vscodeCommands['sapling.amend-selected-files'];
+
+    const fileUri = (name: string) => vscode.Uri.file(`${repoRoot}/${name}`);
+    const resourceState = (name: string) => ({resourceUri: fileUri(name)}) as vscode.SourceControlResourceState;
+
+    beforeEach(() => {
+      jest.spyOn(repositoryCache, 'cachedRepositoryForPath').mockReturnValue(mockRepo);
+    });
+
+    it('commits only the selected files', async () => {
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = 'partial commit';
+      const clicked = resourceState('a.txt');
+      const selection = [clicked, resourceState('b.txt')];
+
+      await commitSelected.apply(ctx, [clicked, selection]);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: [
+            'commit',
+            '--addremove',
+            '--message',
+            'partial commit',
+            {type: 'repo-relative-file', path: 'a.txt'},
+            {type: 'repo-relative-file', path: 'b.txt'},
+          ],
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('amends only the selected files', async () => {
+      const sourceControl = getSourceControl();
+      sourceControl.inputBox.value = '';
+      const clicked = resourceState('a.txt');
+
+      await amendSelected.apply(ctx, [clicked, [clicked]]);
+
+      expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          args: ['amend', '--addremove', {type: 'repo-relative-file', path: 'a.txt'}],
+        }),
+        expect.anything(),
+      );
+    });
   });
 });
