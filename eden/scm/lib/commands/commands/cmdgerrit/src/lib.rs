@@ -151,6 +151,16 @@ fn check_opts(ctx: &ReqCtx<GerritOpts>, subcmd: &str, allowed: &[&str]) -> Resul
 fn run_publish(ctx: ReqCtx<GerritOpts>, repo: &Repo) -> Result<u8> {
     let is_wip = ctx.opts.wip || ctx.opts.draft;
 
+    // Whatever followed the subcommand is the REV to publish, as it is for
+    // `review` and `refresh`. Without one `sl push` starts from `.`, so the
+    // stack you are checked out on is the default rather than a special case.
+    let rest = &ctx.opts.args[1..];
+    abort_if!(
+        rest.len() > 1,
+        "gerrit publish takes at most one revision, got {}",
+        rest.len()
+    );
+
     // Build push args, delegating branch resolution to sl push. The
     // `--to-prefix refs/for/` turns the guessed bookmark (e.g. `master`)
     // into a Gerrit review ref (`refs/for/master`) rather than a direct
@@ -161,6 +171,10 @@ fn run_publish(ctx: ReqCtx<GerritOpts>, repo: &Repo) -> Result<u8> {
         "--to-prefix".to_string(),
         "refs/for/".to_string(),
     ];
+    if let Some(rev) = rest.first() {
+        args.push("-r".to_string());
+        args.push(rev.clone());
+    }
 
     // Collect Gerrit push options as %key or %key=value suffixes.
     let mut suffixes: Vec<String> = Vec::new();
@@ -278,13 +292,14 @@ pub fn doc() -> &'static str {
 
     Subcommands::
 
-      publish [OPTIONS]   Push commits to Gerrit for review
+      publish [REV]       Push commits to Gerrit for review
       view -u USER        Show a user's open changes as a graph
       pull CHANGE         Pull a change and its open ancestors
       review [REV]        Show or update the change for a commit
       refresh [REV]       Update the local cache of review status
 
-    ``publish`` pushes the current commit to Gerrit for review. Branch
+    ``publish`` pushes a commit and the unpublished commits below it to
+    Gerrit for review, defaulting to the commit you are on. Branch
     resolution is delegated to ``sl push``; the destination is rewritten to
     ``refs/for/<branch>`` via ``--to-prefix`` so the change lands in Gerrit's
     review queue rather than being pushed directly to the branch. Gerrit push
@@ -305,7 +320,8 @@ pub fn doc() -> &'static str {
 
     Examples::
 
-      sl gerrit publish                          push current commit for review
+      sl gerrit publish                          push current stack for review
+      sl gerrit publish abc123                   push another stack for review
       sl gerrit publish --wip                    push as work-in-progress
       sl gerrit publish --topic my-feature       set topic
       sl gerrit publish -l Verified+1            set a label

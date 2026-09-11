@@ -23,6 +23,7 @@ import {MS_PER_DAY} from 'shared/constants';
 import serverAPI from '../ClientToServerAPI';
 import {OSSCommitMessageFieldSchema} from '../CommitInfoView/OSSCommitMessageFieldsSchema';
 import {t, T} from '../i18n';
+import {succeedableRevset} from '../types';
 import {showModal} from '../useModal';
 import {allDiffSummaries, codeReviewProvider} from './CodeReviewInfo';
 import './GerritBadge.css';
@@ -158,8 +159,16 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return false;
   }
 
-  submitOperation(_commits: Array<CommitInfo>, options?: {draft?: boolean}): Operation {
-    return new GerritPublishOperation(options);
+  submitOperation(commits: Array<CommitInfo>, options?: {draft?: boolean}): Operation {
+    // `sl push` sends the rev it is given and every unpublished commit below
+    // it, so the top of what was asked for is what to publish. Commits arrive
+    // in dag order (roots first). With no rev `sl push` starts from `.`, which
+    // would publish whichever stack is checked out rather than this one.
+    const top = commits.at(-1);
+    return new GerritPublishOperation({
+      draft: options?.draft,
+      rev: top == null ? undefined : succeedableRevset(top.hash),
+    });
   }
 
   submitCommandName(): string {
@@ -184,11 +193,32 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
   }
 
   getSupportedStackActions(
-    _hash: Hash,
-    _dag: Dag,
-    _diffSummaries: Map<string, DiffSummary>,
+    hash: Hash,
+    dag: Dag,
+    diffSummaries: Map<string, DiffSummary>,
   ): {resubmittableStack?: Array<CommitInfo>; submittableStack?: Array<CommitInfo>} {
-    return {};
+    // The stack is the draft commits at and above `hash`, roots first, which is
+    // the order `submitOperation` reads the top of the stack off. Obsolete
+    // commits are left out: a push would not send them.
+    const stack = dag.getBatch(
+      dag.sortAsc(dag.nonObsolete(dag.descendants(hash, {within: dag.draft()}))),
+    );
+
+    // Already up for review, so publishing sends a new patchset rather than
+    // creating a change. A Change-Id alone does not mean pushed -- the
+    // commit-msg hook stamps one on every commit -- so this asks the server's
+    // summary, which only exists once the change does. Unlike
+    // `getSubmittableDiffs`, a missing summary here means "not on the server":
+    // `diffSummaries` has finished loading by the time this is called.
+    const resubmittableStack = stack.filter(commit => {
+      if (commit.diffId == null) {
+        return false;
+      }
+      const summary = diffSummaries.get(commit.diffId) as GerritDiffSummary | undefined;
+      return summary != null && summary.state !== 'MERGED' && summary.state !== 'ABANDONED';
+    });
+
+    return {resubmittableStack, submittableStack: this.getSubmittableDiffs(stack, diffSummaries)};
   }
 
   getSubmittableDiffs(
