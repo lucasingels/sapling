@@ -823,7 +823,14 @@ def origpath(ui, repo, filepath):
     if not origbackuppath:
         return filepath + ".orig"
 
-    origbackuppath = origbackuppath.replace("@DOTDIR@", ui.identity.dotdir())
+    # "@DOTDIR@" means the repo's real dot dir, which is not always
+    # "<root>/<dotdir>": in a git worktree ".git" is a *file* pointing at
+    # .git/worktrees/<name>, so joining the relative dotdir onto the working
+    # copy root yields a path whose ".git" component is not a directory, and
+    # every command that writes a backup fails with ENOTDIR. Substitute the
+    # resolved dot dir instead - repo.wjoin() passes absolute paths through.
+    if "@DOTDIR@" in origbackuppath:
+        origbackuppath = origbackuppath.replace("@DOTDIR@", repo.localvfs.base)
 
     # Convert filepath from an absolute path into a path inside the repo.
     filepathfromroot = util.normpath(os.path.relpath(filepath, start=repo.root))
