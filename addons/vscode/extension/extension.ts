@@ -21,7 +21,9 @@ import {Internal} from './Internal';
 import {VSCodeReposList} from './VSCodeRepo';
 import {makeExtensionApi} from './api/api';
 import {InlineBlameProvider} from './blame/blame';
+import {BlameCodeLensProvider} from './blame/blameCodeLens';
 import {registerCommands} from './commands';
+import {CommentsProvider} from './comments/CommentsProvider';
 import {getCLICommand} from './config';
 import {ensureTranslationsLoaded} from './i18n';
 import {registerISLCommands} from './islWebviewPanel';
@@ -58,10 +60,13 @@ export async function activate(
     const reposList = new VSCodeReposList(logger, extensionTracker, enabledSCMApiFeatures);
     context.subscriptions.push(reposList);
     if (enabledSCMApiFeatures.has('blame')) {
-      context.subscriptions.push(new InlineBlameProvider(reposList, ctx));
+      const inlineBlameProvider = new InlineBlameProvider(reposList, ctx);
+      context.subscriptions.push(inlineBlameProvider);
+      context.subscriptions.push(new BlameCodeLensProvider(inlineBlameProvider, reposList, ctx));
     }
     context.subscriptions.push(registerSaplingDiffContentProvider(ctx));
     context.subscriptions.push(new DeletedFileContentProvider());
+    context.subscriptions.push(new CommentsProvider(reposList, logger));
     const inlineCommentsProvider = Internal.registerInlineCommentsProvider?.(
       context,
       extensionTracker,

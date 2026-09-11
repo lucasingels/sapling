@@ -70,6 +70,12 @@ jest.mock('isl-server/src/Repository', () => {
     public onChangeConflictState = jest.fn();
     public getUncommittedChanges = jest.fn();
     public getMergeConflicts = jest.fn();
+    public getHeadCommit = jest.fn();
+    public subscribeToHeadCommit = jest.fn();
+    public subscribeToSmartlogCommitsBeginFetching = jest.fn();
+    public getRunningOperation = jest.fn();
+    public getAllDiffIds = jest.fn(() => []);
+    public codeReviewProvider = undefined;
   }
   return {
     Repository: MockRepository as unknown as Repository,

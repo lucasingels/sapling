@@ -14,6 +14,7 @@
   "settings.isl.showOpenOrFocusButtonOnEditorTitle.description": "Show the Open or Focus Interactive Smartlog button on the active Editor's title/tab bar.",
   "settings.commandPath.description": "Controls which executable to use for running Sapling commands. Default: use `sl` on your PATH. Restart required to take effect.",
   "settings.showInlineBlame.description": "Whether to show inline blame annotations next to your cursor when browsing files in Sapling repos.",
+  "settings.showBlameCodeLens.description": "Whether to show a CodeLens above the file and above each function/method/class with the most recent commit that touched it, so blame is visible without hovering.",
   "settings.showDiffComments.description": "Whether to show Phabricator Diff comments and inline code suggestions.",
   "settings.diffViewMode.description": "Whether to show code suggestion with unified or split diff view",
   "settings.markConflictingFilesResolvedOnSave.description": "Whether to mark files with merge conflicts as resolved after saving them with no remaining conflict markers.",
@@ -33,6 +34,7 @@
   "settings.isl.inlineSignalsRenderMode.enumDescriptions.diagnostics": "Render inline signals as standard VS Code diagnostics and squiggles.",
   "sapling.open-comments-command": "Open Code Review Comments Panel",
   "sapling.toggle-inline-comments-command": "Toggle Show/Hide Inline Code Review Comments",
+  "sapling.refresh-comments-command": "Refresh Code Review Comments",
   "sapling.open-multi-diff-file-head-command": "Open Working Copy File",
   "sapling.worktree.switch-command": "Switch Worktree",
   "sapling.worktree.add-command": "Add Worktree",
@@ -41,5 +43,6 @@
   "sapling.commit-command": "Commit",
   "sapling.amend-command": "Amend",
   "sapling.commit-selected-files-command": "Commit Selected Files",
-  "sapling.amend-selected-files-command": "Amend Selected Files"
+  "sapling.amend-selected-files-command": "Amend Selected Files",
+  "sapling.pull-command": "Pull"
 }

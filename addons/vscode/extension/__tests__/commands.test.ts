@@ -1003,6 +1003,12 @@ describe('commit and amend commands', () => {
       // the commit/amend guards call `repo.getUncommittedChanges()` fresh, not from the cache.
       getUncommittedChanges: jest.fn().mockReturnValue({files: {value: []}}),
       getMergeConflicts: jest.fn().mockReturnValue(undefined),
+      getHeadCommit: jest.fn().mockReturnValue(undefined),
+      subscribeToHeadCommit: jest.fn().mockReturnValue({dispose: jest.fn()}),
+      subscribeToSmartlogCommitsBeginFetching: jest.fn().mockReturnValue({dispose: jest.fn()}),
+      getRunningOperation: jest.fn().mockReturnValue(undefined),
+      getAllDiffIds: jest.fn().mockReturnValue([]),
+      codeReviewProvider: undefined,
       runOrQueueOperation: jest.fn(
         (
           _ctx: RepositoryContext,

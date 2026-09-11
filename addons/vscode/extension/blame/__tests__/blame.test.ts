@@ -14,7 +14,7 @@ import {GitHubCodeReviewProvider} from 'isl-server/src/github/githubCodeReviewPr
 import {mockLogger} from 'shared/testUtils';
 import {contextForRepo} from '../blame';
 import {getDiffBlameHoverMarkup} from '../blameHover';
-import {getRealignedBlameInfo, shortenAuthorName} from '../blameUtils';
+import {getRealignedBlameInfo, mostRecentCommitInRange, shortenAuthorName} from '../blameUtils';
 
 jest.mock('vscode', () => jest.requireActual('../../../__mocks__/vscode'));
 
@@ -180,6 +180,47 @@ describe('blame utils', () => {
 
     it('shows email if no name is given', () => {
       expect(shortenAuthorName('john@example.com')).toEqual('john@example.com');
+    });
+  });
+
+  describe('mostRecentCommitInRange', () => {
+    const older = {hash: 'A', date: new Date('2020-01-01')} as CommitInfo;
+    const newer = {hash: 'B', date: new Date('2022-01-01')} as CommitInfo;
+
+    it('picks the most recently authored commit within the line range', () => {
+      const blame: Array<[string, CommitInfo | undefined]> = [
+        ['a\n', older],
+        ['b\n', newer],
+        ['c\n', older],
+      ];
+      expect(mostRecentCommitInRange(blame, 0, 2)).toEqual(newer);
+    });
+
+    it('ignores lines outside the given range', () => {
+      const blame: Array<[string, CommitInfo | undefined]> = [
+        ['a\n', newer],
+        ['b\n', older],
+        ['c\n', older],
+      ];
+      expect(mostRecentCommitInRange(blame, 1, 2)).toEqual(older);
+    });
+
+    it('skips lines with no commit info (local changes)', () => {
+      const blame: Array<[string, CommitInfo | undefined]> = [
+        ['local edit\n', undefined],
+        ['b\n', older],
+      ];
+      expect(mostRecentCommitInRange(blame, 0, 1)).toEqual(older);
+    });
+
+    it('returns undefined when no line in range has commit info', () => {
+      const blame: Array<[string, CommitInfo | undefined]> = [['local edit\n', undefined]];
+      expect(mostRecentCommitInRange(blame, 0, 0)).toBeUndefined();
+    });
+
+    it('clamps the end of the range to the length of the blame', () => {
+      const blame: Array<[string, CommitInfo | undefined]> = [['a\n', older]];
+      expect(mostRecentCommitInRange(blame, 0, 100)).toEqual(older);
     });
   });
 });

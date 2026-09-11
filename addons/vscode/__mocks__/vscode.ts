@@ -8,8 +8,9 @@
 import type * as vscode from 'vscode';
 
 // don't want to mock vscode.Uri, so use library for it
-import {URI} from 'vscode-uri';
-export const Uri = URI;
+import {URI, Utils} from 'vscode-uri';
+// vscode-uri's URI doesn't implement the `joinPath` static that real vscode.Uri has.
+export const Uri = Object.assign(URI, {joinPath: Utils.joinPath});
 
 export const env = proxyMissingFieldsWithJestFn({
   sessionId: 'test-session-id',
@@ -77,6 +78,69 @@ export class ThemeColor {
   constructor(public id: string) {}
 }
 
+export class Position {
+  constructor(
+    public line: number,
+    public character: number,
+  ) {}
+}
+
+export class Range {
+  public start: Position;
+  public end: Position;
+  constructor(startLine: number, startCharacter: number, endLine: number, endCharacter: number);
+  constructor(start: Position, end: Position);
+  constructor(a: number | Position, b: number | Position, c?: number, d?: number) {
+    if (typeof a === 'number') {
+      this.start = new Position(a, b as number);
+      this.end = new Position(c as number, d as number);
+    } else {
+      this.start = a;
+      this.end = b as Position;
+    }
+  }
+}
+
+export const CommentMode = {
+  Editing: 0,
+  Preview: 1,
+};
+
+export const CommentThreadCollapsibleState = {
+  Collapsed: 0,
+  Expanded: 1,
+};
+
+export const CommentThreadState = {
+  Unresolved: 0,
+  Resolved: 1,
+};
+
+export const comments = {
+  createCommentController: jest.fn(
+    (id: string, label: string): vscode.CommentController =>
+      ({
+        id,
+        label,
+        createCommentThread: jest.fn(
+          (
+            uri: vscode.Uri,
+            range: vscode.Range,
+            threadComments: readonly vscode.Comment[],
+          ): vscode.CommentThread => ({
+            uri,
+            range,
+            comments: threadComments,
+            collapsibleState: CommentThreadCollapsibleState.Collapsed,
+            canReply: true,
+            dispose: jest.fn(),
+          }),
+        ),
+        dispose: jest.fn(),
+      }) as unknown as vscode.CommentController,
+  ),
+};
+
 export class Disposable implements vscode.Disposable {
   static from(...disposables: vscode.Disposable[]): vscode.Disposable {
     return new Disposable(() => {
@@ -110,13 +174,62 @@ function proxyMissingFieldsWithJestFn<T extends object>(t: T): T {
 }
 
 interface Event<T> {
-  (listener: (e: T) => unknown): unknown;
+  (listener: (e: T) => unknown): Disposable;
 }
 
 export class EventEmitter<T> {
-  event: Event<T> = () => undefined;
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  fire(_data: T): void {}
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  dispose(): void {}
+  private listeners: Array<(e: T) => unknown> = [];
+  event: Event<T> = (listener: (e: T) => unknown) => {
+    this.listeners.push(listener);
+    return new Disposable(() => {
+      this.listeners = this.listeners.filter(l => l !== listener);
+    });
+  };
+  fire(data: T): void {
+    for (const listener of this.listeners) {
+      listener(data);
+    }
+  }
+  dispose(): void {
+    this.listeners = [];
+  }
+}
+
+export class CodeLens {
+  readonly isResolved: boolean;
+  constructor(
+    public range: Range,
+    public command?: vscode.Command,
+  ) {
+    this.isResolved = command != null;
+  }
+}
+
+export enum SymbolKind {
+  File = 0,
+  Module = 1,
+  Namespace = 2,
+  Package = 3,
+  Class = 4,
+  Method = 5,
+  Property = 6,
+  Field = 7,
+  Constructor = 8,
+  Enum = 9,
+  Interface = 10,
+  Function = 11,
+  Variable = 12,
+  Constant = 13,
+  String = 14,
+  Number = 15,
+  Boolean = 16,
+  Array = 17,
+  Object = 18,
+  Key = 19,
+  Null = 20,
+  EnumMember = 21,
+  Struct = 22,
+  Event = 23,
+  Operator = 24,
+  TypeParameter = 25,
 }

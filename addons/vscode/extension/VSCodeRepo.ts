@@ -7,6 +7,7 @@
 
 import type {RepositoryReference} from 'isl-server/src/RepositoryCache';
 import type {ServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
+import type {DiffSummaries} from 'isl-server/src/CodeReviewProvider';
 import type {Logger} from 'isl-server/src/logger';
 import type {ChangedFile, RepoRelativePath} from 'isl/src/types';
 import {GeneratedStatus} from 'isl/src/types';
@@ -32,6 +33,7 @@ import {ResolveOperation, ResolveTool} from 'isl/src/operations/ResolveOperation
 import {diffCurrentCommit} from 'isl/src/stackEdit/diffSplit';
 import type {DiffCommit} from 'isl/src/stackEdit/diffSplitTypes';
 import * as path from 'path';
+import {debounce} from 'shared/debounce';
 import {beforeRevsetForComparison, ComparisonType} from 'shared/Comparison';
 import {filterFilesFromPatch, parsePatch} from 'shared/patch/parse';
 import {notEmpty} from 'shared/utils';
@@ -41,6 +43,7 @@ import SaplingFileDecorationProvider from './SaplingFileDecorationProvider';
 import {executeVSCodeCommand} from './commands';
 import {getCLICommand} from './config';
 import {t} from './i18n';
+import {buildPullStatusBarCommand, computeStatusBarInfoCommand} from './statusBar';
 
 const mergeConflictStartRegex = new RegExp('<{7}|>{7}|[|]{7}');
 
@@ -238,6 +241,8 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
     'changes' | 'untracked' | 'unresolved' | 'resolved',
     SaplingResourceGroup
   >;
+  private diffSummaries: DiffSummaries = new Map();
+  private lastRunningOperationId: string | undefined;
   public rootUri: vscode.Uri;
   public rootPath: string;
 
@@ -294,6 +299,73 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
       fileDecorationProvider,
     );
     this.updateResourceGroups();
+    this.initStatusBarCommands();
+  }
+
+  /**
+   * Populate `sourceControl.statusBarCommands` with the head commit/conflict/running-operation
+   * summary and a Pull action. This hangs off the per-repo `SourceControl` (rather than a
+   * standalone `window.createStatusBarItem`) so VS Code's own repository-picker/Auto mode
+   * decides when to show it, the same way it does for other SCM providers like git - there's
+   * no extension-facing API to detect or influence which repo is "active" in a multi-root
+   * workspace, so we don't try to reimplement that.
+   */
+  private initStatusBarCommands() {
+    if (this.sourceControl == null) {
+      return;
+    }
+    const sourceControl = this.sourceControl;
+
+    const refresh = debounce(() => this.renderStatusBarCommands(sourceControl), 300);
+    this.disposables.push(
+      this.repo.subscribeToHeadCommit(() => refresh()),
+      this.repo.subscribeToSmartlogCommitsBeginFetching(() => refresh()),
+      this.repo.subscribeToUncommittedChanges(() => refresh()),
+      this.repo.onChangeConflictState(() => refresh()),
+      {dispose: () => refresh.dispose()},
+    );
+
+    const reviewProvider = this.repo.codeReviewProvider;
+    if (reviewProvider != null) {
+      this.disposables.push(
+        reviewProvider.onChangeDiffSummaries(result => {
+          if (result.value != null) {
+            this.diffSummaries = result.value;
+          }
+          refresh();
+        }),
+      );
+      reviewProvider.triggerDiffSummariesFetch(this.repo.getAllDiffIds());
+    }
+
+    // There's no event for "a running operation started/finished" (operations report progress
+    // only to whichever caller started them), so poll the cheap synchronous getter and only
+    // re-render on an actual change, rather than unconditionally on a timer.
+    this.lastRunningOperationId = this.repo.getRunningOperation()?.id;
+    const pollHandle = setInterval(() => {
+      const id = this.repo.getRunningOperation()?.id;
+      if (id !== this.lastRunningOperationId) {
+        this.lastRunningOperationId = id;
+        refresh();
+      }
+    }, 1000);
+    pollHandle.unref?.();
+    this.disposables.push({dispose: () => clearInterval(pollHandle)});
+
+    this.renderStatusBarCommands(sourceControl);
+  }
+
+  private renderStatusBarCommands(sourceControl: vscode.SourceControl) {
+    const infoCommand = computeStatusBarInfoCommand({
+      conflicts: this.repo.getMergeConflicts(),
+      runningOperation: this.repo.getRunningOperation(),
+      headCommit: this.getDotCommit(),
+      diffSummaries: this.diffSummaries,
+    });
+    sourceControl.statusBarCommands = [
+      ...(infoCommand != null ? [infoCommand] : []),
+      buildPullStatusBarCommand(sourceControl),
+    ];
   }
 
   /** If this uri is for file inside the repo or not */

@@ -23,7 +23,15 @@ import {relativeDate} from 'isl/src/relativeDate';
 import {LRU} from 'shared/LRU';
 import {debounce} from 'shared/debounce';
 import {nullthrows} from 'shared/utils';
-import {DecorationRangeBehavior, MarkdownString, Position, Range, window, workspace} from 'vscode';
+import {
+  DecorationRangeBehavior,
+  EventEmitter,
+  MarkdownString,
+  Position,
+  Range,
+  window,
+  workspace,
+} from 'vscode';
 import {Internal} from '../Internal';
 import {getDiffBlameHoverMarkup} from './blameHover';
 import {getRealignedBlameInfo, shortenAuthorName} from './blameUtils';
@@ -41,7 +49,7 @@ type RepoCaches = {
   headHash: string;
   blameCache: LRU<string, CachedBlame>; // Caches file path -> file blame.
 };
-type CachedBlame = {
+export type CachedBlame = {
   baseBlameLines: Array<[line: string, info: CommitInfo | undefined]>;
   currentBlameLines:
     | undefined // undefined if not yet populated with local changes.
@@ -71,6 +79,11 @@ export function contextForRepo(ctx: RepositoryContext, repo: Repository): Reposi
  *
  * One line of blame is rendered next to your cursor, and re-rended every time the cursor moves.
  *
+ * The per-repo blame cache maintained here (`observedRepos`) and the fetch/realign logic
+ * (`fetchBlameIfMissing`, `getCachedBlame`, `onDidChangeBlame`) are also shared by
+ * `BlameCodeLensProvider`, so blame is only fetched from `sl` once per file regardless of how
+ * many surfaces display it.
+ *
  * TODO: instead of diffing with the current file contents, we could instead record all your edits
  * into linelog, and derive blame for that. That would give us timestamps for each change and a way
  * to quickly go backwards in time.
@@ -86,6 +99,14 @@ export class InlineBlameProvider implements Disposable {
   disposables: Array<Disposable> = [];
   observedRepos = new Map<string, RepoCaches>();
   decorationType = window.createTextEditorDecorationType({});
+
+  private readonly blameChangedEmitter = new EventEmitter<void>();
+  /**
+   * Fires whenever a file's cached blame is (re)populated or invalidated.
+   * Other consumers of the shared blame cache (e.g. `BlameCodeLensProvider`) can use this
+   * to know when to recompute, without needing to issue their own `sl blame` calls.
+   */
+  readonly onDidChangeBlame = this.blameChangedEmitter.event;
 
   constructor(
     private reposList: VSCodeReposList,
@@ -207,7 +228,7 @@ export class InlineBlameProvider implements Disposable {
     this.currentEditor = textEditor;
     this.currentPosition = textEditor?.selection.active;
     if (textEditor && this.isFile(textEditor) && this.currentPosition) {
-      const foundBlame = await this.fetchBlameIfMissing(textEditor);
+      const foundBlame = await this.fetchBlameIfMissing(textEditor.document);
       if (foundBlame) {
         // Update blame before showing in case keystrokes were pressed on load.
         this.updateBlame(textEditor.document);
@@ -221,9 +242,12 @@ export class InlineBlameProvider implements Disposable {
   /**
    * blame is fetched by calling `sl blame` only when the head commit or active file changes,
    * but not if the cursor moves or local edits are made.
+   *
+   * This is shared by any consumer of the blame cache (inline decorations, CodeLens, ...),
+   * so it only depends on the document, not on any particular editor/cursor state.
    */
-  private async fetchBlameIfMissing(textEditor: TextEditor): Promise<boolean> {
-    const uri = textEditor.document.uri;
+  async fetchBlameIfMissing(document: TextDocument): Promise<boolean> {
+    const uri = document.uri;
     const fileUri = uri.fsPath;
     if (this.filesBeingProcessed.has(fileUri)) {
       return false;
@@ -263,7 +287,7 @@ export class InlineBlameProvider implements Disposable {
       return false;
     }
 
-    const blame = await this.getBlame(textEditor, repoCaches?.headHash);
+    const blame = await this.getBlame(document, repoCaches?.headHash);
 
     if (blame.error) {
       this.ctx.tracker.error('BlameLoaded', 'BlameError', blame.error.message, {
@@ -294,14 +318,15 @@ export class InlineBlameProvider implements Disposable {
       baseBlameLines: blameLines,
       currentBlameLines: undefined,
     });
+    this.blameChangedEmitter.fire();
     return true;
   }
 
   private async getBlame(
-    textEditor: TextEditor,
+    document: TextDocument,
     baseHash: string,
   ): Promise<Result<Array<[line: string, commit: CommitInfo | undefined]>>> {
-    const uri = textEditor.document.uri.fsPath;
+    const uri = document.uri.fsPath;
     const repo = this.reposList.repoForPath(uri)?.repo;
     try {
       const targetRepo = nullthrows(repo);
@@ -439,6 +464,7 @@ export class InlineBlameProvider implements Disposable {
 
         repoCaches.headHash = head.hash;
         repoCaches.blameCache.clear();
+        this.blameChangedEmitter.fire();
         this.switchFocusedEditor(window.activeTextEditor);
       }),
     );
@@ -475,7 +501,8 @@ export class InlineBlameProvider implements Disposable {
     this.filesBeingProcessed.delete(uri);
   }
 
-  private getCachedBlame(document: TextDocument): CachedBlame | undefined {
+  /** Read-only access to the cached blame for a document, shared with other blame consumers. */
+  getCachedBlame(document: TextDocument): CachedBlame | undefined {
     const uri = document.uri.fsPath;
     for (const repoCaches of this.observedRepos.values()) {
       if (repoCaches.blameCache.get(uri) != null) {
@@ -491,5 +518,6 @@ export class InlineBlameProvider implements Disposable {
     }
     this.disposables = [];
     this.decorationType.dispose();
+    this.blameChangedEmitter.dispose();
   }
 }

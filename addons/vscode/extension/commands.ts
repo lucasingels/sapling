@@ -22,6 +22,7 @@ import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {findPublicAncestor} from 'isl-server/src/utils';
 import {Operation} from 'isl/src/operations/Operation';
 import {AddWorktreeOperation} from 'isl/src/operations/AddWorktreeOperation';
+import {PullOperation} from 'isl/src/operations/PullOperation';
 import {RemoveWorktreeOperation} from 'isl/src/operations/RemoveWorktreeOperation';
 import {RenameWorktreeOperation} from 'isl/src/operations/RenameWorktreeOperation';
 import {RevertOperation} from 'isl/src/operations/RevertOperation';
@@ -334,6 +335,13 @@ export const vscodeCommands = {
     if (message != null) {
       vscodeRepo.setCommitMessage('');
     }
+  }),
+
+  ['sapling.pull']: commandWithSourceControl(async function (
+    this: RepositoryContext,
+    vscodeRepo: VSCodeRepo,
+  ) {
+    await runOperation(this, vscodeRepo.repo, new PullOperation());
   }),
 
   ['sapling.commit-selected-files']: commandWithResourceStates(async function (

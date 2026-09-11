@@ -48,6 +48,11 @@
           "description": "%settings.showInlineBlame.description%",
           "default": true
         },
+        "sapling.showBlameCodeLens": {
+          "type": "boolean",
+          "description": "%settings.showBlameCodeLens.description%",
+          "default": false
+        },
         "sapling.showDiffComments": {
           "type": "boolean",
           "description": "%settings.showDiffComments.description%",
@@ -244,6 +249,12 @@
         "enablement": "isl.inlineCommentSidePanelEnabled"
       },
       {
+        "command": "sapling.refresh-comments",
+        "title": "%sapling.refresh-comments-command%",
+        "category": "%sapling.command-category%",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "sapling.debug.interpret-file-as-comments",
         "title": "Debug: Load file as inline comments JSON",
         "enablement": "sapling.isDev"
@@ -265,6 +276,12 @@
         "title": "%sapling.amend-command%",
         "category": "%sapling.command-category%",
         "icon": "$(edit)"
+      },
+      {
+        "command": "sapling.pull",
+        "title": "%sapling.pull-command%",
+        "category": "%sapling.command-category%",
+        "icon": "$(sync)"
       },
       {
         "command": "sapling.commit-selected-files",

@@ -50,3 +50,25 @@ export function shortenAuthorName(author: string): string {
   }
   return author;
 }
+
+/**
+ * Find the most recently authored commit among the lines in [startLine, endLine] (inclusive,
+ * 0-indexed, clamped to the length of `blameLines`). Lines without commit info (uncommitted/
+ * local changes) are ignored. Used to pick a single representative commit for a symbol/file's
+ * CodeLens, since a symbol can span lines from many different commits.
+ */
+export function mostRecentCommitInRange(
+  blameLines: Array<[line: string, info: CommitInfo | undefined]>,
+  startLine: number,
+  endLine: number,
+): CommitInfo | undefined {
+  let best: CommitInfo | undefined;
+  const lastLine = Math.min(endLine, blameLines.length - 1);
+  for (let line = Math.max(startLine, 0); line <= lastLine; line++) {
+    const commit = blameLines[line][1];
+    if (commit != null && (best == null || commit.date > best.date)) {
+      best = commit;
+    }
+  }
+  return best;
+}
