@@ -20,12 +20,13 @@ brew tap lucasingels/tap && brew install lucasingels/tap/sapling
 ## Sapling VS Code Extension
 
 ### Install
-The VS Code extension is compatible only with this repo's sl
+The VS Code extension is compatible only with this repo's sl. To install the latest release run:
 
 ```bash
-gh release download --repo lucasingels/sapling extension-v0.2.3
-code --install-extension sapling-scm-0.2.3.vsix
+curl -fsSL https://raw.githubusercontent.com/lucasingels/sapling/main/vscode.sh | sh
 ```
+
+It installs into the first editor CLI it finds on your `PATH` (`code`, `cursor`, `code-insiders`, `codium`); pick one with `curl ... | VSCODE=cursor sh`. The extension is sideloaded rather than installed from a marketplace, so it does not auto-update: re-run the command to update.
 
 # Using Sapling
 To start using Sapling, see the [Getting Started](https://sapling-scm.com/docs/introduction/getting-started) page for how to clone your existing Git repositories. Checkout the [Overview](https://sapling-scm.com/docs/overview/intro) for a peek at the various features. Coming from Git? Checkout the [Git Cheat Sheet](http://sapling-scm.com/docs/introduction/git-cheat-sheet).
