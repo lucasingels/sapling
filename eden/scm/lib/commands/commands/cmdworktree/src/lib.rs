@@ -23,6 +23,7 @@ use cmdutil::define_flags;
 use fs_err as fs;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::Worktrees;
 
 define_flags! {
     pub struct WorktreeOpts {
@@ -57,7 +58,10 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
         abort!("--rev can only be used with 'worktree add'");
     }
     let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy) -> Result<u8> = match subcmd {
-        "list" | "ls" => list::run,
+        "list" | "ls" => {
+            let worktrees = Worktrees::open(repo, repo.config().as_ref())?;
+            return list::run(&ctx, repo, &worktrees);
+        }
         "add" => add::run,
         "remove" | "rm" => remove::run,
         "label" => label::run,
@@ -137,10 +141,12 @@ pub fn doc() -> &'static str {
     Config options::
 
       worktree.max-count=N                     Hard limit on linked worktrees per repo group (0 = unlimited, the default)
+      worktree.max-count-message=TEXT          Message shown instead of the default when max-count is reached
       worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
       worktree.require-generated-path=true     Require path generator, disallow manual PATH
       worktree.path-generator=CMD              Shell command to generate PATH when omitted
-      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot (always on for git worktrees)"#
+      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot (always on for git worktrees)
+      worktree.git-enabled=true                Enable worktree commands in native Git repositories"#
 }
 
 pub fn synopsis() -> Option<&'static str> {

@@ -55,13 +55,14 @@ def override_environ(values: Dict[str, str]) -> Generator[None, None, None]:
 class EdenFsManager:
     test_dir: Path
     edenfs_dir: Optional[Path]
+    eden: Optional[edenclient.EdenFS]
 
     def __init__(self, test_dir: Path) -> None:
         self.test_dir = test_dir
         self.edenfs_dir = None
+        self.eden = None
 
     def start(self, overrides: Dict[str, str]) -> None:
-        overrides = dict(overrides)
         orig_test_dir = self.test_dir
 
         # Valid socketpaths on macOS are too short, and the usual temp dir created when running
@@ -92,33 +93,35 @@ overrides = {{}}
 """
             )
 
-        overrides.update(
-            {
-                "SCRATCH_CONFIG_PATH": str(scratch_config),
-                "INTEGRATION_TEST": "1",
-            }
-        )
+        # The test process and edenfsctl must resolve the same scratch targets.
+        overrides["SCRATCH_CONFIG_PATH"] = str(scratch_config)
+        eden_overrides = dict(overrides)
+        # Keep this out of the test process: it changes sl's network detection.
+        eden_overrides["EDENFS_INTEGRATION_TEST"] = "1"
 
         # See D43988120 to see why this is necessary
         if sys.platform == "darwin":
-            overrides["TMPDIR"] = "/tmp"
+            eden_overrides["TMPDIR"] = "/tmp"
 
         ex = None
-        with override_environ(overrides):
+        with override_environ(eden_overrides):
             try:
-                # pyre-fixme[16]: `EdenFsManager` has no attribute `eden`.
-                self.eden = edenclient.EdenFS(
+                eden = edenclient.EdenFS(
                     base_dir=self.edenfs_dir,
                     storage_engine="memory",
                 )
+                self.eden = eden
 
                 # Write out edenfs config file.
-                with open(self.eden.system_rc_path, mode="w") as eden_rc:
+                with open(eden.system_rc_path, mode="w") as eden_rc:
                     eden_rc.write(
                         """
 [experimental]
 enable-nfs-server = "true"
 allow-remote-get-batch = "false"
+
+[telemetry]
+enable-scribe-logging = "false"
 """
                     )
 
@@ -154,18 +157,16 @@ enable-eden-menu = "false"
                     # edenapi there, so we cannot really start EdenFS until
                     # that setting there is set. For Mononoke tests, EdenFS
                     # will be started there.
-                    self.eden.start()
-                self.generate_eden_cli_wrapper(orig_test_dir)
+                    eden.start()
+                self.generate_eden_cli_wrapper(eden, orig_test_dir)
             except Exception as e:
                 ex = e
 
         if ex:
             raise ex
 
-    # pyre-fixme[3]: Return type must be annotated.
-    def generate_eden_cli_wrapper(self, binpath: Path):
-        # pyre-fixme[16]: `EdenFsManager` has no attribute `eden`.
-        cmd, env = self.eden.get_edenfsctl_cmd_env("", config_dir=True, home_dir=False)
+    def generate_eden_cli_wrapper(self, eden: edenclient.EdenFS, binpath: Path) -> None:
+        cmd, env = eden.get_edenfsctl_cmd_env("", config_dir=True, home_dir=False)
 
         edenpath = binpath.parents[1] / "install" / "bin" / "eden"
         # These two are not really necessary and contain symbols that might be

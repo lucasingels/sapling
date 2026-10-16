@@ -32,8 +32,6 @@ use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriter;
 use commit_graph::CommitGraphWriterRef;
-use dbbookmarks::SqlBookmarks;
-use dbbookmarks::SqlBookmarksRef;
 use filenodes::Filenodes;
 use filenodes::FilenodesArc;
 use filenodes::FilenodesRef;
@@ -146,7 +144,7 @@ generic_newtype_with_obvious_impls! { Source }
 generic_newtype_with_obvious_impls! { Target }
 
 #[derive(Debug, Error)]
-pub enum ErrorKind {
+pub enum CrossRepoSyncError {
     #[error("Pushrebase of synced commit failed - check config for overlaps: {0:?}")]
     PushrebaseFailure(PushrebaseError),
     #[error("Remapped commit {0} expected in target repo, but not present")]
@@ -179,7 +177,6 @@ pub enum PushrebaseRewriteDates {
 
 pub trait Repo = BookmarksArc
     + BookmarksRef
-    + SqlBookmarksRef
     + BookmarkUpdateLogArc
     + BookmarkUpdateLogRef
     + RepoBlobstoreArc
@@ -216,9 +213,6 @@ pub trait Repo = BookmarksArc
 pub struct ConcreteRepo {
     #[facet]
     bookmarks: dyn Bookmarks,
-
-    #[facet]
-    sql_bookmarks: SqlBookmarks,
 
     #[facet]
     bookmark_update_log: dyn BookmarkUpdateLog,

@@ -19,13 +19,13 @@ import {repositoryInfo, worktreeInfoData} from './serverAPIState';
 export const showWorktreeLabels = localStorageBackedAtom<boolean>('isl.show-worktree-labels', true);
 
 /**
- * `{info, worktreeInfo}` when the worktrees feature is enabled, this repo can host
- * worktrees, and worktree data has loaded -- `undefined` otherwise. Shared gating logic
- * for the atoms below, so unsupported/flag-off repos never pay for the extra reads.
+ * `{info, worktreeInfo}` when the worktrees feature is enabled and worktree data
+ * has loaded -- `undefined` otherwise, so flag-off repos never pay for the extra reads.
  */
-const enabledWorktreeInfo = atom(get => {
+const loadedWorktreeInfo = atom(get => {
   const info = get(repositoryInfo);
-  if (info?.worktreesSupported !== true) {
+  const worktreeInfo = get(worktreeInfoData);
+  if (info == null || worktreeInfo == null) {
     return undefined;
   }
 
@@ -34,13 +34,34 @@ const enabledWorktreeInfo = atom(get => {
     return undefined;
   }
 
-  const worktreeInfo = get(worktreeInfoData);
-  if (worktreeInfo == null) {
-    return undefined;
-  }
-
   return {info, worktreeInfo};
 });
+
+/**
+ * Like `loadedWorktreeInfo`, but only when there are sibling worktrees to show.
+ * Shared gating for the read-only worktree features, which work in any repo
+ * `sl worktree list` supports (EdenFS and native Git).
+ */
+const enabledWorktreeInfo = atom(get => {
+  const loaded = get(loadedWorktreeInfo);
+  if (loaded == null || loaded.worktreeInfo.worktrees.length <= 1) {
+    return undefined;
+  }
+  return loaded;
+});
+
+/** Whether worktrees can be added, renamed, and removed, as reported by the server. */
+export const worktreeMutationsSupported = atom(
+  get => get(loadedWorktreeInfo)?.worktreeInfo.supportsMutation === true,
+);
+
+/**
+ * Whether to show the worktree list: when there are sibling worktrees, or when
+ * the user could add one.
+ */
+export const worktreeListEnabled = atom(
+  get => get(enabledWorktreeInfo) != null || get(worktreeMutationsSupported),
+);
 
 /** All sibling-worktree checkout locations, independent of whether labels are visible. */
 export const allOtherWorktreeCheckoutsByHash = atom(get => {
@@ -86,10 +107,7 @@ export const otherWorktreeCheckoutsByHash = atom(get => {
   return get(allOtherWorktreeCheckoutsByHash);
 });
 
-/**
- * The sibling worktree(s) currently checked out at this commit, if any.
- * Analogous to `isHighlightedCommit` in `HighlightedCommits.tsx`.
- */
+/** The sibling worktree(s) currently checked out at this commit, if any. */
 export const isCheckedOutElsewhere = atomFamilyWeak((hash: Hash) =>
   atom(get => get(otherWorktreeCheckoutsByHash).get(hash)),
 );
@@ -104,7 +122,7 @@ export const currentWorktreeName = atom(get => {
     return undefined;
   }
   const enabled = get(enabledWorktreeInfo);
-  if (enabled == null || enabled.worktreeInfo.worktrees.length <= 1) {
+  if (enabled == null) {
     return undefined;
   }
   const {info, worktreeInfo} = enabled;

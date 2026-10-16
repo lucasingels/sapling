@@ -80,6 +80,7 @@ import {
   getConfigs,
   getExecParams,
   listWorktrees,
+  narrowToSubmoduleChain,
   runCommand,
   setConfig,
   whereami,
@@ -304,7 +305,7 @@ export class Repository {
             ) ?? Promise.resolve()
           );
         } else if (operation.runner === CommandRunner.Conf) {
-          const {args: normalizedArgs} = this.normalizeOperationArgs(cwd, operation);
+          const {args: normalizedArgs} = this.normalizeOperationArgs(ctx, operation);
           if (this.codeReviewProvider?.runConfCommand == null) {
             return Promise.reject(
               Error('CodeReviewProvider does not support running conf commands'),
@@ -321,7 +322,7 @@ export class Repository {
           );
         } else if (operation.runner === CommandRunner.InternalArcanist) {
           // TODO: support stdin
-          const {args: normalizedArgs} = this.normalizeOperationArgs(cwd, operation);
+          const {args: normalizedArgs} = this.normalizeOperationArgs(ctx, operation);
           if (Internal.runArcanistCommand == null) {
             return Promise.reject(Error('InternalArcanist runner is not supported'));
           }
@@ -536,7 +537,7 @@ export class Repository {
    */
   static async getRepoInfo(ctx: RepositoryContext): Promise<RepoInfo> {
     const {cmd, cwd, logger} = ctx;
-    const [repoRoot, repoRoots, dotdir, configs] = await Promise.all([
+    const [repoRoot, allRepoRoots, dotdir, configs] = await Promise.all([
       findRoot(ctx).catch((err: Error) => err),
       findRoots(ctx),
       findDotDir(ctx),
@@ -544,6 +545,7 @@ export class Repository {
       // However, `sl debugexpandpaths` is currently too slow and impacts startup time.
       getConfigs(ctx, [
         'paths.default',
+        'paths.upstream',
         'github.pull_request_domain',
         'github.preferred_submit_command',
         'phrevset.callsign',
@@ -574,6 +576,13 @@ export class Repository {
       return {type: 'cwdNotARepository', cwd};
     }
 
+    // `debugroots` reports every repo above the cwd, including unrelated ones that happen to
+    // contain this checkout, so keep only the genuine submodule chain.
+    const repoRoots =
+      allRepoRoots != null && allRepoRoots.length > 1
+        ? await narrowToSubmoduleChain(ctx, allRepoRoots)
+        : allRepoRoots;
+
     const isEdenFs = await isEdenFsRepo(repoRoot as AbsolutePath);
     const worktreesSupported = isEdenFs || isDotGitDotDir(dotdir);
 
@@ -586,11 +595,26 @@ export class Repository {
     } else if (pathsDefault === '') {
       codeReviewSystem = {type: 'none'};
     } else {
-      const repoInfo = extractRepoInfoFromUrl(pathsDefault);
-      if (
-        repoInfo != null &&
-        (repoInfo.hostname === 'github.com' || (await isGithubEnterprise(repoInfo.hostname)))
-      ) {
+      // A fork pushes to itself but its pull requests belong upstream, which is already how the CLI
+      // behaves: `try_find_upstream` in the github extension resolves a bare pull request number
+      // against `paths.upstream` before `paths.default`.
+      const candidates = [configs.get('paths.upstream') ?? '', pathsDefault]
+        .map(url => extractRepoInfoFromUrl(url))
+        .filter(info => info != null);
+      // A fork and its upstream share a host, so resolve each host once rather than per candidate:
+      // `isGithubEnterprise` shells out to `gh`.
+      const hostnames = [...new Set(candidates.map(info => info.hostname))];
+      const githubHostnames = new Set(
+        (
+          await Promise.all(
+            hostnames.map(async hostname =>
+              hostname === 'github.com' || (await isGithubEnterprise(hostname)) ? hostname : null,
+            ),
+          )
+        ).filter(hostname => hostname != null),
+      );
+      const repoInfo = candidates.find(info => githubHostnames.has(info.hostname));
+      if (repoInfo != null) {
         const {owner, repo, hostname} = repoInfo;
         codeReviewSystem = {
           type: 'github',
@@ -688,9 +712,10 @@ export class Repository {
   }
 
   private normalizeOperationArgs(
-    cwd: string,
+    ctx: RepositoryContext,
     operation: RunnableOperation,
   ): {args: Array<string>; stdin?: string | undefined} {
+    const {cwd} = ctx;
     const repoRoot = nullthrows(this.info.repoRoot);
     const illegalArgs = new Set(['--cwd', '--config', '--insecure', '--repository', '-R']);
     let stdin = operation.stdin;
@@ -800,7 +825,7 @@ export class Repository {
     signal: AbortSignal,
   ): Promise<void> {
     const {cwd} = ctx;
-    const {args: cwdRelativeArgs, stdin} = this.normalizeOperationArgs(cwd, operation);
+    const {args: cwdRelativeArgs, stdin} = this.normalizeOperationArgs(ctx, operation);
 
     const env = await Promise.all([
       Internal.additionalEnvForCommand?.(operation),
@@ -1015,6 +1040,7 @@ export class Repository {
           ? {
               sharedRoot,
               worktrees: worktreeEntriesWithNodes,
+              supportsMutation: this.info.isEdenFs || this.info.worktreesSupported === true,
             }
           : undefined;
       this.worktreeInfo = worktreeInfo;

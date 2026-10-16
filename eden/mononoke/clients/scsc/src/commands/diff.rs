@@ -326,9 +326,10 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
             .split('/')
             .cmp(compare_file_path(b).split('/'))
     });
+    let compare_partial = crate::util::is_partial_verdict(&response.partial_info);
 
     if args.paths_only {
-        return app
+        let result = app
             .target
             .render_one(
                 &args,
@@ -337,6 +338,10 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
                 },
             )
             .await;
+        if result.is_ok() && compare_partial {
+            crate::util::print_partial_note();
+        }
+        return result;
     }
 
     // Use original ephemeral_bonsai commit IDs to preserve bubble info for snapshots.
@@ -380,7 +385,8 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
             pair_size,
         )
     });
-    app.target
+    let result = app
+        .target
         .render(
             &(),
             diff_files(
@@ -393,5 +399,9 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
                 args.context,
             ),
         )
-        .await
+        .await;
+    if result.is_ok() && (compare_partial || conn.is_partial()) {
+        crate::util::print_partial_note();
+    }
+    result
 }

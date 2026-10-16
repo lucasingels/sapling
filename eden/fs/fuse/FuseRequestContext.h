@@ -51,6 +51,7 @@ class FuseRequestContext : public RequestContext {
  public:
   explicit FuseRequestContext(
       FuseChannel* channel,
+      const FuseTransport& source,
       const fuse_in_header& fuseHeader);
 
   FuseRequestContext(const FuseRequestContext&) = delete;
@@ -76,6 +77,39 @@ class FuseRequestContext : public RequestContext {
   const fuse_in_header& getReq() const;
 
   /**
+   * Count the outcome of a request and reply with the appropriate error if
+   * it failed.
+   */
+  void handleResult(
+      folly::Try<folly::Unit>&& try_,
+      Notifier* FOLLY_NULLABLE notifier,
+      const EdenStatsPtr& stats,
+      StatsGroupBase::Counter FuseStats::* countSuccessful,
+      StatsGroupBase::Counter FuseStats::* countFailure) {
+    if (try_.hasException()) {
+      if (stats && countFailure) {
+        stats->increment(countFailure);
+      }
+      if (auto* futureTimeoutErr =
+              try_.tryGetExceptionObject<folly::FutureTimeout>()) {
+        timeoutErrorHandler(*futureTimeoutErr, notifier);
+      } else if (
+          auto* systemErr = try_.tryGetExceptionObject<std::system_error>()) {
+        systemErrorHandler(*systemErr, notifier);
+      } else if (auto* ex = try_.tryGetExceptionObject<std::exception>()) {
+        genericErrorHandler(*ex, notifier);
+      } else {
+        genericErrorHandler(
+            std::runtime_error{"unknown exception type"}, notifier);
+      }
+    } else {
+      if (stats && countSuccessful) {
+        stats->increment(countSuccessful);
+      }
+    }
+  }
+
+  /**
    * Append error handling clauses to a future chain. These clauses result in
    * reporting a fuse request error back to the kernel.
    */
@@ -85,34 +119,15 @@ class FuseRequestContext : public RequestContext {
       EdenStatsPtr stats,
       StatsGroupBase::Counter FuseStats::* countSuccessful,
       StatsGroupBase::Counter FuseStats::* countFailure) {
-    return std::move(fut).thenTryInline([this,
-                                         notifier,
-                                         stats = std::move(stats),
-                                         countSuccessful,
-                                         countFailure](
-                                            folly::Try<folly::Unit>&& try_) {
-      if (try_.hasException()) {
-        if (stats && countFailure) {
-          stats->increment(countFailure);
-        }
-        if (auto* futureTimeoutErr =
-                try_.tryGetExceptionObject<folly::FutureTimeout>()) {
-          timeoutErrorHandler(*futureTimeoutErr, notifier);
-        } else if (
-            auto* systemErr = try_.tryGetExceptionObject<std::system_error>()) {
-          systemErrorHandler(*systemErr, notifier);
-        } else if (auto* ex = try_.tryGetExceptionObject<std::exception>()) {
-          genericErrorHandler(*ex, notifier);
-        } else {
-          genericErrorHandler(
-              std::runtime_error{"unknown exception type"}, notifier);
-        }
-      } else {
-        if (stats && countSuccessful) {
-          stats->increment(countSuccessful);
-        }
-      }
-    });
+    return std::move(fut).thenTryInline(
+        [this,
+         notifier,
+         stats = std::move(stats),
+         countSuccessful,
+         countFailure](folly::Try<folly::Unit>&& try_) {
+          handleResult(
+              std::move(try_), notifier, stats, countSuccessful, countFailure);
+        });
   }
 
   void systemErrorHandler(
@@ -127,7 +142,8 @@ class FuseRequestContext : public RequestContext {
 
   template <typename... T>
   void sendReply(T&&... payload) {
-    channel_->sendReply(stealReqWithResult(0), std::forward<T>(payload)...);
+    channel_->sendReply(
+        source_, stealReqWithResult(0), std::forward<T>(payload)...);
   }
 
   /**
@@ -137,13 +153,14 @@ class FuseRequestContext : public RequestContext {
    */
   template <typename T>
   void sendReplyWithInode(uint64_t nodeid, T&& reply) {
-    channel_->sendReply(stealReqWithResult(nodeid), std::forward<T>(reply));
+    channel_->sendReply(
+        source_, stealReqWithResult(nodeid), std::forward<T>(reply));
   }
 
   // Reply with a negative errno value or 0 for success
   void replyError(int err);
 
-  // Don't send a reply, just release req_
+  // Complete the request without a FUSE reply payload.
   void replyNone();
 
  private:
@@ -152,6 +169,7 @@ class FuseRequestContext : public RequestContext {
   fuse_in_header stealReqWithResult(int64_t result);
 
   FuseChannel* channel_;
+  const FuseTransport& source_;
   const fuse_in_header fuseHeader_;
 
   std::optional<int64_t> result_;

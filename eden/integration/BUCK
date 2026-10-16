@@ -1,14 +1,35 @@
 load("@fbcode//eden:defs.bzl", "get_integration_test_env_and_deps", "get_oss_suffix", "get_test_env_and_deps")
 load("@fbcode_macros//build_defs:python_integration_test.bzl", "python_integration_test")
+load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
+load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
 
 oncall("scm_client_infra")
 
 artifacts = get_integration_test_env_and_deps()
 
 python_integration_test(
+    name = "testcase",
+    srcs = ["testcase_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
+        "//eden/fs/py/eden:config",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
     name = "basic" + get_oss_suffix(),
     srcs = ["basic_test.py"],
     env = artifacts["env"],
+    # The test drives a real EdenFS daemon over its Thrift socket. That is
+    # loopback rather than the wider network, but the local forkserver brings
+    # loopback down for every restricted mode, so none()/strict()/loopback are
+    # all equally unusable here and only all() works both locally and on RE.
+    network_access = network_access_utils.all(),
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
@@ -63,6 +84,7 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "//eden/fs/cli:lib",
         "//eden/integration/lib:lib",
     ],
 )
@@ -94,6 +116,7 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "//eden/fs/cli:lib",
         "//eden/integration/lib:lib",
     ],
 )
@@ -141,6 +164,18 @@ python_integration_test(
 python_integration_test(
     name = "edenclient_test",
     srcs = ["edenclient_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/fs/service:thrift-python-types",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "fifo",
+    srcs = ["fifo_test.py"],
+    compatible_with = ["ovr_config//os:linux"],
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
@@ -252,7 +287,9 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "fbsource//third-party/pypi/parameterized:parameterized",
         "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
     ],
 )
 
@@ -326,6 +363,7 @@ python_integration_test(
     env = artifacts["env"],
     supports_static_listing = False,
     deps = [
+        "//eden/fs/cli:lib",
         "//eden/fs/service:thrift-python-types",
         "//eden/integration/lib:lib",
     ],
@@ -344,7 +382,13 @@ python_integration_test(
 python_integration_test(
     name = "mount",
     srcs = ["mount_test.py"],
-    env = artifacts["env"],
+    env = selects.apply(
+        sanitizers.get_sanitizer_v2(),
+        lambda sanitizer: dict(
+            artifacts["env"],
+            EDEN_TEST_TSAN = "1" if sanitizer and "thread" in sanitizer else "0",
+        ),
+    ),
     supports_static_listing = False,
     deps = [
         "//eden/fs/cli:lib",
@@ -566,6 +610,16 @@ python_integration_test(
 )
 
 python_integration_test(
+    name = "telemetry",
+    srcs = ["telemetry_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
     name = "stop",
     srcs = ["stop_test.py"],
     env = artifacts["env"],
@@ -573,7 +627,9 @@ python_integration_test(
     deps = [
         "//eden/fs/cli:lib",
         "//eden/fs/cli:proc_utils",
+        "//eden/fs/py/eden/thrift:client",
         "//eden/integration/lib:lib",
+        "//thrift/lib/python:types",
     ],
 )
 
@@ -747,6 +803,22 @@ python_integration_test(
     supports_static_listing = False,
     deps = [
         "fbsource//third-party/pypi/parameterized:parameterized",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_integration_test(
+    name = "readdir_cookies_break_across_checkout",
+    srcs = ["readdir_cookies_break_across_checkout_test.py"],
+    # The cookie collision is a POSIX readdir/NFS behavior; Windows PrjFS
+    # enumeration does not reproduce it, so the bug-asserting test fails there.
+    compatible_with = [
+        "ovr_config//os:linux",
+        "ovr_config//os:macos",
+    ],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    deps = [
         "//eden/integration/lib:lib",
     ],
 )

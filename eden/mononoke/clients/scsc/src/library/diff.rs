@@ -182,18 +182,21 @@ async fn make_file_diff_request(
     };
 
     let response = connection.commit_file_diffs(commit, &params).await?;
+    if crate::util::is_partial_verdict(&response.partial_info) {
+        connection.note_partial();
+    }
     let diffs: Vec<_> = response
         .path_diffs
         .into_iter()
         .filter_map(|path_diff| match path_diff {
             thrift::CommitFileDiffsResponseElement {
-                diff: thrift::Diff::raw_diff(diff),
+                diff: Some(thrift::Diff::raw_diff(diff)),
                 ..
             } => Some(DiffOutputElement::RawDiff(
                 diff.raw_diff.unwrap_or_else(Vec::new),
             )),
             thrift::CommitFileDiffsResponseElement {
-                diff: thrift::Diff::metadata_diff(diff),
+                diff: Some(thrift::Diff::metadata_diff(diff)),
                 base_path,
                 other_path,
                 ..
@@ -218,6 +221,8 @@ async fn make_file_diff_request(
 
 /// Given the paths and sizes of files to diff returns the stream of renderable
 /// structs. The sizes are used to avoid hitting size limit when doing batch requests.
+/// A batch whose response was partial records it on the client, so the caller
+/// can emit a single note after rendering succeeds.
 pub(crate) fn diff_files<T: IntoIterator<Item = (thrift::CommitFileDiffsParamsPathPair, i64)>>(
     connection: &ScsClient,
     commit: thrift::CommitSpecifier,

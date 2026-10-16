@@ -12,17 +12,31 @@ use anyhow::Ok;
 use anyhow::Result;
 use anyhow::bail;
 use arc_swap::ArcSwap;
+use futures::future::BoxFuture;
 use futures::stream::AbortHandle;
 use parking_lot::Mutex;
+
+mod slot;
+
+pub use crate::slot::RepoSlot;
+
+/// The future is owned rather than borrowing the loader: the load runs on a
+/// task that outlives the call that started it.
+pub trait RepoLoader<R>: Send + Sync {
+    fn load(&self, repo_name: String) -> BoxFuture<'static, Result<R>>;
+}
 
 /// Set of repos currently associated with an instance of Mononoke
 /// service or command. This type doesn't derive clone and thus
 /// sharing of MononokeRepo should occur under Arc / Rc clones.
 pub struct MononokeRepos<R> {
-    name_to_repo_map: ArcSwap<HashMap<String, Arc<R>>>,
+    name_to_repo_map: ArcSwap<HashMap<String, Arc<RepoSlot<R>>>>,
     id_to_name_map: ArcSwap<HashMap<i32, String>>,
     update_lock: Arc<Mutex<()>>, // Dedicated lock for guarding update operations.
     stats_handles: ArcSwap<HashMap<String, AbortHandle>>,
+    /// Absent for a collection whose repos are all built elsewhere and handed
+    /// in through `add` and friends.
+    loader: Option<Arc<dyn RepoLoader<R>>>,
 }
 
 impl<R> MononokeRepos<R> {
@@ -34,13 +48,29 @@ impl<R> MononokeRepos<R> {
             id_to_name_map: ArcSwap::from_pointee(HashMap::new()),
             update_lock: Arc::new(Mutex::new(())),
             stats_handles: ArcSwap::from_pointee(HashMap::new()),
+            loader: None,
         }
+    }
+
+    /// Set once, at construction, so a collection never exists in a state
+    /// where it is meant to build but cannot.
+    pub fn new_lazy(loader: Arc<dyn RepoLoader<R>>) -> Self {
+        Self {
+            loader: Some(loader),
+            ..Self::new()
+        }
+    }
+
+    /// Whether this collection can build a placeholder on request, i.e. was
+    /// constructed with a loader.
+    pub fn loads_on_demand(&self) -> bool {
+        self.loader.is_some()
     }
 
     /// Get the repo corresponding to the repo-name if the repo
     /// has been loaded for the service/command, else return None.
     pub fn get_by_name(&self, repo_name: &str) -> Option<Arc<R>> {
-        self.name_to_repo_map.load().get(repo_name).cloned()
+        self.name_to_repo_map.load().get(repo_name)?.loaded()
     }
 
     /// Get the repo corresponding to the repo-id if the repo
@@ -49,7 +79,7 @@ impl<R> MononokeRepos<R> {
         self.id_to_name_map
             .load()
             .get(&repo_id)
-            .and_then(|repo_name| self.name_to_repo_map.load().get(repo_name).cloned())
+            .and_then(|repo_name| self.name_to_repo_map.load().get(repo_name)?.loaded())
     }
 
     /// Returns an iterator over the set of repos currently loaded
@@ -59,7 +89,7 @@ impl<R> MononokeRepos<R> {
             .name_to_repo_map
             .load()
             .values()
-            .map(Arc::clone)
+            .filter_map(|repo_slot| repo_slot.loaded())
             .collect();
         result.into_iter()
     }
@@ -76,6 +106,21 @@ impl<R> MononokeRepos<R> {
         result.into_iter()
     }
 
+    /// Names of the repos that are **built**, unlike [`Self::iter_names`],
+    /// which also reports repos that are merely assigned. Rebuild decisions
+    /// need this one: an unbuilt repo has no resolved config to compare
+    /// against, so counting it as loaded makes it look permanently drifted.
+    pub fn iter_loaded_names(&self) -> impl Iterator<Item = String> + use<R> {
+        let result: Vec<_> = self
+            .name_to_repo_map
+            .load()
+            .iter()
+            .filter(|(_, repo_slot)| repo_slot.loaded().is_some())
+            .map(|(name, _)| name.to_string())
+            .collect();
+        result.into_iter()
+    }
+
     /// Returns an iterator over the set of repo-ids corresponding
     /// to the repos currently loaded for the service / command.
     pub fn iter_ids(&self) -> impl Iterator<Item = i32> + use<R> {
@@ -86,7 +131,7 @@ impl<R> MononokeRepos<R> {
     /// Private method that performs the add/update operations without lock-related
     /// logic. The public accessors to this method ensure that the lock is
     /// acquired before this method is invoked.
-    fn add_or_update_inner(&self, repo_name: &str, repo_id: i32, repo: R) {
+    fn add_or_update_inner(&self, repo_name: &str, repo_id: i32, repo_slot: RepoSlot<R>) {
         // First, add the repo-id to repo-name mapping since the actual
         // repo addition should be the last step.
         let id_to_name_map = self.id_to_name_map.load();
@@ -103,9 +148,9 @@ impl<R> MononokeRepos<R> {
         let mut new_name_to_repo_map = HashMap::from_iter(
             name_to_repo_map
                 .iter()
-                .map(|(name, repo)| (name.to_string(), Arc::clone(repo))),
+                .map(|(name, repo_slot)| (name.to_string(), Arc::clone(repo_slot))),
         );
-        new_name_to_repo_map.insert(repo_name.to_string(), Arc::new(repo));
+        new_name_to_repo_map.insert(repo_name.to_string(), Arc::new(repo_slot));
         self.name_to_repo_map.store(Arc::new(new_name_to_repo_map));
     }
 
@@ -120,7 +165,30 @@ impl<R> MononokeRepos<R> {
     pub fn add(&self, repo_name: &str, repo_id: i32, repo: R) {
         // Acquire the lock to avoid race conditions during update.
         let lock = self.update_lock.lock();
-        self.add_or_update_inner(repo_name, repo_id, repo);
+        self.add_or_update_inner(
+            repo_name,
+            repo_id,
+            RepoSlot::ready(repo_name.to_string(), Arc::new(repo)),
+        );
+        // Drop the lock to allow other threads to update the repos.
+        drop(lock);
+    }
+
+    /// Registers a repo as assigned to this service without building it. The
+    /// repo is reported by `iter_names` and `iter_ids`, but `get_by_name` and
+    /// `get_by_id` return `None` for it until something builds it.
+    ///
+    /// No-op if the repo is already present: registering an assignment only
+    /// ever adds one, and never un-builds a repo that is already loaded.
+    pub fn add_placeholder(&self, repo_name: &str, repo_id: i32) {
+        // Acquire the lock to avoid race conditions during update.
+        let lock = self.update_lock.lock();
+        // Presence check under update_lock is atomic vs add/remove/reload/populate.
+        if self.name_to_repo_map.load().contains_key(repo_name) {
+            drop(lock);
+            return;
+        }
+        self.add_or_update_inner(repo_name, repo_id, RepoSlot::empty(repo_name.to_string()));
         // Drop the lock to allow other threads to update the repos.
         drop(lock);
     }
@@ -151,7 +219,11 @@ impl<R> MononokeRepos<R> {
         match self.update_lock.try_lock() {
             // Lock acquired, add repo.
             Some(lock) => {
-                self.add_or_update_inner(repo_name, repo_id, repo);
+                self.add_or_update_inner(
+                    repo_name,
+                    repo_id,
+                    RepoSlot::ready(repo_name.to_string(), Arc::new(repo)),
+                );
                 drop(lock);
                 Ok(())
             }
@@ -179,9 +251,9 @@ impl<R> MononokeRepos<R> {
         // Remove the repo-name to repo mapping.
         let name_to_repo_map = self.name_to_repo_map.load();
         let new_name_to_repo_map =
-            HashMap::from_iter(name_to_repo_map.iter().filter_map(|(name, repo)| {
+            HashMap::from_iter(name_to_repo_map.iter().filter_map(|(name, repo_slot)| {
                 if name != repo_name {
-                    Some((name.to_string(), Arc::clone(repo)))
+                    Some((name.to_string(), Arc::clone(repo_slot)))
                 } else {
                     None
                 }
@@ -255,10 +327,11 @@ impl<R> MononokeRepos<R> {
         // Acquire the lock to avoid race conditions during update.
         let lock = self.update_lock.lock();
         let mut id_to_name_map: HashMap<i32, String> = HashMap::new();
-        let mut name_to_repo_map: HashMap<String, Arc<R>> = HashMap::new();
+        let mut name_to_repo_map: HashMap<String, Arc<RepoSlot<R>>> = HashMap::new();
         for (id, name, repo) in repos.into_iter() {
             id_to_name_map.insert(id, name.to_string());
-            name_to_repo_map.insert(name, Arc::new(repo));
+            let repo_slot = RepoSlot::ready(name.clone(), Arc::new(repo));
+            name_to_repo_map.insert(name, Arc::new(repo_slot));
         }
         self.id_to_name_map.store(Arc::new(id_to_name_map));
         self.name_to_repo_map.store(Arc::new(name_to_repo_map));
@@ -283,11 +356,12 @@ impl<R> MononokeRepos<R> {
         let lock = self.update_lock.lock();
         let mut id_to_name_map: HashMap<i32, String> =
             Arc::<_>::unwrap_or_clone(self.id_to_name_map.load().clone());
-        let mut name_to_repo_map: HashMap<String, Arc<R>> =
+        let mut name_to_repo_map: HashMap<String, Arc<RepoSlot<R>>> =
             Arc::<_>::unwrap_or_clone(self.name_to_repo_map.load().clone());
         for (id, name, repo) in repos.into_iter() {
             id_to_name_map.insert(id, name.to_string());
-            name_to_repo_map.insert(name, Arc::new(repo));
+            let repo_slot = RepoSlot::ready(name.clone(), Arc::new(repo));
+            name_to_repo_map.insert(name, Arc::new(repo_slot));
         }
         self.id_to_name_map.store(Arc::new(id_to_name_map));
         self.name_to_repo_map.store(Arc::new(name_to_repo_map));
@@ -307,14 +381,46 @@ impl<R> MononokeRepos<R> {
         }
         let mut id_to_name_map: HashMap<i32, String> =
             Arc::<_>::unwrap_or_clone(self.id_to_name_map.load().clone());
-        let mut name_to_repo_map: HashMap<String, Arc<R>> =
+        let mut name_to_repo_map: HashMap<String, Arc<RepoSlot<R>>> =
             Arc::<_>::unwrap_or_clone(self.name_to_repo_map.load().clone());
         id_to_name_map.insert(id, name.clone());
-        name_to_repo_map.insert(name, Arc::new(repo));
+        let repo_slot = RepoSlot::ready(name.clone(), Arc::new(repo));
+        name_to_repo_map.insert(name, Arc::new(repo_slot));
         self.id_to_name_map.store(Arc::new(id_to_name_map));
         self.name_to_repo_map.store(Arc::new(name_to_repo_map));
         drop(lock);
         true
+    }
+
+    /// Concurrent callers for the same repo share a single build, and a caller
+    /// that goes away neither cancels nor restarts it.
+    ///
+    /// `None` covers both "not assigned to this service" and "assigned, but
+    /// this collection cannot load anything", deliberately: splitting them
+    /// would send a reader looking at shard assignment over a wiring mistake.
+    ///
+    /// Bounded because the build runs on a detached task. The bound is on the
+    /// method so a collection that never builds stays usable for any `R`.
+    pub async fn get(&self, repo_name: &str) -> Result<Option<Arc<R>>>
+    where
+        R: Send + Sync + 'static,
+    {
+        let Some(repo_slot) = self.name_to_repo_map.load().get(repo_name).cloned() else {
+            return Ok(None);
+        };
+
+        if let Some(repo) = repo_slot.loaded() {
+            return Ok(Some(repo));
+        }
+
+        let Some(loader) = self.loader.clone() else {
+            return Ok(None);
+        };
+
+        repo_slot
+            .get_or_build(move |repo_name| loader.load(repo_name))
+            .await
+            .map(Some)
     }
 }
 

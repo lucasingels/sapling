@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Error;
@@ -22,8 +23,10 @@ use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use bytes::Bytes;
+use cacheblob::MemWritesBlobstore;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
+use context::PerfCounterType;
 use dag_types::Location;
 use edenapi_types::AnyId;
 use edenapi_types::UploadToken;
@@ -40,16 +43,21 @@ use futures::TryStreamExt;
 use futures::stream;
 use futures_util::try_join;
 use mercurial_derivation::DeriveHgChangeset;
+use mercurial_derivation::upload_augmented_manifest::UploadTreeAugmented;
+use mercurial_derivation::upload_augmented_manifest::build_augmented_manifests_for_uploaded_trees;
+use mercurial_derivation::upload_augmented_manifest::store_uploaded_tree_envelopes;
 use mercurial_mutation::HgMutationEntry;
 use mercurial_mutation::HgMutationStoreRef;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileEnvelopeMut;
 use mercurial_types::HgFileNodeId;
+use mercurial_types::HgManifestEnvelope;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
 use mercurial_types::blobs::RevlogChangeset;
 use mercurial_types::blobs::UploadHgNodeHash;
 use mercurial_types::blobs::UploadHgTreeEntry;
+use mercurial_types::blobs::store_manifest_envelope;
 use metaconfig_types::RepoConfig;
 use mononoke_api::MononokeRepo;
 use mononoke_api::errors::MononokeError;
@@ -64,17 +72,41 @@ use phases::PhasesRef;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_client::find_new_draft_commits_and_derive_filenodes_for_public_roots;
+use repo_identity::RepoIdentityRef;
 use repo_update_logger::CommitInfo;
 use repo_update_logger::log_new_commits;
+use restricted_paths::RestrictedPathsArc;
 use tracing::debug;
+use unbundle::ShallowSubtreeCopyRejected;
 use unbundle::upload_changeset;
 
 use super::HgFileContext;
 use super::HgTreeContext;
 
+/// Lets the envelopes built at tree upload reach the blobstore.
+const STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD: &str =
+    "scm/mononoke:store_augmented_manifests_at_tree_upload";
+
 #[derive(Clone)]
 pub struct HgRepoContext<R> {
     repo_ctx: RepoContext<R>,
+}
+
+/// Where `get_graph_mapping` takes the draft flag of each commit from.
+enum DraftClassification {
+    /// The draft commits found by the getbundle walk down from the heads.
+    Walked(HashSet<HgChangesetId>),
+    /// The public commits among the commits being returned, from the phases.
+    Phases(HashSet<ChangesetId>),
+}
+
+impl DraftClassification {
+    fn is_draft(&self, cs_id: ChangesetId, hg_id: HgChangesetId) -> bool {
+        match self {
+            DraftClassification::Walked(draft_commits) => draft_commits.contains(&hg_id),
+            DraftClassification::Phases(public_commits) => !public_commits.contains(&cs_id),
+        }
+    }
 }
 
 impl<R: MononokeRepo> HgRepoContext<R> {
@@ -221,16 +253,24 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         }
     }
 
-    /// Store file into blobstore
+    /// Store file into blobstore. When `bypass_redaction` is true, redaction
+    /// remains logged but is not enforced for the filestore operation.
     pub async fn store_file(
         &self,
         key: impl Into<FetchKey>,
         size: u64,
         data: impl Stream<Item = Result<Bytes, Error>> + Send,
         bubble_id: Option<BubbleId>,
+        bypass_redaction: bool,
     ) -> Result<ContentMetadataV2, MononokeError> {
+        let blobstore = self.bubble_blobstore(bubble_id).await?;
+        let blobstore = if bypass_redaction {
+            blobstore.with_log_only_redaction()
+        } else {
+            blobstore
+        };
         filestore::store(
-            &self.bubble_blobstore(bubble_id).await?,
+            &blobstore,
             *self.repo().filestore_config(),
             self.ctx(),
             &StoreRequest::with_fetch_key(size, key.into()),
@@ -343,7 +383,11 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         Ok(())
     }
 
-    /// Store Tree into blobstore
+    /// Store Tree into blobstore, returning the envelope it was stored as.
+    ///
+    /// Take the envelope from here rather than rebuilding it from the raw
+    /// bytes: `upload_node_id` and `computed_node_id` legitimately differ for a
+    /// mirror upload, and a second construction site loses that distinction.
     pub async fn store_tree(
         &self,
         upload_node_id: HgNodeHash,
@@ -351,7 +395,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         p2: Option<HgNodeHash>,
         contents: Bytes,
         computed_node_id: Option<HgNodeHash>,
-    ) -> Result<(), MononokeError> {
+    ) -> Result<HgManifestEnvelope, MononokeError> {
         if computed_node_id.is_some() {
             self.repo_ctx
                 .authorization_context()
@@ -366,14 +410,60 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             path: RepoPath::RootPath, // only used for logging
             computed_node_id,
         };
-        let (_, upload_future) = entry.upload(
-            self.ctx().clone(),
-            Arc::new(self.repo().repo_blobstore().clone()),
-        )?;
+        let (envelope, _path) = entry.into_verified_envelope()?;
+        store_manifest_envelope(self.ctx(), self.repo().repo_blobstore(), envelope.clone())
+            .await
+            .map_err(MononokeError::from)?;
 
-        upload_future.await.map_err(MononokeError::from)?;
+        Ok(envelope)
+    }
 
-        Ok(())
+    /// Build the augmented manifest envelopes for a batch of already-stored
+    /// trees and, when the store knob is on, store them so they exist before
+    /// the changeset that references them is uploaded.
+    ///
+    /// A tree whose child is neither in the batch nor already derived is an
+    /// error: the batch builds completely or not at all.
+    ///
+    /// Until `scm/mononoke:store_augmented_manifests_at_tree_upload` is on for
+    /// the repo, no envelope is written, and the build's own writes (large
+    /// directory shards, ACL nodes) land in a `MemWritesBlobstore` overlay that
+    /// dies with this call.
+    ///
+    /// Once it is on the writes are permanent: the key is the hg manifest id
+    /// alone and the put is if-absent, so a wrong envelope cannot be corrected
+    /// later. Turning the knob off stops new writes, it does not repair old
+    /// ones.
+    pub async fn build_and_store_augmented_manifests_for_uploaded_trees(
+        &self,
+        trees: Vec<HgManifestEnvelope>,
+    ) -> Result<Vec<UploadTreeAugmented>, Error> {
+        let store = justknobs::eval(
+            STORE_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD,
+            None,
+            Some(self.repo().repo_identity().name()),
+        );
+        let repo_blobstore = if store {
+            self.repo().repo_blobstore().clone()
+        } else {
+            RepoBlobstore::new_with_wrapped_inner_blobstore(
+                self.repo().repo_blobstore().clone(),
+                |inner| Arc::new(MemWritesBlobstore::new(inner)),
+            )
+        };
+        let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(repo_blobstore);
+        let restricted_paths = self.repo().restricted_paths_arc();
+        let built = build_augmented_manifests_for_uploaded_trees(
+            self.ctx(),
+            &blobstore,
+            restricted_paths.config_based(),
+            trees,
+        )
+        .await?;
+        if store {
+            store_uploaded_tree_envelopes(self.ctx(), &blobstore, &built).await?;
+        }
+        Ok(built)
     }
 
     /// Store HgChangeset. The function also generates bonsai changeset and stores all necessary mappings.
@@ -398,7 +488,10 @@ impl<R: MononokeRepo> HgRepoContext<R> {
                 bonsai,
             )
             .await
-            .map_err(MononokeError::from)?;
+            .map_err(|e| match e.downcast_ref::<ShallowSubtreeCopyRejected>() {
+                Some(rejected) => MononokeError::InvalidRequest(rejected.to_string()),
+                None => MononokeError::from(e),
+            })?;
         }
         let mut results = Vec::new();
         let mut hg_changesets = HashSet::new();
@@ -767,10 +860,8 @@ impl<R: MononokeRepo> HgRepoContext<R> {
     }
 
     /// Return a mapping of commits to their parents that are in the segment of
-    /// of the commit graph bounded by common and heads.
-    ///
-    /// We need to make sure filenodes are derived before sending for draft commits.
-    /// This method also return commit's phases.
+    /// of the commit graph bounded by common and heads, along with whether
+    /// each commit is a draft.
     pub async fn get_graph_mapping(
         &self,
         common: Vec<HgChangesetId>,
@@ -788,20 +879,61 @@ impl<R: MononokeRepo> HgRepoContext<R> {
             self.convert_changeset_ids(common),
             self.convert_changeset_ids(heads),
         )?;
-        let (draft_commits, missing_commits) = try_join!(
-            find_new_draft_commits_and_derive_filenodes_for_public_roots(
-                &ctx,
-                repo,
-                &common_set,
-                &heads_vec,
-                phases
-            ),
+
+        // Getbundle walks the draft commits down from the heads to derive
+        // filenodes for their public roots, because it sends filenodes along
+        // with the commits, and classifies drafts from that walk.  The commit
+        // graph doesn't include filenodes, so with the pull optimizations on
+        // the walk is skipped and drafts are classified from the phases of
+        // the commits being returned instead.
+        let walk_drafts = !justknobs::eval(
+            "scm/mononoke:commit_graph_pull_optimizations",
+            ctx.client_request_info().map(|c| c.correlator.as_str()),
+            Some(self.repo_ctx().name()),
+        );
+        let walked_draft_commits = async {
+            if !walk_drafts {
+                return anyhow::Ok(None);
+            }
+            Ok(Some(
+                find_new_draft_commits_and_derive_filenodes_for_public_roots(
+                    &ctx,
+                    repo,
+                    &common_set,
+                    &heads_vec,
+                    phases,
+                )
+                .await?,
+            ))
+        };
+        let (walked_draft_commits, missing_commits) = try_join!(
+            walked_draft_commits,
             self.repo_ctx().repo().commit_graph().ancestors_difference(
                 &ctx,
                 bonsai_heads,
                 bonsai_common,
             )
         )?;
+
+        let classification = async {
+            match walked_draft_commits {
+                Some(draft_commits) => anyhow::Ok(DraftClassification::Walked(draft_commits)),
+                None => {
+                    let classify_start = Instant::now();
+                    let public = stream::iter(missing_commits.clone())
+                        .chunks(100)
+                        .map(|chunk| phases.get_cached_public(&ctx, chunk))
+                        .buffered(25)
+                        .try_concat()
+                        .await?;
+                    ctx.perf_counters().add_duration_us(
+                        PerfCounterType::PhasesSectionUs,
+                        classify_start.elapsed(),
+                    );
+                    Ok(DraftClassification::Phases(public))
+                }
+            }
+        };
 
         let cs_parent_mapping = stream::iter(missing_commits.clone())
             .map(move |cs_id| async move {
@@ -812,8 +944,9 @@ impl<R: MononokeRepo> HgRepoContext<R> {
                 Ok::<_, Error>((cs_id, parents))
             })
             .buffered(100)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .try_collect::<Vec<_>>();
+
+        let (classification, cs_parent_mapping) = try_join!(classification, cs_parent_mapping)?;
 
         let all_cs_ids = cs_parent_mapping
             .clone()
@@ -858,7 +991,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
                     .map(get_hg_id_fn)
                     .collect::<Result<Vec<HgChangesetId>, Error>>()
                     .map_err(MononokeError::from)?;
-                let is_draft = draft_commits.contains(&hg_id);
+                let is_draft = classification.is_draft(cs_id, hg_id);
                 Ok((hg_id, (hg_parents, is_draft)))
             })
             .collect::<Result<Vec<_>, MononokeError>>()?;
@@ -872,9 +1005,15 @@ mod tests {
     use std::sync::Arc;
 
     use fbinit::FacebookInit;
+    use futures::FutureExt;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs_async;
+    use maplit::hashmap;
     use mononoke_api::repo::Repo;
     use mononoke_api::repo::RepoContext;
     use mononoke_macros::mononoke;
+    use tests_utils::CreateCommitContext;
 
     use super::*;
     use crate::RepoContextHgExt;
@@ -889,6 +1028,70 @@ mod tests {
         let hg = repo_ctx.hg();
         assert_eq!(hg.repo_ctx().name(), "repo");
 
+        Ok(())
+    }
+
+    async fn assert_graph_mapping_marks_drafts(fb: FacebookInit) -> Result<(), MononokeError> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
+
+        // A and B are public, C and D are drafts on top of them, and only A
+        // is common, so B is returned as a public commit among the drafts.
+        let a = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("a", "a")
+            .commit()
+            .await?;
+        let b = CreateCommitContext::new(&ctx, &repo, vec![a])
+            .add_file("b", "b")
+            .commit()
+            .await?;
+        let c = CreateCommitContext::new(&ctx, &repo, vec![a])
+            .add_file("c", "c")
+            .commit()
+            .await?;
+        let d = CreateCommitContext::new(&ctx, &repo, vec![b])
+            .add_file("d", "d")
+            .commit()
+            .await?;
+        repo.phases().add_reachable_as_public(&ctx, vec![b]).await?;
+
+        let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
+        let hg = repo_ctx.hg();
+        let hg_a = hg.get_hg_from_bonsai(a).await?;
+        let hg_b = hg.get_hg_from_bonsai(b).await?;
+        let hg_c = hg.get_hg_from_bonsai(c).await?;
+        let hg_d = hg.get_hg_from_bonsai(d).await?;
+
+        let mapping: HashMap<_, _> = hg
+            .get_graph_mapping(vec![hg_a], vec![hg_c, hg_d])
+            .await?
+            .into_iter()
+            .collect();
+        assert_eq!(
+            mapping,
+            hashmap! {
+                hg_d => (vec![hg_b], true),
+                hg_b => (vec![hg_a], false),
+                hg_c => (vec![hg_a], true),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_get_graph_mapping_marks_drafts(fb: FacebookInit) -> Result<(), MononokeError> {
+        // Drafts are classified from the phases with the knob on and by the
+        // getbundle draft walk with it off.
+        for knob_on in [true, false] {
+            with_just_knobs_async(
+                JustKnobsInMemory::new(hashmap! {
+                    "scm/mononoke:commit_graph_pull_optimizations".to_string() => KnobVal::Bool(knob_on),
+                }),
+                assert_graph_mapping_marks_drafts(fb).boxed(),
+            )
+            .await?;
+        }
         Ok(())
     }
 }

@@ -35,6 +35,7 @@ from . import (
     extensions,
     filemerge,
     git,
+    grepo,
     i18n,
     match as matchmod,
     pathutil,
@@ -2292,12 +2293,16 @@ def goto(
             updatecheck = "none"
         assert updatecheck in ("none", "noconflict")
 
+    if grepo.GREPO_REQUIREMENT in repo.requirements and not force:
+        grepo.checkout_manifest(repo, repo["."], repo[node], force, dry_run=True)
+
     if (
         repo.ui.configbool("workingcopy", "rust-checkout")
         and repo.ui.configbool("checkout", "use-rust")
         and (force or updatecheck != "none")
     ):
         repo.ui.log("checkout_info", python_checkout="rust")
+        source = repo["."]
         target = repo[node]
         try:
             with repo.dirstate.parentchange():
@@ -2322,89 +2327,96 @@ def goto(
                     report_mode="quiet",
                 )
                 if git.isgitformat(repo):
-                    git.submodulecheckout(target, force=force)
+                    _checkout_projects(repo, source, target, force)
                 repo.setparents(target.node())
-                return ret
         except rusterror.CheckoutConflictsError as ex:
             abort_on_conflicts(ex.args[0])
+    else:
+        repo.ui.log("checkout_info", python_checkout="python")
 
-    repo.ui.log("checkout_info", python_checkout="python")
-
-    _logupdatedistance(repo.ui, repo, node)
-    _prefetchlazychildren(repo, node)
-
-    if (
-        edenfs.requirement in repo.requirements
-        or git.DOTGIT_REQUIREMENT in repo.requirements
-    ):
-        from . import eden_update
-
-        return eden_update.update(
-            repo,
-            node,
-            force=force,
-            labels=labels,
-            updatecheck=updatecheck,
-        )
-
-    # If we're doing the initial checkout from null, let's use the new fancier
-    # nativecheckout, since it has more efficient fetch mechanics.
-    # git backend only supports nativecheckout at present.
-    isclonecheckout = repo["."].node() == nullid
-
-    if (
-        repo.ui.configbool("experimental", "nativecheckout")
-        or (repo.ui.configbool("clone", "nativecheckout") and isclonecheckout)
-        or git.isgitstore(repo)
-    ):
-        wc = repo[None]
+        _logupdatedistance(repo.ui, repo, node)
+        _prefetchlazychildren(repo, node)
 
         if (
-            not isclonecheckout
-            and (force or updatecheck != "noconflict")
-            and (wc.dirty(missing=True) or mergestate.read(repo).active())
+            edenfs.requirement in repo.requirements
+            or git.DOTGIT_REQUIREMENT in repo.requirements
         ):
-            fallbackcheckout = (
-                "Working copy is dirty and --clean specified - not supported yet"
+            from . import eden_update
+
+            ret = eden_update.update(
+                repo,
+                node,
+                force=force,
+                labels=labels,
+                updatecheck=updatecheck,
             )
-        elif not hasattr(repo.fileslog, "filestore"):
-            fallbackcheckout = "Repo does not have remotefilelog"
         else:
-            fallbackcheckout = None
+            # If we're doing the initial checkout from null, let's use the new fancier
+            # nativecheckout, since it has more efficient fetch mechanics.
+            # git backend only supports nativecheckout at present.
+            isclonecheckout = repo["."].node() == nullid
+            did_native_checkout = False
 
-        if fallbackcheckout:
-            repo.ui.debug("Not using native checkout: %s\n" % fallbackcheckout)
-        else:
-            # If the user is attempting to checkout for the first time, let's assume
-            # they don't have any pending changes and let's do a force checkout.
-            # This makes it much faster, by skipping the entire "check for unknown
-            # files" and "check for conflicts" code paths, and makes it so they
-            # aren't blocked by pending files and have to purge+clone over and over.
-            if isclonecheckout:
-                force = True
+            if (
+                repo.ui.configbool("experimental", "nativecheckout")
+                or (repo.ui.configbool("clone", "nativecheckout") and isclonecheckout)
+                or git.isgitstore(repo)
+            ):
+                wc = repo[None]
 
-            p1 = wc.parents()[0]
-            p2 = repo[node]
+                if (
+                    not isclonecheckout
+                    and (force or updatecheck != "noconflict")
+                    and (wc.dirty(missing=True) or mergestate.read(repo).active())
+                ):
+                    fallbackcheckout = "Working copy is dirty and --clean specified - not supported yet"
+                elif not hasattr(repo.fileslog, "filestore"):
+                    fallbackcheckout = "Repo does not have remotefilelog"
+                else:
+                    fallbackcheckout = None
 
-            with repo.wlock():
-                ret = donativecheckout(
+                if fallbackcheckout:
+                    repo.ui.debug("Not using native checkout: %s\n" % fallbackcheckout)
+                else:
+                    # If the user is attempting to checkout for the first time, let's assume
+                    # they don't have any pending changes and let's do a force checkout.
+                    # This makes it much faster, by skipping the entire "check for unknown
+                    # files" and "check for conflicts" code paths, and makes it so they
+                    # aren't blocked by pending files and have to purge+clone over and over.
+                    if isclonecheckout:
+                        force = True
+
+                    p1 = wc.parents()[0]
+                    p2 = repo[node]
+
+                    with repo.wlock():
+                        ret = donativecheckout(repo, p1, p2, force, wc)
+                        if git.isgitformat(repo):
+                            _checkout_projects(repo, p1, p2, force)
+                    did_native_checkout = True
+
+            if not did_native_checkout:
+                ret = _update(
                     repo,
-                    p1,
-                    p2,
-                    force,
-                    wc,
+                    node,
+                    force=force,
+                    labels=labels,
+                    updatecheck=updatecheck,
                 )
-                if git.isgitformat(repo):
-                    git.submodulecheckout(p2, force=force)
-                return ret
 
-    return _update(
-        repo,
-        node,
-        force=force,
-        labels=labels,
-        updatecheck=updatecheck,
-    )
+    return ret
+
+
+def _checkout_projects(repo, source, target, force):
+    """Check out the submodules of `target`.
+
+    In a grepo, check out the manifests before any project. As a result, a
+    failed project leaves the manifests at `target`. Call this only after the
+    main checkout passed the `preupdate` hook and its conflict checks.
+    """
+    if grepo.GREPO_REQUIREMENT in repo.requirements:
+        grepo.checkout_manifest(repo, source, target, force)
+    git.submodulecheckout(target, force=force)
 
 
 def merge(
@@ -2433,6 +2445,88 @@ def merge(
         wc=wc,
         from_repo=from_repo,
     )
+
+
+# Commit extra set on merge commits created by 'merge --noconflict'. Such a
+# commit has no content of its own: it only records that its parents combine
+# without conflicts, so tools can treat it as bookkeeping.
+NOCONFLICT_MERGE_EXTRA = "noconflict_merge"
+
+
+def merge_in_memory(repo, node, force=False, labels=None, basectx=None, wctx=None):
+    """Merge `node` into `basectx` (default: the working copy parent) in
+    memory and return the resulting overlay context (`wctx` if given).
+    Raises InMemoryMergeConflictsError, with the first affected paths, if
+    the merge cannot be completed automatically. The working copy is not
+    touched either way.
+    """
+    from . import context
+
+    if wctx is None:
+        wctx = context.overlayworkingctx(repo)
+    wctx.setbase(basectx if basectx is not None else repo["."])
+    # Callers report progress themselves; this merge is silent.
+    repo.ui.pushbuffer(error=True)
+    try:
+        stats = merge(repo, node, force=force, labels=labels, wc=wctx)
+    finally:
+        repo.ui.popbuffer()
+    if stats[3] > 0:
+        # Conflicts normally surface from the file merge itself with their
+        # paths; this only guards against a merge that reported unresolved
+        # files without raising.
+        raise error.InMemoryMergeConflictsError(
+            _("%d unresolved files") % stats[3],
+            type=error.InMemoryMergeConflictsError.TYPE_FILE_CONFLICTS,
+            paths=[],
+        )
+    return wctx
+
+
+def check_noconflict_merge(repo, node, force=False, labels=None, basectx=None):
+    """Merge `node` into `basectx` (default: the working copy parent) in
+    memory and return the result, or abort with the first affected paths."""
+    try:
+        return merge_in_memory(repo, node, force=force, labels=labels, basectx=basectx)
+    except error.InMemoryMergeConflictsError as e:
+        paths = sorted(set(e.paths))
+        if paths:
+            msg = _("merge of %s stopped at conflicts in:\n %s") % (
+                repo[node],
+                "\n ".join(paths),
+            )
+        else:
+            msg = _("merge of %s would have conflicts: %s") % (repo[node], e)
+        raise error.Abort(
+            msg,
+            hint=_("run '@prog@ merge' without --noconflict to resolve them by hand"),
+        )
+
+
+def is_noconflict_merge(ctx):
+    return len(ctx.parents()) == 2 and ctx.extra().get(NOCONFLICT_MERGE_EXTRA) == "1"
+
+
+def landed_successor(repo, ctx):
+    """The public commit an obsolete `ctx` was rewritten into, or None.
+
+    A commit counts as landed when all terminal successors are public and
+    the mutation history is present locally.
+    """
+    from . import mutation
+
+    if not ctx.obsolete() or not mutation.enabled(repo):
+        return None
+    nodemap = repo.changelog.nodemap
+    succs = [n for n in mutation.allsuccessors(repo, [ctx.node()]) if n != ctx.node()]
+    if any(n not in nodemap for n in succs):
+        return None
+    terminal = [
+        n for n in succs if repo[n].ispublic() or not mutation.lookupsuccessors(repo, n)
+    ]
+    if not terminal or not all(repo[n].ispublic() for n in terminal):
+        return None
+    return terminal[0]
 
 
 @perftrace.tracefunc("Update")
@@ -2719,12 +2813,9 @@ def _update(
 
     if git.isgitformat(to_repo) and not wc.isinmemory() and not is_crossrepo:
         if branchmerge:
-            ctx = p1
-            mctx = p2
+            git.submodulecheckout(p1, force=force, mctx=p2)
         else:
-            ctx = p2
-            mctx = None
-        git.submodulecheckout(ctx, force=force, mctx=mctx)
+            _checkout_projects(to_repo, p1, p2, force)
 
     if not wc.isinmemory():
         # XXX: extend preupdate hook to support cross repo merge case

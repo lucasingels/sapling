@@ -20,7 +20,7 @@ import type {
 } from './types';
 
 import {act, screen, waitFor, within} from '@testing-library/react';
-import {nextTick} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import platform from './platform';
 import {deserializeFromString, serializeToString} from './serialize';
 import {mostRecentSubscriptionIds} from './serverAPIState';
@@ -76,13 +76,14 @@ export function simulateWorktreeInfo(
     label?: string;
     node?: string;
   }>,
+  supportsMutation = true,
 ) {
   act(() => {
     simulateMessageFromServer({
       type: 'subscriptionResult',
       kind: 'worktreeInfo',
       subscriptionID: mostRecentSubscriptionIds.worktreeInfo,
-      data: {sharedRoot, worktrees: worktrees as WorktreeEntry[]},
+      data: {sharedRoot, worktrees: worktrees as WorktreeEntry[], supportsMutation},
     });
   });
 }

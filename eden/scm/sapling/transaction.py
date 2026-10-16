@@ -162,6 +162,8 @@ class transaction(util.transactional):
         uiconfig=None,
         desc=None,
         lockfree=False,
+        pendingroot=None,
+        sharedpendingroot=None,
     ):
         """Begin a new transaction
 
@@ -187,6 +189,9 @@ class transaction(util.transactional):
         self.report = report
         self.desc = desc
         self.lockfree = lockfree
+        # Repo roots used to scope legacy pending files for child processes.
+        self._pendingroot = pendingroot
+        self._sharedpendingroot = sharedpendingroot
         # a vfs to the store content
         self.opener = opener
         # a map to access file in various {location -> vfs}
@@ -250,8 +255,6 @@ class transaction(util.transactional):
         self._filegenerators = {}
         # hold callback to write pending data for hooks
         self._pendingcallback = {}
-        # True is any pending data have been written ever
-        self._anypending = False
         # holds callback to call when writing the transaction
         self._finalizecallback = {}
         # hold callback for post transaction close
@@ -433,9 +436,9 @@ class transaction(util.transactional):
 
     def _generatefiles(self, suffix="", group=gengroupall):
         # write files registered for generation
-        any = False
+        pending = bool(suffix)
+        wrotephysical = False
         for id, entry in sorted(self._filegenerators.items()):
-            any = True
             order, filenames, genfunc, location = entry
 
             # for generation at closing, check if it's before or after finalize
@@ -447,6 +450,10 @@ class transaction(util.transactional):
             files = []
             try:
                 for name in filenames:
+                    if pending and not location and name in METALOG_TRACKED:
+                        files.append(vfs.metaopen(name, "w", mirror=False))
+                        continue
+                    wrotephysical = True
                     name += suffix
                     if suffix:
                         self.registertmp(name, location=location)
@@ -460,7 +467,7 @@ class transaction(util.transactional):
             finally:
                 for f in files:
                     f.close()
-        return any
+        return wrotephysical
 
     @active
     def find(self, file):
@@ -519,18 +526,21 @@ class transaction(util.transactional):
 
         This is used to allow hooks to view a transaction before commit
 
-        Returns a bool, `isanypending`.
-
-        `isanypending` indicates if there are anything pending (whether
-        HG_PENDING should be set).
-
         If `env` is not None, it is a dictionary that will be mutated to
-        include information to pick up _metalog_ pending changes.
+        include information to pick up pending changes.
         """
         for cat, callback in sorted(self._pendingcallback.items()):
-            any = callback(self)
-            self._anypending = self._anypending or any
-        self._anypending |= self._generatefiles(suffix=".pending")
+            callback(self)
+        islegacypending = self._generatefiles(suffix=".pending")
+
+        if env is not None and islegacypending:
+            pendingenv = (
+                ("HG_PENDING", self._pendingroot),
+                ("HG_SHAREDPENDING", self._sharedpendingroot),
+            )
+            for name, root in pendingenv:
+                if root is not None:
+                    env[name] = root
 
         # Write pending metalog changes. Other processes can load the
         # metalog with rootid set to `mlrootid` explicitly to see the
@@ -538,7 +548,6 @@ class transaction(util.transactional):
         # not explicitly set.
         ml = self._vfsmap[""].metalog
         if ml.isdirty():
-            self._anypending = True
             rootid = ml.commit("(transaction pending)", pending=True)
             if env is not None:
                 # Set the environment variable to specify metalog root for the
@@ -555,7 +564,6 @@ class transaction(util.transactional):
                     env[ENV_PENDING_METALOG] = encodependingmetalog(pathroots)
                 else:
                     env.pop(ENV_PENDING_METALOG, None)
-        return self._anypending
 
     @active
     def addfinalize(self, category, callback):

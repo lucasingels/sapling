@@ -21,6 +21,7 @@ pub struct CachelibSettings {
     pub use_tupperware_shrinker: bool,
     pub presence_cache_size: Option<usize>,
     pub commit_graph_cache_size: Option<usize>,
+    pub commit_derived_data_mapping_cache_size: Option<usize>,
     pub filenodes_cache_size: Option<usize>,
     pub filenodes_history_cache_size: Option<usize>,
     pub hg_mutation_store_cache_size: Option<usize>,
@@ -28,6 +29,7 @@ pub struct CachelibSettings {
     pub bonsai_git_mapping_cache_size: Option<usize>,
     pub globalrev_cache_size: Option<usize>,
     pub svnrev_cache_size: Option<usize>,
+    pub p4_changelist_cache_size: Option<usize>,
     pub blob_cache_size: Option<usize>,
     pub phases_cache_size: Option<usize>,
     pub mutable_renames_cache_size: Option<usize>,
@@ -87,6 +89,11 @@ impl CachelibSettings {
         );
         set_default(
             &mut defaults,
+            "commit-derived-data-mapping-cache-size",
+            &self.commit_derived_data_mapping_cache_size,
+        );
+        set_default(
+            &mut defaults,
             "filenodes-cache-size",
             &self.filenodes_cache_size,
         );
@@ -116,6 +123,11 @@ impl CachelibSettings {
             &self.globalrev_cache_size,
         );
         set_default(&mut defaults, "svnrevs-cache-size", &self.svnrev_cache_size);
+        set_default(
+            &mut defaults,
+            "p4_changelists_cache_size",
+            &self.p4_changelist_cache_size,
+        );
         set_default(&mut defaults, "blob-cache-size", &self.blob_cache_size);
         set_default(&mut defaults, "phases-cache-size", &self.phases_cache_size);
         set_default(
@@ -162,6 +174,10 @@ impl CachelibSettings {
             &mut self.commit_graph_cache_size,
             &args.commit_graph_cache_size,
         );
+        replace(
+            &mut self.commit_derived_data_mapping_cache_size,
+            &args.commit_derived_data_mapping_cache_size,
+        );
         replace(&mut self.filenodes_cache_size, &args.filenodes_cache_size);
         replace(
             &mut self.filenodes_history_cache_size,
@@ -178,6 +194,10 @@ impl CachelibSettings {
         );
         replace(&mut self.globalrev_cache_size, &args.globalrevs_cache_size);
         replace(&mut self.svnrev_cache_size, &args.svnrevs_cache_size);
+        replace(
+            &mut self.p4_changelist_cache_size,
+            &args.p4_changelists_cache_size,
+        );
         replace(&mut self.blob_cache_size, &args.blob_cache_size);
         replace(&mut self.phases_cache_size, &args.phases_cache_size);
         replace(
@@ -203,6 +223,7 @@ impl Default for CachelibSettings {
             use_tupperware_shrinker: false,
             presence_cache_size: None,
             commit_graph_cache_size: None,
+            commit_derived_data_mapping_cache_size: None,
             filenodes_cache_size: None,
             filenodes_history_cache_size: None,
             hg_mutation_store_cache_size: None,
@@ -210,6 +231,7 @@ impl Default for CachelibSettings {
             bonsai_git_mapping_cache_size: None,
             globalrev_cache_size: None,
             svnrev_cache_size: None,
+            p4_changelist_cache_size: None,
             blob_cache_size: None,
             phases_cache_size: None,
             mutable_renames_cache_size: None,
@@ -221,5 +243,34 @@ impl Default for CachelibSettings {
             cache_file_path: None,
             cache_file_size: 32 * ONE_GIB as u64,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use clap::Args;
+    use clap::Command;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+    use crate::CachelibArgs;
+
+    /// Every default name must be the clap id of a real argument, or the app builder's
+    /// `mut_arg` panics at startup.
+    #[mononoke::test]
+    fn test_p4_changelist_cache_size_default_names_a_real_arg() {
+        let settings = CachelibSettings {
+            p4_changelist_cache_size: Some(4096),
+            ..Default::default()
+        };
+        let mut command = CachelibArgs::augment_args(Command::new("test"));
+        for (name, default) in settings.arg_defaults() {
+            command = command.mut_arg(name, |arg| arg.default_value(default));
+        }
+        let p4_default = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "p4_changelists_cache_size")
+            .map(|arg| arg.get_default_values().to_vec());
+        assert_eq!(p4_default, Some(vec!["4096".into()]));
     }
 }

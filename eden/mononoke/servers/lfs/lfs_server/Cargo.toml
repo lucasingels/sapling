@@ -29,9 +29,9 @@ gotham_ext = { version = "0.1.0", path = "../../../common/gotham_ext" }
 hostname = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 http = "1.5.0"
 http-body = "1.1.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"] }
-hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 lfs_protocol = { version = "0.1.0", path = "../../../common/lfs_protocol" }
 lfs_server_config = { version = "0.1.0", path = "../../../../../configerator/structs/scm/mononoke/lfs_server" }
@@ -47,7 +47,7 @@ ods_counters = { version = "0.1.0", path = "../../../common/ods_counters" }
 openssl = "0.10.80"
 permission_checker = { version = "0.1.0", path = "../../../common/permission_checker" }
 pin-project = "1.1.13"
-rand = "0.10.2"
+rand = "0.10.3"
 rate_limiting = { version = "0.1.0", path = "../../../common/rate_limiting" }
 redactedblobstore = { version = "0.1.0", path = "../../../blobstore/redactedblobstore" }
 regex = "1.13.1"
@@ -62,10 +62,10 @@ secure_utils = { version = "0.1.0", git = "https://github.com/facebookexperiment
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 time_window_counter = { version = "0.1.0", path = "../../../common/time_window_counter" }
-tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.53.2", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

@@ -18,6 +18,9 @@ use bookmarks::BookmarkName;
 use bookmarks::Freshness;
 use context::CoreContext;
 use dbbookmarks::store::SqlBookmarksRef;
+use futures::stream;
+use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use mononoke_types::hash::GitSha1;
@@ -27,6 +30,21 @@ use sql_ext::mononoke_queries;
 use crate::repo_provider::RepoProvider;
 
 const BATCH_SIZE: usize = 500;
+
+/// Chunks are independent `IN (...)` reads against the same shard's
+/// connection pool, so this many run concurrently instead of one at a time.
+/// 10-50 is this crate's convention for SQL-backed stores (see
+/// `sequential_blobstore_fetches` guidance).
+///
+/// Note: each chunk is materialised with `to_vec` rather than kept as a
+/// borrowed `&[..]` slice. Feeding borrowed slices through `StreamExt::map`
+/// into an async block makes the closure higher-ranked over the slice
+/// lifetime, which trips rustc's "implementation of `Send` is not general
+/// enough" auto-trait leak in the Thrift service that awaits these futures
+/// (only visible in `mode/opt`, not `mode/dev-rust-oss`). The copy is one
+/// chunk of small keys per query, far below the cost of the round-trip it
+/// overlaps.
+const CHUNK_CONCURRENCY: usize = 10;
 
 mononoke_queries! {
     read BulkResolveBookmarksCrossRepo(
@@ -81,20 +99,25 @@ where
         .collect();
 
     let conn = conn_repo.sql_bookmarks().connection(ctx, freshness);
-    let mut values = HashMap::new();
-    for chunk in unique.chunks(BATCH_SIZE) {
-        let rows = BulkResolveBookmarksCrossRepo::query(conn, ctx.sql_query_telemetry(), chunk)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to query bookmarks for chunk of {} pairs",
-                    chunk.len()
-                )
-            })?;
-        for (repo_id, name, cs_id) in rows {
-            values.insert((repo_id, name), cs_id);
-        }
-    }
+    let values = stream::iter(unique.chunks(BATCH_SIZE).map(<[_]>::to_vec))
+        .map(|chunk| async move {
+            BulkResolveBookmarksCrossRepo::query(conn, ctx.sql_query_telemetry(), &chunk)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to query bookmarks for chunk of {} pairs",
+                        chunk.len()
+                    )
+                })
+        })
+        .buffer_unordered(CHUNK_CONCURRENCY)
+        .try_fold(HashMap::new(), |mut values, rows| async move {
+            for (repo_id, name, cs_id) in rows {
+                values.insert((repo_id, name), cs_id);
+            }
+            Ok(values)
+        })
+        .await?;
     Ok(values)
 }
 
@@ -122,20 +145,25 @@ where
         .collect();
 
     let conn = conn_repo.sql_bookmarks().connection(ctx, freshness);
-    let mut values = HashMap::new();
-    for chunk in unique.chunks(BATCH_SIZE) {
-        let rows = BulkGitMappingCrossRepo::query(conn, ctx.sql_query_telemetry(), chunk)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to query git mappings for chunk of {} pairs",
-                    chunk.len()
-                )
-            })?;
-        for (repo_id, bcs_id, git_sha1) in rows {
-            values.insert((repo_id, bcs_id), git_sha1);
-        }
-    }
+    let values = stream::iter(unique.chunks(BATCH_SIZE).map(<[_]>::to_vec))
+        .map(|chunk| async move {
+            BulkGitMappingCrossRepo::query(conn, ctx.sql_query_telemetry(), &chunk)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to query git mappings for chunk of {} pairs",
+                        chunk.len()
+                    )
+                })
+        })
+        .buffer_unordered(CHUNK_CONCURRENCY)
+        .try_fold(HashMap::new(), |mut values, rows| async move {
+            for (repo_id, bcs_id, git_sha1) in rows {
+                values.insert((repo_id, bcs_id), git_sha1);
+            }
+            Ok(values)
+        })
+        .await?;
     Ok(values)
 }
 
@@ -163,20 +191,25 @@ where
         .collect();
 
     let conn = conn_repo.sql_bookmarks().connection(ctx, freshness);
-    let mut values = HashMap::new();
-    for chunk in unique.chunks(BATCH_SIZE) {
-        let rows = BulkBonsaiByGitCrossRepo::query(conn, ctx.sql_query_telemetry(), chunk)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to query bonsais by git sha for chunk of {} pairs",
-                    chunk.len()
-                )
-            })?;
-        for (repo_id, git_sha1, bcs_id) in rows {
-            values.insert((repo_id, git_sha1), bcs_id);
-        }
-    }
+    let values = stream::iter(unique.chunks(BATCH_SIZE).map(<[_]>::to_vec))
+        .map(|chunk| async move {
+            BulkBonsaiByGitCrossRepo::query(conn, ctx.sql_query_telemetry(), &chunk)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to query bonsais by git sha for chunk of {} pairs",
+                        chunk.len()
+                    )
+                })
+        })
+        .buffer_unordered(CHUNK_CONCURRENCY)
+        .try_fold(HashMap::new(), |mut values, rows| async move {
+            for (repo_id, git_sha1, bcs_id) in rows {
+                values.insert((repo_id, git_sha1), bcs_id);
+            }
+            Ok(values)
+        })
+        .await?;
     Ok(values)
 }
 
@@ -193,6 +226,10 @@ pub enum ResolveOutcome {
     Resolved(GitSha1),
     /// Human-readable reason resolution failed.
     Error(String),
+    /// The repo is not served here; the message keeps the `unknown repo` form.
+    UnknownRepo(String),
+    /// The repo is served but did not build; the reason is the load error.
+    LoadFailed(String),
 }
 
 /// Per-entry result; results are returned in input order.
@@ -229,8 +266,8 @@ where
     let mut any_repo: Option<Arc<R>> = None;
 
     for (idx, entry) in entries.iter().enumerate() {
-        match provider.get_by_name(&entry.repo_name) {
-            Some(repo) => {
+        match provider.get_or_load(&entry.repo_name).await {
+            Ok(Some(repo)) => {
                 let repo_id = repo.repo_identity().id();
                 if any_repo.is_none() {
                     any_repo = Some(repo);
@@ -242,13 +279,27 @@ where
                     entry.bookmark_name.clone(),
                 ));
             }
-            None => {
+            Ok(None) => {
                 if let Some(slot) = results.get_mut(idx) {
                     *slot = Some(ResolveResult {
                         repo_name: entry.repo_name.clone(),
                         bookmark_name: entry.bookmark_name.clone(),
-                        outcome: ResolveOutcome::Error(format!(
+                        outcome: ResolveOutcome::UnknownRepo(format!(
                             "unknown repo: {}",
+                            entry.repo_name
+                        )),
+                    });
+                }
+            }
+            // A served repo that failed to load is this entry's error, not the
+            // batch's: the other members still resolve.
+            Err(e) => {
+                if let Some(slot) = results.get_mut(idx) {
+                    *slot = Some(ResolveResult {
+                        repo_name: entry.repo_name.clone(),
+                        bookmark_name: entry.bookmark_name.clone(),
+                        outcome: ResolveOutcome::LoadFailed(format!(
+                            "repo {} failed to load: {e:#}",
                             entry.repo_name
                         )),
                     });

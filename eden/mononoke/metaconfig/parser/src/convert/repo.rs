@@ -16,6 +16,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::ensure;
 use bookmarks_types::BookmarkKey;
 use metaconfig_types::AclManifestMode;
 use metaconfig_types::Address;
@@ -41,6 +42,7 @@ use metaconfig_types::DirectoryBranchClusterConfig;
 use metaconfig_types::DirectoryBranchClusterFixedCluster;
 use metaconfig_types::DirectoryBranchClusterFixedConfig;
 use metaconfig_types::EnforcementConditionSet;
+use metaconfig_types::EnforcementExemptionSet;
 use metaconfig_types::GitBundleURIConfig;
 use metaconfig_types::GitConcurrencyParams;
 use metaconfig_types::GitConfigs;
@@ -55,6 +57,7 @@ use metaconfig_types::HookParams;
 use metaconfig_types::InferredCopyFromConfig;
 use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
+use metaconfig_types::LazyLoadingConfig;
 use metaconfig_types::LfsParams;
 use metaconfig_types::LoggingDestination;
 use metaconfig_types::MergeResolutionOverride;
@@ -71,6 +74,7 @@ use metaconfig_types::PushrebaseParams;
 use metaconfig_types::PushrebaseRemoteMode;
 use metaconfig_types::RemoteDerivationConfig;
 use metaconfig_types::RemoteDiffConfig;
+use metaconfig_types::RequestMatchers;
 use metaconfig_types::RestrictedPathsConfig;
 use metaconfig_types::RestrictedPathsManifestIdStoreConfig;
 use metaconfig_types::ServiceWriteRestrictions;
@@ -116,6 +120,7 @@ use repos::RawDirectoryBranchClusterConfig;
 use repos::RawDirectoryBranchClusterFixedCluster;
 use repos::RawDirectoryBranchClusterFixedConfig;
 use repos::RawEligibilityCheck;
+use repos::RawEnforcementConditionSet;
 use repos::RawGitBundleURIConfig;
 use repos::RawGitConcurrencyParams;
 use repos::RawGitConfigs;
@@ -125,6 +130,7 @@ use repos::RawHookConfig;
 use repos::RawHookManagerParams;
 use repos::RawInferredCopyFromConfig;
 use repos::RawInfinitepushParams;
+use repos::RawLazyLoadingConfig;
 use repos::RawLfsParams;
 use repos::RawLoggingDestination;
 use repos::RawLoggingDestinationScribe;
@@ -397,12 +403,6 @@ impl Convert for RawPushrebaseParams {
                     })
                     .transpose()?
                     .unwrap_or_default(),
-                pessimistic_locking_bookmarks: self
-                    .pessimistic_locking_bookmarks
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(BookmarkKey::new)
-                    .collect::<Result<Vec<_>>>()?,
                 merge_resolution_override: MergeResolutionOverride::UseJk, // request-scoped, not loaded from config
                 land_instance_id: None, // request-scoped, not loaded from config
                 phab_diff_id: None,     // request-scoped, not loaded from config
@@ -1205,6 +1205,9 @@ impl Convert for RawShardedService {
             RawShardedService::DERIVATION_PIPELINE_TAILER => {
                 ShardedService::DerivationPipelineTailer
             }
+            RawShardedService::DERIVATION_PIPELINE_WORKER => {
+                ShardedService::DerivationPipelineWorker
+            }
             v => return Err(anyhow!("Invalid value {v} for enum ShardedService")),
         };
         Ok(service)
@@ -1224,6 +1227,24 @@ impl Convert for RawShardingModeConfig {
                 // such a case, it should be safe to ignore this unknown value cause the existing code can work without it.
                 .filter_map(|(k, v)| k.convert().map(|k| (k, v)).ok())
                 .collect(),
+        })
+    }
+}
+
+impl Convert for RawLazyLoadingConfig {
+    type Output = LazyLoadingConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(LazyLoadingConfig {
+            sharded: self
+                .sharded
+                .unwrap_or_default()
+                .into_iter()
+                // Unknown services are dropped, not rejected, so adding one is
+                // not a breaking change for older binaries.
+                .filter_map(|(k, v)| k.convert().map(|k| (k, v)).ok())
+                .collect(),
+            unsharded: self.unsharded.unwrap_or(false),
         })
     }
 }
@@ -1488,30 +1509,29 @@ impl Convert for RawRestrictedPathsConfig {
             .map(|raw| {
                 Ok::<_, anyhow::Error>(EnforcementConditionSet {
                     always_enabled: raw.always_enabled.unwrap_or(false),
-                    entry_points: raw.entry_points.unwrap_or_default(),
                     require_client_request_flag: raw.require_client_request_flag.unwrap_or(false),
                     restriction_acls: raw
                         .restriction_acls
-                        .unwrap_or_default()
-                        .into_iter()
+                        .iter()
+                        .flatten()
                         .map(|s| {
-                            MononokeIdentity::from_str(&s)
+                            MononokeIdentity::from_str(s)
                                 .with_context(|| format!("parsing restriction_acl `{s}`"))
                         })
                         .collect::<Result<Vec<_>>>()?,
-                    machine_tiers: raw.machine_tiers.unwrap_or_default(),
-                    build_rules: raw.build_rules.unwrap_or_default(),
-                    client_identity_regexes: raw
-                        .client_identity_regexes
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|pattern| {
-                            ComparableRegex::new(&pattern).with_context(|| {
-                                format!("parsing client_identity_regex `{pattern}`")
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?,
+                    matchers: convert_request_matchers(raw)?,
                 })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let enforcement_exemption_sets = self
+            .enforcement_exemption_sets
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                convert_enforcement_exemption_set(raw)
+                    .with_context(|| format!("invalid enforcement_exemption_sets[{index}]"))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1525,10 +1545,59 @@ impl Convert for RawRestrictedPathsConfig {
                 .acl_file_name
                 .unwrap_or(RestrictedPathsConfig::default().acl_file_name.to_string()),
             enforcement_condition_sets,
+            enforcement_exemption_sets,
             enforcement_enabled: self.enforcement_enabled.unwrap_or(false),
             acl_manifest_mode: parse_acl_manifest_mode(self.acl_manifest_mode.as_deref())?,
+            denial_message: self.denial_message,
         })
     }
+}
+
+/// Convert the request-metadata matchers of a raw enforcement condition set.
+fn convert_request_matchers(raw: RawEnforcementConditionSet) -> Result<RequestMatchers> {
+    Ok(RequestMatchers {
+        entry_points: raw.entry_points.unwrap_or_default(),
+        machine_tiers: raw.machine_tiers.unwrap_or_default(),
+        build_rules: raw.build_rules.unwrap_or_default(),
+        client_identity_regexes: raw
+            .client_identity_regexes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pattern| {
+                ComparableRegex::new(&pattern)
+                    .with_context(|| format!("parsing client_identity_regex `{pattern}`"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        is_agent: raw.is_agent,
+    })
+}
+
+/// Convert a raw enforcement exemption set.
+///
+/// Exemptions share the raw condition-set shape in thrift, but a mistake fails
+/// open, so the fields an exemption cannot have are rejected rather than
+/// ignored, as is a set with no matcher. That includes the deprecated
+/// `restriction_roots`, which condition sets ignore.
+fn convert_enforcement_exemption_set(
+    raw: RawEnforcementConditionSet,
+) -> Result<EnforcementExemptionSet> {
+    ensure!(
+        raw.always_enabled != Some(true),
+        "exemptions cannot set `always_enabled`"
+    );
+    ensure!(
+        raw.require_client_request_flag != Some(true),
+        "exemptions cannot set `require_client_request_flag`"
+    );
+    ensure!(
+        raw.restriction_acls.as_ref().is_none_or(Vec::is_empty),
+        "exemptions cannot set `restriction_acls`"
+    );
+    ensure!(
+        raw.restriction_roots.as_ref().is_none_or(Vec::is_empty),
+        "exemptions cannot set `restriction_roots`"
+    );
+    EnforcementExemptionSet::new(convert_request_matchers(raw)?)
 }
 
 fn convert_manifest_id_store_config(
@@ -1579,7 +1648,6 @@ fn positive_config_value(field_name: &str, value: Option<i64>, default: u64) -> 
 mod tests {
     use mononoke_macros::mononoke;
     use repos::RawDerivationPipelineConfig;
-    use repos::RawEnforcementConditionSet;
 
     use super::*;
 
@@ -1787,12 +1855,189 @@ mod tests {
         raw.enforcement_condition_sets = Some(vec![raw_set]);
         let cfg: RestrictedPathsConfig = raw.convert().unwrap();
         assert_eq!(cfg.enforcement_condition_sets.len(), 1);
-        let regexes = &cfg.enforcement_condition_sets[0].client_identity_regexes;
+        let regexes = &cfg.enforcement_condition_sets[0]
+            .matchers
+            .client_identity_regexes;
         assert_eq!(regexes.len(), 1, "expected exactly one compiled regex");
         assert_eq!(regexes[0].as_str(), "^USER:foo$");
         assert!(
             regexes[0].is_match("USER:foo"),
             "compiled regex should match the canonical identity Display form",
+        );
+    }
+
+    #[mononoke::test]
+    fn test_parse_is_agent_passthrough() {
+        let raw_sets = vec![
+            RawEnforcementConditionSet {
+                is_agent: Some(true),
+                ..Default::default()
+            },
+            RawEnforcementConditionSet {
+                is_agent: Some(false),
+                ..Default::default()
+            },
+            RawEnforcementConditionSet {
+                is_agent: None,
+                ..Default::default()
+            },
+        ];
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_condition_sets = Some(raw_sets);
+        let cfg: RestrictedPathsConfig = raw.convert().unwrap();
+        assert_eq!(cfg.enforcement_condition_sets.len(), 3);
+        assert_eq!(
+            cfg.enforcement_condition_sets[0].matchers.is_agent,
+            Some(true)
+        );
+        assert_eq!(
+            cfg.enforcement_condition_sets[1].matchers.is_agent,
+            Some(false)
+        );
+        assert_eq!(cfg.enforcement_condition_sets[2].matchers.is_agent, None);
+    }
+
+    /// What it tests: exemption sets are parsed with the same matchers as
+    /// condition sets.
+    /// Expected: request-local matchers pass through unchanged, and an absent
+    /// list parses as no exemptions.
+    #[mononoke::test]
+    fn test_parse_enforcement_exemption_sets_passthrough() -> Result<()> {
+        let cfg: RestrictedPathsConfig = empty_raw_restricted_paths_config().convert()?;
+        assert!(
+            cfg.enforcement_exemption_sets.is_empty(),
+            "an absent list should parse as no exemptions"
+        );
+
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_exemption_sets = Some(vec![RawEnforcementConditionSet {
+            entry_points: Some(vec!["scs".to_string()]),
+            machine_tiers: Some(vec!["od".to_string()]),
+            build_rules: Some(vec!["fbcode:foo:bar".to_string()]),
+            client_identity_regexes: Some(vec!["^SERVICE_IDENTITY:svc$".to_string()]),
+            is_agent: Some(false),
+            ..Default::default()
+        }]);
+        let cfg: RestrictedPathsConfig = raw.convert()?;
+
+        let [exemption] = cfg.enforcement_exemption_sets.as_slice() else {
+            bail!(
+                "expected one exemption, got {:?}",
+                cfg.enforcement_exemption_sets
+            );
+        };
+        assert_eq!(
+            exemption,
+            &EnforcementExemptionSet::new(RequestMatchers {
+                entry_points: vec!["scs".to_string()],
+                machine_tiers: vec!["od".to_string()],
+                build_rules: vec!["fbcode:foo:bar".to_string()],
+                client_identity_regexes: vec![ComparableRegex::new("^SERVICE_IDENTITY:svc$")?],
+                is_agent: Some(false),
+            })?,
+            "every request-local matcher should pass through unchanged"
+        );
+        Ok(())
+    }
+
+    /// What it tests: exemption sets that could match more than intended are
+    /// rejected at parse time.
+    /// Expected: `always_enabled`, `require_client_request_flag`,
+    /// `restriction_acls`, the deprecated `restriction_roots` and a set with no
+    /// matcher each fail with an error naming the offending exemption and field.
+    #[mononoke::test]
+    fn test_parse_enforcement_exemption_sets_rejects_unsafe_sets() -> Result<()> {
+        let scs_only = || RawEnforcementConditionSet {
+            entry_points: Some(vec!["scs".to_string()]),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                RawEnforcementConditionSet {
+                    always_enabled: Some(true),
+                    ..scs_only()
+                },
+                "`always_enabled`",
+            ),
+            (
+                RawEnforcementConditionSet {
+                    require_client_request_flag: Some(true),
+                    ..scs_only()
+                },
+                "`require_client_request_flag`",
+            ),
+            (
+                RawEnforcementConditionSet {
+                    restriction_acls: Some(vec!["REPO_REGION:tent".to_string()]),
+                    ..scs_only()
+                },
+                "`restriction_acls`",
+            ),
+            (
+                RawEnforcementConditionSet {
+                    restriction_roots: Some(vec!["secret/tent".to_string()]),
+                    ..scs_only()
+                },
+                "`restriction_roots`",
+            ),
+            (
+                RawEnforcementConditionSet {
+                    always_enabled: Some(false),
+                    require_client_request_flag: Some(false),
+                    ..Default::default()
+                },
+                "must set at least one of",
+            ),
+        ];
+
+        cases.into_iter().try_for_each(|(exemption, expected)| {
+            let mut raw = empty_raw_restricted_paths_config();
+            raw.enforcement_exemption_sets = Some(vec![scs_only(), exemption]);
+            let error = <RawRestrictedPathsConfig as Convert>::convert(raw)
+                .err()
+                .ok_or_else(|| anyhow!("expected exemption rejected for {expected}"))?;
+            let message = format!("{error:#}");
+            ensure!(
+                message.contains("enforcement_exemption_sets[1]") && message.contains(expected),
+                "expected error naming enforcement_exemption_sets[1] and {expected}, got: {message}"
+            );
+            Ok(())
+        })
+    }
+
+    /// What it tests: `false` is the same as unset for the boolean fields an
+    /// exemption may not enable.
+    /// Expected: an exemption with explicit `false` values and a real matcher
+    /// parses.
+    #[mononoke::test]
+    fn test_parse_enforcement_exemption_sets_accepts_explicit_false() -> Result<()> {
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.enforcement_exemption_sets = Some(vec![RawEnforcementConditionSet {
+            always_enabled: Some(false),
+            require_client_request_flag: Some(false),
+            is_agent: Some(true),
+            ..Default::default()
+        }]);
+        let cfg: RestrictedPathsConfig = raw.convert()?;
+        assert_eq!(
+            cfg.enforcement_exemption_sets.len(),
+            1,
+            "explicit `false` should be accepted like an unset field"
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_parse_denial_message_passthrough() {
+        let cfg: RestrictedPathsConfig = empty_raw_restricted_paths_config().convert().unwrap();
+        assert_eq!(cfg.denial_message, None);
+
+        let mut raw = empty_raw_restricted_paths_config();
+        raw.denial_message = Some("see https://fburl.com/example".to_string());
+        let cfg: RestrictedPathsConfig = raw.convert().unwrap();
+        assert_eq!(
+            cfg.denial_message.as_deref(),
+            Some("see https://fburl.com/example")
         );
     }
 

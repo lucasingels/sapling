@@ -7,13 +7,17 @@ rust_library(
     name = "cas_client",
     srcs = glob(["client/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "client"},
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+        "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+    ],
     deps = (
         [
             "fbsource//third-party/rust:anyhow",
             "fbsource//third-party/rust:async-trait",
             "fbsource//third-party/rust:bytes",
             "fbsource//third-party/rust:futures",
-            "fbsource//third-party/rust:thiserror",
             "//common/rust/shed/fbinit:fbinit",
             "//eden/mononoke/blobstore:blobstore",
             "//eden/mononoke/blobstore:fileblob",
@@ -25,6 +29,7 @@ rust_library(
             if rust_oss.is_oss_build()
             else [
                 "//cas/client_lib/wrappers/rust:cas_client_lib",
+                "//common/rust/folly/logging:logging",
                 "//common/rust/shed/futures_ext:futures_ext",
                 "fbsource//third-party/rust:tracing",
                 "fbsource//third-party/rust:tokio",
@@ -41,9 +46,9 @@ rust_library(
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:futures",
-        "fbsource//third-party/rust:thiserror",
         "//common/rust/shed/stats:stats",
         "//eden/mononoke/blobstore:blobstore",
+        "//eden/mononoke/blobstore:redactedblobstore",
         "//eden/mononoke/common/cas_client:cas_client",
         "//eden/mononoke/mercurial:mercurial_types",
         "//eden/mononoke/mononoke_types:mononoke_types",
@@ -75,6 +80,7 @@ rust_library(
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
         "//eden/mononoke/repo_attributes/repo_blobstore:repo_blobstore",
+        "//eden/mononoke/repo_attributes/restricted_paths:restricted_paths",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
     ],
 )

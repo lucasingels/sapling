@@ -100,6 +100,9 @@ struct MononokeServerArgs {
     /// RIM backend ID for EdenAPI QPS shadow probes
     #[clap(long)]
     rim_backend: Option<i32>,
+    /// Additional RIM backend for per-serving-region EdenAPI rate limiting
+    #[clap(long, requires = "rim_backend")]
+    rim_regional_backend: Option<i32>,
     /// Mark this instance as a shadow tier. Shadow tiers never forward
     /// shadow traffic, preventing forwarding loops.
     #[clap(long, default_value_t = false)]
@@ -246,6 +249,11 @@ fn main(fb: FacebookInit) -> Result<()> {
         cats::enable_test_mode();
     }
 
+    // No Thrift ServiceFramework here to register `ContextPropModule`, so the
+    // handlers outbound calls need are installed by hand, before tracing starts.
+    #[cfg(fbcode_build)]
+    contextprop::install_thrift_handlers();
+
     let runtime = app.runtime().clone();
 
     let cslb_config = args.cslb_config.clone();
@@ -387,6 +395,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 Some(Path::new(&args.tls_args.tls_ca)),
                 rate_limit_config_path,
                 args.rim_backend,
+                args.rim_regional_backend,
             )
             .await
         }

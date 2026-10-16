@@ -107,6 +107,9 @@ typedef binary BinaryHash
  */
 typedef binary PathString
 
+@cpp.Adapter{name = "::facebook::eden::GlobPathAdapter"}
+typedef PathString GlobPathValue
+
 /**
  * Bit set indicating where data should be fetched from in our debugging
  * commands.
@@ -293,6 +296,8 @@ struct MountInfo {
   6: optional string fuseTransport;
   // Whether the mount point is visible in the daemon's current mount namespace.
   7: optional bool visibleInDaemonNamespace;
+  // The NFS transport: "tcp" or "unix". Only set for NFS mounts.
+  8: optional string nfsTransport;
 }
 
 struct MountArgument {
@@ -1603,8 +1608,12 @@ enum PreloadMethod {
   MMAP = 3,
 }
 
+/**
+ * DEPRECATED: predictive prefetching has been removed. This struct is kept
+ * only for wire compatibility and is ignored by the daemon.
+ */
 struct PredictiveFetch {
-  // Number of directories to glob. If not specified, a default value (predictivePrefetchProfileSize in EdenConfig.h) is used.
+  // Number of directories to glob.
   1: optional i32 numTopDirectories;
   // Fetch the most accessed directories by user specified. If not specified, user is derived from the server state.
   2: optional string user;
@@ -1633,8 +1642,7 @@ struct PrefetchParams {
   5: PathString searchRoot;
   // If set, will run the prefetch but will not wait for the result.
   6: bool background = false;
-  // When set, the globs list must be empty and the globbing pattern will be obtained
-  // from an online service.
+  // DEPRECATED: ignored.
   7: optional PredictiveFetch predictiveGlob;
   // When true, returns list of prefetched files.
   8: bool returnPrefetchedFiles = false;
@@ -1801,8 +1809,7 @@ struct GlobParams {
   9: PathString searchRoot;
   // If set, will run the prefetch but will not wait for the result.
   10: bool background = false;
-  // When set, the globs list must be empty and the globbing pattern will be obtained
-  // from an online service.
+  // DEPRECATED: ignored.
   11: optional PredictiveFetch predictiveGlob;
   // Normally the returned file list will contain both files and directories.
   // Some clients would like to see only lists of files, this option tells us
@@ -1820,8 +1827,7 @@ struct Glob {
    * sorted. However, no duplicates may have the same originCommits (note this
    * is not true should the input GlobParams contain duplicate revisions) .
    */
-  @cpp.Type{name = "::facebook::eden::GlobPathList"}
-  1: list<PathString> matchingFiles;
+  1: list<GlobPathValue> matchingFiles;
   2: list<OsDtype> dtypes;
   /**
    * Currently these are the commit hash for the commit to which this file
@@ -2879,14 +2885,8 @@ service EdenService extends fb303_core.BaseService {
   ) throws (1: EdenError ex);
 
   /**
-   * Gets a list of a user's most accessed directories, performs
-   * prefetching as specified by PredictiveGlobParams, and returns
-   * a list of files matching the glob patterns.
-   * There are no duplicate values in the result.
-   *
-   * Note: may return stale data if synchronizeWorkingCopy isn't called, and if
-   * the SyncBehavior specify a 0 timeout. see the documentation for both of
-   * these for more details.
+   * DEPRECATED: predictive prefetching has been removed. This method is a
+   * no-op that always returns an empty Glob.
    */
   Glob predictiveGlobFiles(1: GlobParams params) throws (1: EdenError ex);
 

@@ -2,6 +2,7 @@
 
   $ . $TESTDIR/git.sh
   $ setconfig diff.git=true ui.allowemptycommit=true
+  $ enable absorb
 
 Prepare git repo
 
@@ -67,7 +68,7 @@ Clean up (revert, purge)
 `debugstatus` does not crash
 
   $ sl debugstatus
-  len(dirstate) = not supproted
+  len(dirstate) = not supported
   len(nonnormal) = 0
   len(filtered nonnormal) = 0
   clock = None
@@ -117,5 +118,40 @@ Handle Tree Changes
   $ echo 1 > some
   $ sl addremove --quiet
   $ sl commit -m "replace dir with file of the same name"
+  $ sl status
+  $ git status --porcelain
+
+Clean stage after amend
+
+  $ echo 2 >> some
+  $ sl amend
+  $ sl status
+  $ git status --porcelain
+
+  $ echo 3 >> some
+  $ sl --config experimental.git-index-fast-path=false amend
+  $ sl status
+  $ git status --porcelain
+
+Clean stage after uncommit
+
+  $ echo 1 > e
+  $ sl commit -Aqm "add e"
+  $ sl uncommit
+  $ sl revert --all -q --no-backup
+  $ sl status
+  ? e
+  $ git status --porcelain
+  ?? e
+  $ rm e
+
+Clean stage after absorb
+
+  $ printf '1\n2\n' > f
+  $ sl commit -Aqm "add f"
+  $ echo 1 > g
+  $ sl commit -Aqm "add g"
+  $ printf '1\n2 edited\n' > f
+  $ sl absorb -qa
   $ sl status
   $ git status --porcelain

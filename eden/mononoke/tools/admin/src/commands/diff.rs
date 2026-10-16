@@ -18,6 +18,7 @@ use mononoke_api::ChangesetFileOrdering;
 use mononoke_api::ChangesetId;
 use mononoke_api::CopyInfo;
 use mononoke_api::Repo;
+use mononoke_api::RestrictedPathsPolicy;
 use mononoke_app::MononokeApp;
 use mononoke_app::args::ChangesetArgs;
 use mononoke_app::args::RepoArgs;
@@ -30,11 +31,6 @@ use repo_identity::RepoIdentityRef;
 /// Runs the same `ChangesetContext::diff` the SCS server uses for
 /// `commit_compare`, in this process, so the diff path can be profiled against
 /// real repo data. Output matches `scsc diff --paths-only`.
-///
-/// Which manifest type backs the diff is decided by
-/// `scm/mononoke:derived_data_use_content_manifests`, exactly as in production.
-/// To compare backends, override it with the global
-/// `--just-knobs-config-path`.
 ///
 /// Pass the two commits oldest first: `-i FROM -i TO`.
 #[derive(Parser)]
@@ -147,6 +143,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
             diff_items,
             ordering,
             args.limit,
+            &RestrictedPathsPolicy::Strict,
         )
         .timed()
         .await;

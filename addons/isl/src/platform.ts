@@ -20,8 +20,8 @@ import type {
   ServerToClientMessage,
 } from './types';
 
-import {browserPlatform} from './BrowserPlatform';
 import type {CodeReviewIssue} from './firstPassCodeReview/types';
+import {makeBrowserLikePlatformImpl} from './platform/browserPlatformImpl';
 
 export type InitialParamKeys = 'token' | string;
 
@@ -35,6 +35,8 @@ export interface PlatformVisibility {
  */
 export interface Platform {
   platformName: PlatformName;
+  /** Whether the embedding host supports investigating a failed operation. */
+  supportsFailureInvestigation?: boolean;
   confirm(message: string, details?: string): Promise<boolean>;
   openFile(path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}): void;
   openFiles(paths: ReadonlyArray<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
@@ -44,8 +46,9 @@ export interface Platform {
   revealInExplorerView?(path: RepoRelativePath): void;
   openDiff?(path: RepoRelativePath, comparison: Comparison): void;
   openFileAtRevset?(path: RepoRelativePath, revset: string): void;
+  openPreview?(path: RepoRelativePath): void;
   openExternalLink(url: string): void;
-  clipboardCopy(text: string, html?: string): void;
+  clipboardCopy(text: string, html?: string): void | Promise<void>;
   chooseFile?(title: string, multi: boolean): Promise<Array<File>>;
   /** Whether to ask to configure an external merge tool. Useful for standalone platforms, but not embedded ones like vscode. */
   upsellExternalMergeTool: boolean;
@@ -122,8 +125,8 @@ declare global {
 // However, non-vscode but non-browser platforms are defined by setting window.islPlatform
 // before the main ISL script loads.
 
-/** The ISL client Platform. This may be BrowserPlatform, VSCodeWebviewPlatform, or another platforms, determined at runtime.  */
-const platform = window.islPlatform ?? browserPlatform;
+/** The ISL client Platform. This may be the browser platform, VSCodeWebviewPlatform, or another platforms, determined at runtime.  */
+const platform = window.islPlatform ?? makeBrowserLikePlatformImpl('browser');
 window.islPlatform = platform;
 
 export default platform;

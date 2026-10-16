@@ -19,6 +19,7 @@ use mononoke_types::FileChange;
 use mononoke_types::GitLfs;
 use mononoke_types::SubtreeChange;
 use serde::Serialize;
+use serde::Serializer;
 
 #[derive(Serialize)]
 #[serde(tag = "type")]
@@ -87,9 +88,34 @@ pub struct DisplayChangeset {
     pub committer: Option<String>,
     pub committer_date: Option<DateTime>,
     pub message: String,
+    #[serde(serialize_with = "serialize_hg_extra")]
     pub hg_extra: BTreeMap<String, Vec<u8>>,
     pub file_changes: BTreeMap<String, FileChange>,
     pub subtree_changes: BTreeMap<String, DisplaySubtreeChange>,
+}
+
+fn serialize_hg_extra<S: Serializer>(
+    hg_extra: &BTreeMap<String, Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(hg_extra.iter().map(|(name, value)| {
+        let value = match std::str::from_utf8(value) {
+            Ok(text) => DisplayHgExtraValue::Text(text),
+            Err(_) => DisplayHgExtraValue::Bytes {
+                hex: hex::encode(value),
+            },
+        };
+        (name, value)
+    }))
+}
+
+/// An hg extra value is text when it is valid UTF-8; otherwise it is raw bytes, rendered as a
+/// sub-struct so that a hex-encoded value is distinguishable from text that happens to be hex.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DisplayHgExtraValue<'a> {
+    Text(&'a str),
+    Bytes { hex: String },
 }
 
 impl TryFrom<&BonsaiChangeset> for DisplayChangeset {
@@ -200,5 +226,50 @@ pub fn display_subtree_change(path: &String, change: &DisplaySubtreeChange) -> S
         } => format!(
             "\t SUBTREE_CROSS_REPO_MERGE: {path} (from {from_path} @ {from_commit} in {from_repo_url})"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    fn display_changeset(hg_extra: BTreeMap<String, Vec<u8>>) -> Result<DisplayChangeset> {
+        Ok(DisplayChangeset {
+            changeset_id: ChangesetId::from_bytes([1u8; 32])?,
+            parents: vec![],
+            author: "author".to_string(),
+            author_date: DateTime::from_timestamp(0, 0)?,
+            committer: None,
+            committer_date: None,
+            message: "message".to_string(),
+            hg_extra,
+            file_changes: BTreeMap::new(),
+            subtree_changes: BTreeMap::new(),
+        })
+    }
+
+    /// `hg_extra` values that are valid UTF-8 are rendered as JSON strings; raw bytes are rendered
+    /// as a `{"hex": "<hex>"}` object, so they are distinguishable from text that happens to be
+    /// hex.
+    #[mononoke::test]
+    fn hg_extra_json_rendering() -> Result<()> {
+        let changeset = display_changeset(BTreeMap::from([
+            ("hg-git-rename-source".to_string(), b"git".to_vec()),
+            ("convert_revision".to_string(), b"1234abcd".to_vec()),
+            (
+                "transplant_source".to_string(),
+                vec![0x31, 0x32, 0x33, 0xff],
+            ),
+        ]))?;
+        let json = serde_json::to_value(&changeset)?;
+        assert_eq!(json["hg_extra"]["hg-git-rename-source"], "git");
+        assert_eq!(json["hg_extra"]["convert_revision"], "1234abcd");
+        assert_eq!(
+            json["hg_extra"]["transplant_source"],
+            serde_json::json!({ "hex": "313233ff" })
+        );
+        Ok(())
     }
 }

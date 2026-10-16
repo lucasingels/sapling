@@ -10,12 +10,14 @@
 
 #ifndef _WIN32
 
+#include "eden/fs/privhelper/PrivHelperRollback.h"
 #include "eden/fs/privhelper/PrivHelperServer.h"
 
 #include <fcntl.h>
 #include <folly/Conv.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
 #include <sys/mount.h>
@@ -29,7 +31,13 @@
 
 #ifdef __linux__
 
+#include <linux/capability.h>
+#include <linux/openat2.h>
+#include <sys/fsuid.h>
+#include <sys/prctl.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
+#include <array>
 
 #endif
 
@@ -49,26 +57,62 @@ namespace {
 #endif
 #endif
 
+#ifdef __linux__
+bool isOldEdenMountFd(int fd) {
+  std::string fdInfo;
+  folly::checkUnixError(
+      folly::readFile(fmt::format("/proc/self/fdinfo/{}", fd).c_str(), fdInfo)
+          ? 0
+          : -1,
+      "cannot read mount fdinfo");
+  std::vector<folly::StringPiece> lines;
+  folly::split('\n', fdInfo, lines);
+  std::string mountIdPrefix;
+  for (auto line : lines) {
+    if (line.startsWith("mnt_id:")) {
+      mountIdPrefix = fmt::format(
+          "{} ", folly::to<uint64_t>(folly::trimWhitespace(line.subpiece(7))));
+      break;
+    }
+  }
+  if (mountIdPrefix.empty()) {
+    throw std::runtime_error("mount ID missing from fdinfo");
+  }
+
+  std::string mountInfo;
+  folly::checkUnixError(
+      folly::readFile("/proc/self/mountinfo", mountInfo) ? 0 : -1,
+      "cannot read mountinfo");
+  lines.clear();
+  folly::split('\n', mountInfo, lines);
+  for (auto line : lines) {
+    if (!line.startsWith(mountIdPrefix)) {
+      continue;
+    }
+    const auto separator = line.find(" - ");
+    if (separator == folly::StringPiece::npos) {
+      throw std::runtime_error("mountinfo entry has no field separator");
+    }
+    std::vector<folly::StringPiece> fields;
+    folly::split(' ', line.subpiece(separator + 3), fields);
+    return fields.size() >= 3 && is_edenfs_fs_type(fields.at(1));
+  }
+  return false;
+}
+#endif
+
 /**
  * Determines whether the given mountPoint is contained in the mount table
  * and looks like it was previously mounted by EdenFS.
  */
 bool isOldEdenMount(const std::string& mountPoint) {
 #ifdef __linux__
-  MountInfoOptions options;
-  options.includeMountSource = true;
-  auto result = getMountInfoForPath(mountPoint.c_str(), options);
-  if (result.hasError()) {
-    XLOGF(
-        WARN,
-        "Failed to get mount info for {}: {}",
-        mountPoint,
-        folly::errnoStr(result.error()));
+  try {
+    folly::File fd(mountPoint.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    return isOldEdenMountFd(fd.fd());
+  } catch (const std::exception& ex) {
+    XLOGF(WARN, "Cannot identify mount {}: {}", mountPoint, ex.what());
     return false;
-  }
-  if (result.value().has_value() &&
-      is_edenfs_fs_type(result.value()->mountSource)) {
-    return true;
   }
 #else
   struct statfs* buf;
@@ -78,7 +122,8 @@ bool isOldEdenMount(const std::string& mountPoint) {
   } else {
     for (int i = 0; i < count; i++) {
       if (std::string(buf[i].f_mntonname) == mountPoint &&
-          is_edenfs_fs_type(buf[i].f_fstypename)) {
+          (is_edenfs_fs_type(buf[i].f_fstypename) ||
+           is_edenfs_nfs_mount(buf[i].f_fstypename, buf[i].f_mntfromname))) {
         return true;
       }
     }
@@ -171,19 +216,6 @@ void sanityCheckFs(const std::string& mountPoint, int mountPointFd = -1) {
 }
 
 #ifdef __linux__
-folly::File openCheckedMountTarget(const std::string& mountPoint) {
-  const auto fd = open(mountPoint.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-  if (fd < 0) {
-    auto err = errno;
-    throwf<std::domain_error>(
-        "User:{} cannot open {}: {}",
-        getuid(),
-        mountPoint,
-        folly::errnoStr(err));
-  }
-  return folly::File{fd, /*ownsFd=*/true};
-}
-
 void checkMountPointWriteAccess(
     const std::string& mountPoint,
     int mountPointFd) {
@@ -202,10 +234,72 @@ void checkMountPointWriteAccess(
 }
 #endif
 
-void sanityCheckOpenedMountPoint(
+} // namespace
+
+#ifdef __linux__
+folly::File PrivHelperServer::openPathAsUser(
+    const std::string& path,
+    int accessMode) const {
+  const auto savedUid = static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1)));
+  const auto savedGid = static_cast<gid_t>(setfsgid(static_cast<gid_t>(-1)));
+  const auto dumpable = prctl(PR_GET_DUMPABLE);
+  folly::checkUnixError(dumpable, "cannot read privhelper dumpability");
+  __user_cap_header_struct header{_LINUX_CAPABILITY_VERSION_3, 0};
+  std::array<__user_cap_data_struct, _LINUX_CAPABILITY_U32S_3> savedCaps{};
+  folly::checkUnixError(
+      syscall(SYS_capget, &header, savedCaps.data()),
+      "cannot read privhelper capabilities");
+  SCOPE_EXIT {
+    setfsuid(savedUid);
+    setfsgid(savedGid);
+    XCHECK_EQ(savedUid, static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))));
+    XCHECK_EQ(savedGid, static_cast<gid_t>(setfsgid(static_cast<gid_t>(-1))));
+    XCHECK_EQ(0, syscall(SYS_capset, &header, savedCaps.data()));
+    // PR_SET_DUMPABLE only accepts 0 and 1; keep a kernel-only value of 2
+    // non-dumpable rather than allowing user-readable core dumps.
+    XCHECK_EQ(0, prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0));
+  };
+
+  setfsgid(gid_);
+  setfsuid(uid_);
+  if (static_cast<uid_t>(setfsuid(static_cast<uid_t>(-1))) != uid_ ||
+      static_cast<gid_t>(setfsgid(static_cast<gid_t>(-1))) != gid_) {
+    folly::throwSystemErrorExplicit(
+        EPERM, "cannot select filesystem credentials for user ", uid_);
+  }
+  if (uid_ != 0) {
+    auto caps = savedCaps;
+    folly::checkUnixError(syscall(SYS_capget, &header, caps.data()));
+    // Securebits can disable setfsuid's automatic capability drop.
+    caps[0].effective &=
+        ~((1U << CAP_DAC_OVERRIDE) | (1U << CAP_DAC_READ_SEARCH));
+    folly::checkUnixError(
+        syscall(SYS_capset, &header, caps.data()),
+        "cannot drop filesystem access overrides");
+  }
+
+  open_how how{};
+  how.flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+  how.resolve = RESOLVE_NO_MAGICLINKS;
+  const auto fd = static_cast<int>(
+      syscall(SYS_openat2, AT_FDCWD, path.c_str(), &how, sizeof(how)));
+  folly::checkUnixError(fd, "user ", uid_, " cannot open ", path);
+  folly::File file{fd, true};
+  // AT_EACCESS preserves the scoped filesystem credentials and capabilities.
+  // O_PATH checks ancestor traversal but does not check access to the leaf.
+  folly::checkUnixError(
+      syscall(SYS_faccessat2, fd, "", accessMode, AT_EMPTY_PATH | AT_EACCESS),
+      "user ",
+      uid_,
+      " cannot access ",
+      path);
+  return file;
+}
+#endif
+
+void PrivHelperServer::sanityCheckOpenedMountPoint(
     const std::string& mountPoint,
-    int mountPointFd,
-    uid_t uid) {
+    int mountPointFd) {
   struct stat st{};
   if (fstat(mountPointFd, &st) < 0) {
     auto err = errno;
@@ -220,17 +314,18 @@ void sanityCheckOpenedMountPoint(
     throwf<std::domain_error>("{} isn't a directory", mountPoint);
   }
 
-  if (st.st_uid != uid) {
+  if (st.st_uid != uid_) {
     throwf<std::domain_error>(
-        "User:{} isn't the owner of: {}", uid, mountPoint);
+        "User:{} isn't the owner of: {}", uid_, mountPoint);
   }
 
 #ifdef __linux__
-  checkMountPointWriteAccess(mountPoint, mountPointFd);
+  if (!disablePrivHelperHardening()) {
+    checkMountPointWriteAccess(mountPoint, mountPointFd);
+  }
 #endif
   sanityCheckFs(mountPoint, mountPointFd);
 }
-} // namespace
 
 SanityCheckResult PrivHelperServer::cleanupStaleBindMounts(
     const std::string& checkoutPath) {
@@ -291,32 +386,41 @@ SanityCheckResult PrivHelperServer::cleanupStaleBindMounts(
   return result;
 }
 
-void PrivHelperServer::unmountStaleMount(const std::string& mountPoint) {
-  // Attempt to unmount the stale mount.
-  // Error logging is done inside unmount.
-  // Always remove the mount point from mountPoints_ since it represents
-  // valid mounts only.
-  unmount(mountPoint.c_str(), {});
-  mountPoints_.erase(mountPoint);
-  XLOGF(INFO, "Successfully unmounted stale mount {}", mountPoint);
+int PrivHelperServer::statMountPoint(const char* path, struct stat* st) const {
+  // This probes mount health; it does not authorize any path-based operation.
+  // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
+  return stat(path, st);
 }
 
 bool PrivHelperServer::detectAndUnmountStaleMount(
     const std::string& mountPoint,
     bool isNFS,
     bool isHardMount) {
-  bool didUnmount = false;
+  const auto hardeningDisabled = disablePrivHelperHardening();
+  folly::File mountFd;
+  std::string probePath = mountPoint;
+#ifdef __linux__
+  if (!hardeningDisabled) {
+    const auto fd = open(mountPoint.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+      throwf<std::domain_error>(
+          "User:{} cannot open {}: {}",
+          uid_,
+          mountPoint,
+          folly::errnoStr(errno));
+    }
+    mountFd = folly::File(fd, true);
+    // Probes, identity lookup, and unmount must refer to this same mount even
+    // when a caller replaces an ancestor of mountPoint.
+    probePath = fmt::format("/proc/self/fd/{}", fd);
+  }
+#endif
   struct stat st;
   // Stat the mount point to determine its status. If the errno matches certain
   // values, then the mount is likely hanging. We'll try to unmount it before
   // performing further sanity checks. On any other error, we throw.
-  bool is_hanging = false;
 
-  // Stat is only being used to check if the mount is hanging, not to perform
-  // any sanity checks. Therefore, it should be safe to ignore this lint.
-  //
-  // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
-  if (stat(mountPoint.c_str(), &st) < 0) {
+  if (statMountPoint(probePath.c_str(), &st) < 0) {
     auto err = errno;
     XLOGF(
         WARN,
@@ -326,15 +430,14 @@ bool PrivHelperServer::detectAndUnmountStaleMount(
 
     // Avoids running on hard NFS mounts since IO into hard mounts can hang
     // forever instead of returning an error.
-    if (!isHardMount && isErrorSafeToIgnore(err, isNFS, mountPoint)) {
+    if (!isHardMount && isErrorSafeToIgnore(err, isNFS, probePath)) {
       XLOGF(
           INFO,
           "Found a stale mount {}: {}. Attempting to unmount it",
           mountPoint,
           folly::errnoStr(err));
-      unmountStaleMount(mountPoint);
-      didUnmount = true;
-      is_hanging = true;
+      unmountStaleMount(mountPoint, mountFd.fd());
+      return true;
     } else {
       throwf<std::domain_error>(
           "User:{} cannot stat {}: {}",
@@ -347,26 +450,26 @@ bool PrivHelperServer::detectAndUnmountStaleMount(
   // Sometimes stat will not return this error even if the mount is
   // hanging because the stat'd path is cached by the kernel. We check for this
   // by attempting to stat a non-existent file under a non-existent folder.
-  if (!isHardMount && !is_hanging) {
+  if (!isHardMount) {
     // Check in case the mount point is cached in the kernel.
     XLOG(DBG4, "Double checking whether a stale mount is present.");
     std::string test_path =
-        mountPoint + "/this-folder-does-not-exist/this-file-does-not-exist";
+        probePath + "/this-folder-does-not-exist/this-file-does-not-exist";
     struct stat test_st;
 
-    // As mentioned above, using path-based stat is fine for our usescase.
-    //
-    // @lint-ignore CLANGTIDY facebook-hte-BadCall-stat
-    if (stat(test_path.c_str(), &test_st) < 0) {
+    if (statMountPoint(test_path.c_str(), &test_st) < 0) {
       auto err = errno;
-      if (isErrnoFromHangingMount(err, isNFS)) {
+      const auto safeToIgnore = hardeningDisabled
+          ? isErrnoFromHangingMount(err, isNFS)
+          : isErrorSafeToIgnore(err, isNFS, probePath);
+      if (safeToIgnore) {
         XLOGF(
             INFO,
             "Found a stale mount {}: {}. Attempting to unmount it",
             mountPoint,
             folly::errnoStr(err));
-        unmountStaleMount(mountPoint);
-        didUnmount = true;
+        unmountStaleMount(mountPoint, mountFd.fd());
+        return true;
       }
     }
     XLOGF(DBG4, "Mount {} is not stale.", mountPoint);
@@ -376,39 +479,39 @@ bool PrivHelperServer::detectAndUnmountStaleMount(
   // is stale, but stat won't. Try statfs as well to catch this case.
 #ifdef __linux__
   struct statfs fsBuf;
-  if (!isNFS && statfs(mountPoint.c_str(), &fsBuf) < 0) {
+  if (!isNFS && statfs(probePath.c_str(), &fsBuf) < 0) {
     auto err = errno;
-    if (isErrorSafeToIgnore(err, isNFS, mountPoint)) {
+    if (isErrorSafeToIgnore(err, isNFS, probePath)) {
       XLOGF(
           INFO,
           "Found a stale mount {}: {}. Attempting to unmount it",
           mountPoint,
           folly::errnoStr(err));
-      unmountStaleMount(mountPoint);
-      didUnmount = true;
+      unmountStaleMount(mountPoint, mountFd.fd());
+      return true;
     } else {
       throwf<std::domain_error>(
           "statfs failed for: {}: {}", mountPoint, folly::errnoStr(err));
     }
   }
 #endif
-  return didUnmount;
+  return false;
 }
 
 SanityCheckResult PrivHelperServer::sanityCheckMountPoint(
     const std::string& mountPoint,
-    bool isNFS,
-    bool isHardMount,
-    bool performBindMountCleanup) {
+    const SanityCheckOptions& options) {
   XLOGF(INFO, "Sanity checking mount {}", mountPoint);
-  if (getuid() == 0) {
+  if ((disablePrivHelperHardening() ? getuid() : uid_) == 0) {
     XLOG(INFO, "Skipping sanity check for root user.");
     return SanityCheckResult{};
   }
 
   SanityCheckResult result{};
-  result.staleCheckoutMountUnmounted =
-      detectAndUnmountStaleMount(mountPoint, isNFS, isHardMount);
+  if (const auto& staleMountCheck = options.staleMountCheck()) {
+    result.staleCheckoutMountUnmounted = detectAndUnmountStaleMount(
+        mountPoint, staleMountCheck->isNFS, staleMountCheck->isHardMount);
+  }
 
   if (access(mountPoint.c_str(), W_OK) < 0) {
     auto err = errno;
@@ -429,8 +532,8 @@ SanityCheckResult PrivHelperServer::sanityCheckMountPoint(
         mountPoint,
         folly::errnoStr(e.code().value()));
   }
-  sanityCheckOpenedMountPoint(mountPoint, file.fd(), uid_);
-  if (performBindMountCleanup) {
+  sanityCheckOpenedMountPoint(mountPoint, file.fd());
+  if (options.performBindMountCleanup()) {
     // Only clean up mounts under a checkout after the checkout path itself has
     // passed the ownership and access checks.
     auto cleanupResult = cleanupStaleBindMounts(mountPoint);
@@ -448,23 +551,34 @@ SanityCheckResult PrivHelperServer::sanityCheckMountPoint(
 PrivHelperServer::CheckedMountPoint
 PrivHelperServer::openAndSanityCheckMountPoint(
     const std::string& mountPoint,
-    bool isNFS,
-    bool isHardMount,
-    bool performBindMountCleanup) {
+    const SanityCheckOptions& options) {
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARN,
+        "Using legacy mount target validation for `{}` because privhelper hardening is disabled",
+        mountPoint);
+    auto sanityResult = sanityCheckMountPoint(mountPoint, options);
+    return CheckedMountPoint{
+        folly::File(mountPoint.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC),
+        sanityResult};
+  }
+
   XLOGF(INFO, "Sanity checking mount {}", mountPoint);
-  if (getuid() == 0) {
+  if (uid_ == 0) {
     XLOG(INFO, "Skipping sanity check for root user.");
-    auto targetFd = openCheckedMountTarget(mountPoint);
+    auto targetFd = openPathAsUser(mountPoint, F_OK);
     return CheckedMountPoint{std::move(targetFd), SanityCheckResult{}};
   }
 
   SanityCheckResult result{};
-  result.staleCheckoutMountUnmounted =
-      detectAndUnmountStaleMount(mountPoint, isNFS, isHardMount);
+  if (const auto& staleMountCheck = options.staleMountCheck()) {
+    result.staleCheckoutMountUnmounted = detectAndUnmountStaleMount(
+        mountPoint, staleMountCheck->isNFS, staleMountCheck->isHardMount);
+  }
 
-  auto targetFd = openCheckedMountTarget(mountPoint);
-  sanityCheckOpenedMountPoint(mountPoint, targetFd.fd(), uid_);
-  if (performBindMountCleanup) {
+  auto targetFd = openPathAsUser(mountPoint, R_OK | W_OK | X_OK);
+  sanityCheckOpenedMountPoint(mountPoint, targetFd.fd());
+  if (options.performBindMountCleanup()) {
     // Only clean up mounts under a checkout after the checkout path itself has
     // passed the ownership and access checks.
     auto cleanupResult = cleanupStaleBindMounts(mountPoint);

@@ -18,8 +18,10 @@ use std::sync::RwLock;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use identity::dotgit::follow_dotgit_path;
-use identity::dotgit::read_git_common_dir;
+use identity::dotgit::resolve_git_common_dir;
 use spawn_ext::CommandExt;
+
+use crate::refs::ReftableRefCache;
 
 /// Run `git` outside a repo.
 #[derive(Default, Clone)]
@@ -32,27 +34,20 @@ pub struct GlobalGit {
 
 /// Run `git` in a "bare" git repo, without a working copy.
 pub struct BareGit {
-    /// The `GIT_DIR`.
-    /// This is usually `root/.git`. When `.git` is a "symlink" ("gitdir: ..."),
-    /// this is the "symlink" destination.
+    /// Git's `GIT_DIR`. This is usually `root/.git`. For a linked worktree,
+    /// this is the worktree's private Git directory named by its `.git`
+    /// gitfile, such as `<GIT_COMMON_DIR>/worktrees/<name>`. A submodule also
+    /// uses a `.git` gitfile, typically pointing to `<superproject
+    /// GIT_DIR>/modules/<path>`.
     pub(crate) git_dir: PathBuf,
-    /// The `GIT_COMMON_DIR`. Same as `git_dir` unless `git_dir` is a linked
-    /// worktree's admin dir (`<main>/.git/worktrees/<name>`), in which case
-    /// this is the main `.git` holding objects and shared refs.
-    pub(crate) git_common_dir: PathBuf,
+    /// Git's `GIT_COMMON_DIR`, containing repository-wide state shared by all
+    /// worktrees. This is the same as `git_dir` unless this is a linked
+    /// worktree. Resolved once at construction time, so constructing before the
+    /// worktree exists on disk (ex. before `git worktree add`) will not pick it
+    /// up.
+    pub(crate) common_dir: PathBuf,
     pub(crate) parent: GlobalGit,
-}
-
-impl BareGit {
-    fn new(git_dir: PathBuf, parent: GlobalGit) -> Self {
-        let git_dir = follow_dotgit_path(git_dir);
-        let git_common_dir = read_git_common_dir(&git_dir);
-        Self {
-            git_dir,
-            git_common_dir,
-            parent,
-        }
-    }
+    pub(crate) reftable_ref_cache: RwLock<Option<ReftableRefCache>>,
 }
 
 /// Run `git` in a "regular" repo with a working copy.
@@ -140,6 +135,27 @@ impl GlobalGit {
 }
 
 impl BareGit {
+    fn new(git_dir: PathBuf, parent: GlobalGit) -> Self {
+        let git_dir = follow_dotgit_path(git_dir);
+        let common_dir = match resolve_git_common_dir(&git_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    path = %git_dir.join("commondir").display(),
+                    error = %err,
+                    "failed to read Git commondir; falling back to git dir"
+                );
+                git_dir.clone()
+            }
+        };
+        Self {
+            git_dir,
+            common_dir,
+            parent,
+            reftable_ref_cache: RwLock::new(None),
+        }
+    }
+
     /// Construct from git_dir (".git" path) and config.
     pub fn from_git_dir_and_config(git_dir: PathBuf, config: &dyn Config) -> Self {
         Self::new(git_dir, GlobalGit::from_config(config))
@@ -159,22 +175,14 @@ impl BareGit {
         }
     }
 
-    /// The bare repo root, usually ".git" or "<name>.git".
-    /// For a linked worktree this is the per-worktree admin dir
-    /// (`<main>/.git/worktrees/<name>`), holding `HEAD` and `index`.
+    /// Git's `GIT_DIR`, usually ".git" or "<name>.git".
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
     }
 
-    /// The common git dir holding objects, `refs/`, `packed-refs`, `config`
-    /// and `shallow`. Same as `git_dir()` unless this is a linked worktree.
-    pub fn git_common_dir(&self) -> &Path {
-        &self.git_common_dir
-    }
-
-    /// Whether `git_dir()` is a linked worktree's admin dir.
-    pub fn is_linked_worktree(&self) -> bool {
-        self.git_dir != self.git_common_dir
+    /// Git's `GIT_COMMON_DIR`, containing repository-wide state shared by all worktrees.
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
     }
 }
 
@@ -288,7 +296,7 @@ impl GitCmd for RepoGit {
             self,
             Some(self.git_dir()),
             Some(self.root()),
-            self.is_linked_worktree(),
+            self.git_dir() != self.common_dir(),
         )
     }
 }
@@ -311,6 +319,7 @@ fn git_cmd_impl(
 ) -> Command {
     let cfg = &opts.config;
     let mut cmd = Command::new(&cfg.git_binary);
+    cmd.envs(distributed_tracing::outgoing_env());
 
     // -c foo.bar=baz ...
     for c in &opts.extra_git_configs {
@@ -321,9 +330,9 @@ fn git_cmd_impl(
     // --git-dir=...
     if let Some(git_dir) = git_dir {
         cmd.arg(format!("--git-dir={}", git_dir.display()));
-        // A linked worktree's git dir is `<main>/.git/worktrees/<name>`, whose basename is the
-        // worktree name rather than ".git". Without a pinned cwd git would treat the process cwd
-        // as the work tree.
+        // A linked worktree's GIT_DIR is `<GIT_COMMON_DIR>/worktrees/<name>`, whose basename is
+        // the worktree name rather than ".git". Without a pinned cwd git would treat the process
+        // cwd (ex. a sub-directory) as the work tree.
         if git_dir.file_name().unwrap_or_default() == ".git" || is_linked_worktree {
             // Run `git` from the repo root. This avoids issues like `git status` being over smart
             // and uses relative paths.

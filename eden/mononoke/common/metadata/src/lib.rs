@@ -17,12 +17,31 @@ use clientinfo::ClientInfo;
 use clientinfo::ClientRequestInfo;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
+use permission_checker::ClientCategory;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
 use permission_checker::TenantInfo;
 use session_id::SessionId;
 use session_id::generate_session_id;
 use tokio::time::timeout;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClientPathAclCompatibility {
+    #[default]
+    Absent,
+    ReadyV1,
+    Malformed,
+}
+
+impl ClientPathAclCompatibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::ReadyV1 => "ready_v1",
+            Self::Malformed => "malformed",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Metadata {
@@ -31,6 +50,11 @@ pub struct Metadata {
     /// If the identities were proxied, this is the true and original
     /// identities from the request.
     original_identities: Option<MononokeIdentitySet>,
+    /// Signer (and, for delegated tokens, certified) identities from CATs a caller
+    /// forwarded on behalf of its own caller. Unverified; never used for authorization.
+    unverified_forwarded_identities: Option<MononokeIdentitySet>,
+    forwarded_cats_verifier: Option<String>,
+    forwarded_cats_token_verifiers: Option<MononokeIdentitySet>,
     client_debug: bool,
     /// "true" if client connects from untrusted environment.
     /// We're going to apply restrictions in this case, like rejecting pushes
@@ -46,6 +70,9 @@ pub struct Metadata {
     fetch_from_cas_attempted: bool,
     upstream_client_id: Option<String>,
     user_agent: Option<String>,
+    client_path_acl_compatibility: ClientPathAclCompatibility,
+    partial_responses_opt_in: bool,
+    partial_responses_opt_out: bool,
 }
 
 impl Metadata {
@@ -82,6 +109,9 @@ impl Metadata {
             session_id,
             identities,
             original_identities: None,
+            unverified_forwarded_identities: None,
+            forwarded_cats_verifier: None,
+            forwarded_cats_token_verifiers: None,
             client_debug,
             client_untrusted,
             client_ip,
@@ -94,6 +124,9 @@ impl Metadata {
             fetch_from_cas_attempted: false,
             upstream_client_id: None,
             user_agent: None,
+            client_path_acl_compatibility: ClientPathAclCompatibility::Absent,
+            partial_responses_opt_in: false,
+            partial_responses_opt_out: false,
         }
     }
 
@@ -159,6 +192,18 @@ impl Metadata {
         self
     }
 
+    pub fn add_unverified_forwarded_identities(
+        &mut self,
+        verifier: String,
+        identities: MononokeIdentitySet,
+        token_verifiers: MononokeIdentitySet,
+    ) -> &mut Self {
+        self.forwarded_cats_verifier = Some(verifier);
+        self.unverified_forwarded_identities = Some(identities);
+        self.forwarded_cats_token_verifiers = Some(token_verifiers);
+        self
+    }
+
     pub fn update_client_untrusted(&mut self, client_untrusted: bool) -> &mut Self {
         // Be conservative: if client was already untrusted, don't allow to make
         // it trusted
@@ -180,6 +225,18 @@ impl Metadata {
 
     pub fn original_identities(&self) -> Option<&MononokeIdentitySet> {
         self.original_identities.as_ref()
+    }
+
+    pub fn unverified_forwarded_identities(&self) -> Option<&MononokeIdentitySet> {
+        self.unverified_forwarded_identities.as_ref()
+    }
+
+    pub fn forwarded_cats_verifier(&self) -> Option<&str> {
+        self.forwarded_cats_verifier.as_deref()
+    }
+
+    pub fn forwarded_cats_token_verifiers(&self) -> Option<&MononokeIdentitySet> {
+        self.forwarded_cats_token_verifiers.as_ref()
     }
 
     pub fn raw_encoded_cats(&self) -> &Option<String> {
@@ -223,6 +280,13 @@ impl Metadata {
 
     pub fn client_hostname(&self) -> Option<&str> {
         self.client_hostname.as_deref()
+    }
+
+    pub fn client_region(&self) -> Option<&str> {
+        self.client_hostname()?
+            .split('.')
+            .nth(1)
+            .filter(|region| !region.is_empty())
     }
 
     pub fn set_client_hostname(mut self, client_hostname: Option<String>) -> Self {
@@ -283,15 +347,46 @@ impl Metadata {
     }
 
     pub fn tenant_info(&self) -> TenantInfo {
-        TenantInfo {
-            client_id: self
-                .client_request_info()
-                .and_then(|cri| cri.main_id.clone()),
-            category: self.identities.client_category(self.sandcastle_alias()),
-            ci_purpose: self.ci_purpose().map(str::to_owned),
-            atlas_env_id: self.clientinfo_atlas_env_id().map(str::to_owned),
-            atlas_rl: self.clientinfo_atlas_rl(),
-            faas_job_name: self.clientinfo_faas_job_name().map(str::to_owned),
+        let client_id = self
+            .client_request_info()
+            .and_then(|cri| cri.main_id.clone());
+
+        match self.identities.client_category(self.sandcastle_alias()) {
+            ClientCategory::HealthCheck => TenantInfo::HealthCheck { client_id },
+            ClientCategory::InteractiveDev => TenantInfo::InteractiveDev { client_id },
+            ClientCategory::DevEnv => TenantInfo::DevEnv {
+                client_id,
+                on_demand_type: self.identities.on_demand_type().map(str::to_owned),
+                client_region: self.client_region().map(str::to_owned),
+                client_hostname: self.client_hostname().map(str::to_owned),
+            },
+            ClientCategory::CiSandcastle => TenantInfo::CiSandcastle {
+                client_id,
+                ci_purpose: self.ci_purpose().map(str::to_owned),
+                sandcastle_job_id: self.identities.sandcastle_job_id().map(str::to_owned),
+            },
+            ClientCategory::SandcastleAutomation => TenantInfo::SandcastleAutomation { client_id },
+            ClientCategory::Mast => TenantInfo::Mast {
+                client_id,
+                data_project: self
+                    .identities
+                    .identity_type_filtered_concat("DATA_PROJECT"),
+                offline_job_root_run_id: self
+                    .identities
+                    .identity_type_filtered_concat("OFFLINE_JOB_ROOT_RUN_ID"),
+                offline_job_leaf_run_id: self
+                    .identities
+                    .identity_type_filtered_concat("OFFLINE_JOB_LEAF_RUN_ID"),
+            },
+            ClientCategory::FaaS => TenantInfo::FaaS {
+                client_id,
+                atlas_env_id: self.clientinfo_atlas_env_id().map(str::to_owned),
+                atlas_rl: self.clientinfo_atlas_rl(),
+                atlas_purpose: self.clientinfo_atlas_purpose().map(str::to_owned),
+                faas_job_name: self.clientinfo_faas_job_name().map(str::to_owned),
+            },
+            ClientCategory::Automation => TenantInfo::Automation { client_id },
+            ClientCategory::Unknown => TenantInfo::Unknown { client_id },
         }
     }
 
@@ -309,6 +404,12 @@ impl Metadata {
 
     pub fn clientinfo_atlas_rl(&self) -> Option<bool> {
         self.client_info.as_ref().and_then(|ci| ci.fb.is_atlas_rl())
+    }
+
+    pub fn clientinfo_atlas_purpose(&self) -> Option<&str> {
+        self.client_info
+            .as_ref()
+            .and_then(|ci| ci.fb.atlas_purpose())
     }
 
     pub fn clientinfo_atlas_env_id(&self) -> Option<&str> {
@@ -347,6 +448,36 @@ impl Metadata {
 
     pub fn user_agent(&self) -> Option<&str> {
         self.user_agent.as_deref()
+    }
+
+    pub fn add_client_path_acl_compatibility(
+        &mut self,
+        client_path_acl_compatibility: ClientPathAclCompatibility,
+    ) -> &mut Self {
+        self.client_path_acl_compatibility = client_path_acl_compatibility;
+        self
+    }
+
+    pub fn client_path_acl_compatibility(&self) -> ClientPathAclCompatibility {
+        self.client_path_acl_compatibility
+    }
+
+    pub fn add_partial_responses_opt_in(&mut self, partial_responses_opt_in: bool) -> &mut Self {
+        self.partial_responses_opt_in = partial_responses_opt_in;
+        self
+    }
+
+    pub fn partial_responses_opt_in(&self) -> bool {
+        self.partial_responses_opt_in
+    }
+
+    pub fn add_partial_responses_opt_out(&mut self, partial_responses_opt_out: bool) -> &mut Self {
+        self.partial_responses_opt_out = partial_responses_opt_out;
+        self
+    }
+
+    pub fn partial_responses_opt_out(&self) -> bool {
+        self.partial_responses_opt_out
     }
 
     pub fn machine_tier(&self) -> Option<&str> {

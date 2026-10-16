@@ -9,7 +9,9 @@
 
 #include <eden/common/utils/SpawnedProcess.h>
 #include <folly/File.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <map>
@@ -70,6 +72,16 @@ struct FileAccessMonitorProcess {
  */
 void detachFromParentProcessGroup();
 
+/**
+ * Whether an NFS mount with these options gets the macOS f_fstypename
+ * override ("edenfs:") applied after mounting, while the override is on.
+ *
+ * macOS replaces f_mntfromname for Unix-domain socket transports, so only
+ * those mounts need it. With the override off they are recognized by the
+ * name of the nfsd socket instead, see is_edenfs_nfs_mount().
+ */
+bool needsFstypeOverride(const NFSMountOptions& options);
+
 /*
  * PrivHelperServer runs the main loop for the privhelper server process.
  *
@@ -104,6 +116,10 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
    * Run the PrivHelperServer main loop.
    */
   void run();
+
+  bool nfsFstypeOverrideEnabled() const {
+    return nfsFstypeOverride_.load(std::memory_order_relaxed);
+  }
 
  private:
   // UnixSocket::ReceiveCallback methods
@@ -150,7 +166,6 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   };
 #endif
   RegisteredMount openRegisteredMount(const std::string& mountPath);
-  void registerMountPoint(const std::string& mountPath);
   void registerMountPoint(
       const std::string& mountPath,
       RegisteredMount registeredMount);
@@ -161,17 +176,17 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   UnixSocket::Message processGetPid();
   UnixSocket::Message processGetNamespaceInfo(folly::io::Cursor& cursor);
-  UnixSocket::Message processStartFam(folly::io::Cursor& cursor);
-  UnixSocket::Message processStopFam();
   UnixSocket::Message processSetMemoryPriorityForProcess(
       folly::io::Cursor& cursor);
-  UnixSocket::Message processSetFuseReadAhead(folly::io::Cursor& cursor);
 
-  void unmountStaleMount(const std::string& mountPoint);
+  void unmountStaleMount(const std::string& mountPoint, int mountFd);
 
   // Clean up stale redirection mounts under a checkout path that were left
   // behind when EdenFS crashed without properly unmounting.
   SanityCheckResult cleanupStaleBindMounts(const std::string& checkoutPath);
+
+ protected:
+  virtual int statMountPoint(const char* path, struct stat* st) const;
 
   // Uses stat to determine if there's a stale mount point at the given path. If
   // there is, force unmounts it. Returns true if a stale mount was found and
@@ -182,32 +197,89 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
       bool isHardMount);
 
   /**
+   * How detectAndUnmountStaleMount probes the mount point.
+   */
+  struct StaleMountCheck {
+    bool isNFS;
+    bool isHardMount;
+  };
+
+  /**
+   * What sanityCheckMountPoint and openAndSanityCheckMountPoint do around the
+   * ownership and access checks. Only the factories can build one, so every
+   * call site names the kind of mount it is checking.
+   */
+  class SanityCheckOptions {
+   public:
+    /**
+     * The mount the daemon inherited across a graceful restart. No stale
+     * mount probe: the daemon is already serving the mount when it sends the
+     * takeover startup request, so there is nothing stale to detect.
+     * Redirection bind mounts are left alone: the kernel preserves live ones
+     * (e.g. buck-out) across the restart, so detaching them would unmount
+     * user state.
+     */
+    static SanityCheckOptions forTakeover() {
+      return SanityCheckOptions(
+          /*staleMountCheck=*/std::nullopt,
+          /*performBindMountCleanup=*/false);
+    }
+
+    /** A fresh FUSE mount. */
+    static SanityCheckOptions forFuseMount() {
+      return SanityCheckOptions(
+          StaleMountCheck{/*isNFS=*/false, /*isHardMount=*/false},
+          /*performBindMountCleanup=*/true);
+    }
+
+    /** A fresh NFS mount. Hard mounts skip the probes that can hang. */
+    static SanityCheckOptions forNfsMount(bool isHardMount) {
+      return SanityCheckOptions(
+          StaleMountCheck{/*isNFS=*/true, isHardMount},
+          /*performBindMountCleanup=*/true);
+    }
+
+    /** The stale mount probe to run first, or nullopt to run none. */
+    const std::optional<StaleMountCheck>& staleMountCheck() const {
+      return staleMountCheck_;
+    }
+
+    /**
+     * Whether stale redirection bind mounts under the checkout are detached
+     * after the checkout path passes the ownership and access checks.
+     */
+    bool performBindMountCleanup() const {
+      return performBindMountCleanup_;
+    }
+
+   private:
+    SanityCheckOptions(
+        std::optional<StaleMountCheck> staleMountCheck,
+        bool performBindMountCleanup)
+        : staleMountCheck_(staleMountCheck),
+          performBindMountCleanup_(performBindMountCleanup) {}
+
+    std::optional<StaleMountCheck> staleMountCheck_;
+    bool performBindMountCleanup_;
+  };
+
+  /**
    * Verify that the user has the right credentials to mount/unmount this path.
    *
    * This will check that the user has RW access to every path component
    * leading to the mount point. A std::domain_error exception will be raised
    * if the user doesn't have access to the mount point.
-   *
-   * When performBindMountCleanup is true (the default), stale redirection
-   * bind mounts under the checkout are detached after the checkout path passes
-   * the ownership and access checks. The takeover path passes false because
-   * the kernel preserves legitimate bind mounts (e.g. Sapling redirections like
-   * buck-out) across a graceful restart, and running cleanup there would
-   * unmount live user state.
    */
   SanityCheckResult sanityCheckMountPoint(
       const std::string& mountPoint,
-      bool isNFS = false,
-      bool isHardMount = false,
-      bool performBindMountCleanup = true);
+      const SanityCheckOptions& options);
 #ifndef __APPLE__
   CheckedMountPoint openAndSanityCheckMountPoint(
       const std::string& mountPoint,
-      bool isNFS = false,
-      bool isHardMount = false,
-      bool performBindMountCleanup = true);
+      const SanityCheckOptions& options);
 #endif
 
+ private:
   // These methods are virtual so we can override them during unit tests
   virtual folly::File
   fuseMount(const char* mountPath, bool readOnly, const char* vfsType);
@@ -215,10 +287,6 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   virtual void unmount(const char* mountPath, UnmountOptions options);
   // Both clientPath and mountPath must be existing directories.
   virtual void insecureBindMount(const char* clientPath, const char* mountPath);
-  virtual void bindMount(
-      const char* clientPath,
-      const char* mountPath,
-      folly::StringPiece mountRoot);
   virtual bool useModernMountApi() const;
 #ifndef __APPLE__
   FuseMountResult fuseMountByFd(
@@ -233,6 +301,31 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 #endif
 
  protected:
+  void registerMountPoint(const std::string& mountPath);
+  virtual void bindMount(
+      const char* clientPath,
+      const char* mountPath,
+      folly::StringPiece mountRoot);
+#ifdef __linux__
+  // Supplementary groups must already belong to the served user: setuid
+  // launches inherit them, and PrivHelperMain initializes them for root
+  // launches.
+  folly::File openPathAsUser(const std::string& path, int accessMode) const;
+#endif
+
+  UnixSocket::Message processStartFam(
+      folly::io::Cursor& cursor,
+      UnixSocket::Message& request);
+  UnixSocket::Message processStopFam();
+  UnixSocket::Message processSetFuseReadAhead(folly::io::Cursor& cursor);
+  UnixSocket::Message processSetNfsFstypeOverride(folly::io::Cursor& cursor);
+  virtual AbsolutePath getFamBinaryPath() const;
+
+  // Virtual so tests can replace a pathname after its descriptor is checked.
+  virtual void sanityCheckOpenedMountPoint(
+      const std::string& mountPoint,
+      int mountPointFd);
+
   folly::File openBindMountTarget(
       folly::StringPiece mountRoot,
       folly::StringPiece mountPath);
@@ -244,8 +337,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   // Virtual so that a test can observe whether a code path skipped it.
   virtual void cleanupMountPoints();
 
-#ifdef __APPLE__
-  /** Everything prepareRestart() resolved while it still had privileges. */
+  /** Everything prepareRestart() resolved as root. */
   struct RestartPlan {
     AbsolutePath binary;
     RestartSentinel::RelaunchCommand command;
@@ -256,7 +348,8 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   /**
    * Spawns a new edenfs. Overridable so that tests can exercise the restart
-   * decision without launching anything. Returns false if the spawn failed.
+   * decision without launching anything. Returns false unless the daemon's
+   * startup process exits successfully.
    */
   using SpawnEdenFsFn = std::function<bool(
       const AbsolutePath& binary,
@@ -277,7 +370,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   /**
    * Decide whether this exit looks like a crash worth answering with a
-   * relaunch, and do everything about it that needs root: reading the relaunch
+   * relaunch, and do everything about it that needs root: taking the relaunch
    * command, resolving the binary and charging the circuit breaker.
    *
    * Returns the plan to launch, or nullopt to leave edenfs down.
@@ -286,7 +379,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
 
   /**
    * Validate the child credentials and relaunch edenfs from a plan. Returns
-   * whether the replacement process was spawned.
+   * whether the replacement daemon finished starting.
    */
   bool launchRestart(const RestartPlan& plan) const;
 
@@ -299,7 +392,7 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   /**
    * Path to the edenfs binary to relaunch: the one installed next to this
    * privhelper, which keeps both on the same version, falling back to argv[0]
-   * from the sentinel when there is no sibling. Throws when neither is usable.
+   * of `command` when there is no sibling. Throws when neither is usable.
    *
    * Virtual because a unit test has no sibling edenfs to point at.
    */
@@ -313,7 +406,6 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
    * Virtual so tests can supply controlled credentials.
    */
   virtual void validateRestartOwner() const;
-#endif // __APPLE__
 
  private:
 #ifndef __APPLE__
@@ -336,6 +428,17 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   std::unique_ptr<folly::EventBase> eventBase_;
   UnixSocket::UniquePtr conn_;
   std::unique_ptr<FileAccessMonitorProcess> famProcess_;
+  // Whether the daemon closed the socket, as opposed to the loop ending for
+  // another reason: a receive error also ends the loop but leaves the daemon
+  // running, and relaunching then would put two daemons on the same mounts.
+  //
+  // Written from eofReceived() and read after the loop exits, both on the
+  // EventBase thread, so it needs no synchronization.
+  bool peerExited_{false};
+
+  // Whether nfsMount() overrides the filesystem type of mounts served over a
+  // Unix domain socket. Atomic only so tests can read it from another thread.
+  std::atomic<bool> nfsFstypeOverride_{true};
 
   // The privhelper server only has a single thread,
   // so we don't need to lock the following state

@@ -158,11 +158,16 @@ Sapling_PyEvalFrame(PyThreadState* tstate, PyFrame* f, int exc) {
   volatile ssize_t line_no = 0;
   volatile PyCodeObject* code =
       sapling_cext_evalframe_extract_code_lineno_from_frame(f, &line_no);
+  // Compute a checksum from the wrapper address, stack slot, and sampled
+  // values. The sampler checks this without dereferencing any Python object.
+  volatile uintptr_t cookie = (uintptr_t)Sapling_PyEvalFrame ^
+      (uintptr_t)&cookie ^ (uintptr_t)code ^ (uintptr_t)line_no;
   // Mark variables as used, and keep them on stack explicitly.
   // NO_OPT can still be useful to keep the frame pointer.
 #if !defined(_MSC_VER)
   __asm__ __volatile__("" : : "m"(code));
   __asm__ __volatile__("" : : "m"(line_no));
+  __asm__ __volatile__("" : : "m"(cookie));
 #endif
   return _PyEval_EvalFrameDefault(tstate, f, exc);
 }
@@ -220,11 +225,39 @@ void sapling_cext_evalframe_set_mode(int mode) {
 }
 
 /**
+ * Return the inline UTF-8 data of a compact ASCII `str`, a placeholder for
+ * any other `str`, or NULL for anything that is not a `str`.
+ *
+ * `PyUnicode_AsUTF8` is not usable here: for a non-ASCII `str` it allocates
+ * and caches the UTF-8 form on the object, and the callers of this function
+ * run without the GIL, possibly on a thread that has no Python thread state
+ * at all (the sampling profiler thread), where the allocator dereferences a
+ * NULL thread state. The placeholder keeps the frame, and its line number,
+ * in the backtrace.
+ */
+static const char* ascii_str_data(PyObject* obj) {
+  if (!obj || !PyUnicode_Check(obj)) {
+    return NULL;
+  }
+  if (!PyUnicode_IS_COMPACT_ASCII(obj)) {
+    return "<non-ascii>";
+  }
+  return (const char*)PyUnicode_DATA(obj);
+}
+
+/**
  * Resolve a Python code object to function name.
  * Also report the filename to `pfilename`.
  *
+ * Non-ASCII names and filenames come back as a placeholder; see
+ * `ascii_str_data`. This function might be called without the GIL. It does
+ * not allocate, mutate, or DECREF Python objects.
+ *
+ * `code` comes off the sampled thread's stack (see backtrace-python) and has
+ * turned out to point at other objects, so it is not trusted to be a code
+ * object until its type says so.
+ *
  * See also `sapling_cext_evalframe_stringify_code_lineno`.
- * This function does not DECREF the code object.
  */
 EXPORT const char* sapling_cext_evalframe_resolve_code_object(
     PyCodeObject* code,
@@ -235,14 +268,11 @@ EXPORT const char* sapling_cext_evalframe_resolve_code_object(
   if (!pfilename) {
     goto out;
   }
-  PyObject* filename_obj = code->co_filename;
-  PyObject* name_obj = code->co_name;
-  if (!filename_obj || !name_obj || !PyUnicode_Check(filename_obj) ||
-      !PyUnicode_Check(name_obj)) {
+  if (!PyCode_Check(code)) {
     goto out;
   }
-  const char* name = PyUnicode_AsUTF8(name_obj);
-  const char* filename = PyUnicode_AsUTF8(filename_obj);
+  const char* name = ascii_str_data(code->co_name);
+  const char* filename = ascii_str_data(code->co_filename);
   if (filename == NULL || name == NULL) {
     goto out;
   }

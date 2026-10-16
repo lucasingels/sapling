@@ -14,6 +14,7 @@ use context::CoreContext;
 use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
 use futures::stream;
+use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
@@ -24,6 +25,16 @@ use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use sorted_vector_map::sorted_vector_map;
+
+/// Author and committer of every commit the land service writes.
+pub const LAND_SERVICE_IDENTITY: &str = "multi_repo_land";
+/// Author and committer of every commit the reconciler writes.
+pub const RECONCILER_SERVICE_IDENTITY: &str = "manifest_reconciler";
+
+/// Whether `author` is one of the two services that regenerate manifests.
+pub fn is_service_identity(author: &str) -> bool {
+    author == LAND_SERVICE_IDENTITY || author == RECONCILER_SERVICE_IDENTITY
+}
 
 /// Create (and store) a commit that updates the manifest file on top of `parent`.
 /// No bookmark is moved — the caller does that in its atomic transaction.
@@ -40,7 +51,34 @@ pub async fn create_manifest_commit(
     manifest_path: &NonRootMPath,
     manifest_content: Bytes,
     service_identity: &str,
+    message: Option<String>,
 ) -> Result<ChangesetId> {
+    let bcs = build_manifest_commit(
+        ctx,
+        repo,
+        parent,
+        manifest_path,
+        manifest_content,
+        service_identity,
+        message,
+    )
+    .await?;
+    let cs_id = bcs.get_changeset_id();
+    save_changesets(ctx, repo, vec![bcs]).await?;
+    Ok(cs_id)
+}
+
+/// Store the manifest content and build the commit, without saving it. A
+/// caller preparing many commits saves them in one `save_changesets`.
+pub async fn build_manifest_commit(
+    ctx: &CoreContext,
+    repo: &(impl RepoBlobstoreRef + FilestoreConfigRef),
+    parent: ChangesetId,
+    manifest_path: &NonRootMPath,
+    manifest_content: Bytes,
+    service_identity: &str,
+    message: Option<String>,
+) -> Result<BonsaiChangeset> {
     let size = manifest_content.len() as u64;
 
     let metadata = filestore::store(
@@ -62,13 +100,17 @@ pub async fn create_manifest_commit(
         ),
     };
 
+    // Git has no notion of a commit without a committer, so a bonsai that omits
+    // one derives to the epoch-0 default signature and every generated commit
+    // dates to 1970 in git tooling.
+    let now = DateTime::now();
     let bcs_mut = BonsaiChangesetMut {
         parents: vec![parent],
         author: service_identity.to_string(),
-        author_date: DateTime::now(),
-        committer: None,
-        committer_date: None,
-        message: format!("Update static manifest at {manifest_path}"),
+        author_date: now,
+        committer: Some(service_identity.to_string()),
+        committer_date: Some(now),
+        message: message.unwrap_or_else(|| format!("Update static manifest at {manifest_path}")),
         hg_extra: Default::default(),
         git_extra_headers: None,
         file_changes,
@@ -78,9 +120,5 @@ pub async fn create_manifest_commit(
         subtree_changes: Default::default(),
     };
 
-    let bcs = bcs_mut.freeze()?;
-    let cs_id = bcs.get_changeset_id();
-    save_changesets(ctx, repo, vec![bcs]).await?;
-
-    Ok(cs_id)
+    bcs_mut.freeze()
 }

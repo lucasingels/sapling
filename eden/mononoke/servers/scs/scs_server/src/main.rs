@@ -10,8 +10,6 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -20,7 +18,6 @@ use async_trait::async_trait;
 use clap::Parser;
 use clap::ValueEnum;
 use clientinfo::ClientEntryPoint;
-use cloned::cloned;
 use cmdlib_logging::ScribeLoggingArgs;
 use connection_security_checker::ConnectionSecurityChecker;
 use environment::BookmarkCacheDerivedData;
@@ -29,7 +26,6 @@ use environment::BookmarkCacheOptions;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use executor_lib::args::ShardedExecutorArgs;
-use fb303_core_services::make_BaseService_server;
 use fbinit::FacebookInit;
 use git_source_of_truth::GitSourceOfTruthConfig;
 use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
@@ -37,6 +33,7 @@ use megarepo_api::MegarepoApi;
 use metaconfig_types::ShardedService;
 use mononoke_api::CoreContext;
 use mononoke_api::repo::Repo;
+use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use mononoke_app::args::HooksAppExtension;
@@ -68,7 +65,6 @@ use thrift_factory::ThriftFactoryBuilder;
 use tokio::task;
 use tracing::info;
 
-mod facebook;
 mod metadata;
 mod monitoring;
 
@@ -148,8 +144,7 @@ pub struct ScsServerProcess {
 }
 
 impl ScsServerProcess {
-    fn new(repos_mgr: MononokeReposManager<Repo>) -> Self {
-        let repos_mgr = Arc::new(repos_mgr);
+    fn new(repos_mgr: Arc<MononokeReposManager<Repo>>) -> Self {
         Self { repos_mgr }
     }
 }
@@ -264,11 +259,13 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     } else {
         Some(ShardedService::SourceControlService)
     };
-    let repos_mgr = runtime.block_on(app.open_managed_repos(service_name))?;
+    // Held until after wait_until_terminated: dropping the manager aborts the
+    // config reconcile loop, which is the only thing that rebuilds repos on
+    // config change. Without ShardManager (local runs) nothing else holds it.
+    let repos_mgr = Arc::new(runtime.block_on(app.open_managed_repos(service_name))?);
     let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
     let megarepo_api = Arc::new(MegarepoApi::new(&app, mononoke.clone())?);
 
-    let will_exit = Arc::new(AtomicBool::new(false));
     let (sm_shutdown_sender, sm_shutdown_receiver) = tokio::sync::oneshot::channel::<bool>();
 
     if let Some(max_memory) = args.max_memory {
@@ -318,7 +315,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             .await
             .expect("Failed to build thrift factory")
     });
-    let thrift = setup_thrift_server(fb, &args, &will_exit, source_control_server, factory)
+    let thrift = setup_thrift_server(&app, &args, source_control_server, factory)
         .context("Failed to set up Thrift server")?;
 
     let mut service_framework = ServiceFramework::from_server(SERVICE_NAME, thrift)
@@ -360,7 +357,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     if let Some(executor) = args.sharded_executor_args.build_executor(
         fb,
         runtime.clone(),
-        || Arc::new(ScsServerProcess::new(repos_mgr)),
+        || Arc::new(ScsServerProcess::new(repos_mgr.clone())),
         false, // disable shard (repo) level healing
         SM_CLEANUP_TIMEOUT_SECS,
     )? {
@@ -376,7 +373,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     app.wait_until_terminated(
         move || {
             let _ = sm_shutdown_sender.send(true);
-            will_exit.store(true, Ordering::Relaxed)
         },
         args.shutdown_timeout_args.shutdown_grace_period,
         async {
@@ -389,33 +385,20 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         args.shutdown_timeout_args.shutdown_timeout,
         None,
     )?;
+    drop(repos_mgr);
 
     info!("Exiting...");
     Ok(())
 }
 
 fn setup_thrift_server(
-    fb: FacebookInit,
+    app: &MononokeApp,
     args: &ScsServerArgs,
-    will_exit: &Arc<AtomicBool>,
     source_control_server: SourceControlServiceImpl,
     exec: thrift_factory::ThriftFactory,
 ) -> anyhow::Result<ThriftServer> {
-    let fb303_base = {
-        cloned!(will_exit);
-        move |proto| {
-            make_BaseService_server(proto, facebook::BaseServiceImpl::new(will_exit.clone()))
-        }
-    };
-
     let service = {
-        move |proto| {
-            make_SourceControlService_server(
-                proto,
-                source_control_server.thrift_server(),
-                fb303_base.clone(),
-            )
-        }
+        move |proto| make_SourceControlService_server(proto, source_control_server.thrift_server())
     };
 
     // BetterOverloadHandler: memory-based overload protection at the Thrift
@@ -441,13 +424,14 @@ fn setup_thrift_server(
         net_config: None,
     };
 
-    Ok(ThriftServerBuilder::new(fb)
+    Ok(ThriftServerBuilder::new(app.fb)
         .with_name(SERVICE_NAME)
         .expect("failed to set name")
         .with_address(&args.host, args.port, false)?
         .with_tls()
         .expect("failed to enable TLS")
         .with_cancel_if_client_disconnected()
+        .with_custom_status_impl(app.server_status())
         .with_static_better_overload_handler(&boh_config)
         .context("Failed to configure BetterOverloadHandler")?
         .add_factory(exec, move || service, Some(metadata::create_metadata()))

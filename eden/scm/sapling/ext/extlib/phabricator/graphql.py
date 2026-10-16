@@ -360,9 +360,13 @@ class Client:
                                         }
                                     }
                                 }
-                                phabricator_diff_commit {
+                                phabricator_diff_commit(first: 20, from_commit_message_only: true) {
                                     nodes {
                                         commit_identifier
+                                    }
+                                    page_info {
+                                        has_next_page
+                                        end_cursor
                                     }
                                 }
                             }
@@ -415,8 +419,15 @@ class Client:
                 _status = result["diff_status_name"]
                 if _status in diff_status_list:
                     difftostatus[diffid] = _status
-                    nodes = result["phabricator_diff_commit"]["nodes"]
-                    for n in nodes:
+                    commit_connection = result["phabricator_diff_commit"]
+                    if commit_connection.get("page_info", {}).get("has_next_page"):
+                        repo.ui.debug(
+                            _(
+                                "only checking the 20 most recent landed commits for D%s\n"
+                            )
+                            % diffid
+                        )
+                    for n in commit_connection["nodes"]:
                         diffidentifiers[n["commit_identifier"]] = diffid
 
                     allversionnodes = result["phabricator_versions"]["nodes"]
@@ -485,7 +496,9 @@ class Client:
                         difftonode[diffid] = node
         return difftonode, difftolocalcommits, difftostatus
 
-    def getrevisioninfo(self, timeout, signalstatus, *revision_numbers):
+    def getrevisioninfo(
+        self, timeout, signalstatus, *revision_numbers, statusbadge=False
+    ):
         rev_numbers = self._normalizerevisionnumbers(revision_numbers)
         if self._mock:
             ret = self._mocked_responses.pop()
@@ -496,7 +509,9 @@ class Client:
                     "numbers": rev_numbers,
                 }
             }
-            ret = self._query(timeout, self._getquery(signalstatus), params)
+            ret = self._query(
+                timeout, self._getquery(signalstatus, statusbadge), params
+            )
         return self._processrevisioninfo(ret)
 
     def graphqlquery(self, query, variables, timeout=60_000):
@@ -504,7 +519,7 @@ class Client:
             return self._mocked_responses.pop()
         return self._query(timeout, query, variables)
 
-    def _getquery(self, signalstatus):
+    def _getquery(self, signalstatus, statusbadge):
         signalquery = ""
 
         if signalstatus:
@@ -513,8 +528,17 @@ class Client:
                   core_ci_signals_state
                 }"""
 
-        return (
-            """
+        # The server computes the badge from ~10 reads per diff, so only ask
+        # for it when it will be shown.
+        badgequery = ""
+        if statusbadge:
+            badgequery = """
+                status_badge {
+                  label
+                  status
+                }"""
+
+        return """
         query RevisionQuery(
           $params: [PhabricatorDiffQueryParams!]!
         ) {
@@ -557,14 +581,12 @@ class Client:
                     commit_hash_best_effort
                   }
                 }
-                %s
+                %s%s
               }
             }
           }
         }
-        """
-            % signalquery
-        )
+        """ % (signalquery, badgequery)
 
     def _processrevisioninfo(self, ret):
         try:
@@ -607,6 +629,8 @@ class Client:
                     )
                 else:
                     info["automated_review_badge_label"] = None
+
+                info["status_badge"] = node.get("status_badge")
 
                 info["signal_status"] = None
                 if (

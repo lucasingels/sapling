@@ -15,6 +15,9 @@ use justknobs::test_helpers::JustKnobsInMemory;
 use justknobs::test_helpers::KnobVal;
 use justknobs::test_helpers::with_just_knobs_async;
 use metaconfig_types::AclManifestMode;
+use metaconfig_types::ComparableRegex;
+use metaconfig_types::EnforcementExemptionSet;
+use metaconfig_types::RequestMatchers;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
@@ -102,15 +105,6 @@ async fn test_no_restricted_change(fb: FacebookInit) -> Result<()> {
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
                 .with_full_path(NonRootMPath::new("restricted/dir")?)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
-            // Fsnode tree traversal
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
@@ -237,17 +231,6 @@ async fn test_change_to_restricted_with_access_is_logged(fb: FacebookInit) -> Re
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["user_project/foo"])?)
                 .with_full_path(NonRootMPath::new("user_project/foo/bar")?)
-                .with_has_authorization(true)
-                .with_has_acl_access(true)
-                .with_acls(vec![project_acl.clone()])
-                .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                // The restricted path root is logged, not the full path
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["user_project/foo"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
                 .with_has_authorization(true)
                 .with_has_acl_access(true)
                 .with_acls(vec![project_acl.clone()])
@@ -401,15 +384,6 @@ async fn test_single_dir_single_restricted_change(fb: FacebookInit) -> Result<()
                     .with_has_authorization(false)
                     .with_acls(vec![restricted_acl.clone()])
                     .build()?,
-                // Fsnode access log
-                base_sample
-                    .clone()
-                    .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                    .with_manifest_id(expected_fsnode_id.clone())
-                    .with_manifest_type(ManifestType::Fsnode)
-                    .with_has_authorization(false)
-                    .with_acls(vec![restricted_acl.clone()])
-                    .build()?,
                 // ContentManifest access log
                 base_sample
                     .clone()
@@ -435,7 +409,7 @@ async fn test_single_dir_single_restricted_change(fb: FacebookInit) -> Result<()
                     .with_has_authorization(false)
                     .with_acls(vec![restricted_acl.clone()])
                     .build()?,
-                // Path fsnode access log
+                // Path content access log
                 base_sample
                     .clone()
                     .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
@@ -604,6 +578,92 @@ async fn test_enforcement_condition_set_always_enabled(fb: FacebookInit) -> Resu
     Ok(())
 }
 
+// What it tests: an exemption set matching the caller, with an
+// always-enabled condition set.
+// Expected: unauthorized access is allowed, because the exemption switches
+// enforcement off even for `always_enabled` conditions.
+#[mononoke::fbinit_test]
+async fn test_enforcement_exemption_with_always_enabled_condition(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_enforcement_exemption_sets(vec![EnforcementExemptionSet::new(RequestMatchers {
+            client_identity_regexes: vec![ComparableRegex::new("^USER:myusername0$")?],
+            ..Default::default()
+        })?])
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_always_enabled(true)
+                .build()],
+        )
+        .await?;
+
+    assert!(!was_denied, "a matching exemption should allow the access");
+    Ok(())
+}
+
+// What it tests: an exemption set is evaluated with AND semantics across its
+// filters, like a condition set.
+// Expected: unauthorized access is still denied when only some of the
+// exemption's filters match the caller.
+#[mononoke::fbinit_test]
+async fn test_enforcement_exemption_partial_match_does_not_exempt(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_enforcement_exemption_sets(vec![EnforcementExemptionSet::new(RequestMatchers {
+            machine_tiers: vec!["nonexistent_tier".to_string()],
+            client_identity_regexes: vec![ComparableRegex::new("^USER:myusername0$")?],
+            ..Default::default()
+        })?])
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_always_enabled(true)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        was_denied,
+        "an exemption whose machine tier does not match should not exempt"
+    );
+    Ok(())
+}
+
+// What it tests: an exemption set that does not match the caller.
+// Expected: unauthorized access is denied as if no exemption were configured.
+#[mononoke::fbinit_test]
+async fn test_enforcement_exemption_non_matching_caller(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_enforcement_exemption_sets(vec![EnforcementExemptionSet::new(RequestMatchers {
+            client_identity_regexes: vec![ComparableRegex::new("^USER:someone_else$")?],
+            ..Default::default()
+        })?])
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_always_enabled(true)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        was_denied,
+        "a non-matching exemption should not allow the access"
+    );
+    Ok(())
+}
+
 // What it tests: request-local condition-set filters.
 // Expected: unauthorized access is allowed without the required request flag and
 // denied when the request flag is present.
@@ -682,6 +742,58 @@ async fn test_enforcement_condition_set_request_flag_and_restriction_acl(
 
     assert!(!was_denied_without_flag);
     assert!(was_denied_with_flag);
+    Ok(())
+}
+
+// What it tests: `require_client_request_flag` satisfied by either
+// partial-responses request header.
+// Expected: unauthorized access is enforced when the client sent the opt-in
+// or the opt-out header, since either declares the client handles
+// enforcement; allowed when neither was sent.
+#[mononoke::fbinit_test]
+async fn test_enforcement_condition_set_partial_responses_headers(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let restricted_paths = vec![(NonRootMPath::new("restricted/dir")?, restricted_acl.clone())];
+    let condition_set = || {
+        EnforcementConditionSetBuilder::new()
+            .with_require_client_request_flag(true)
+            .with_restriction_acls([restricted_acl.clone()])
+            .build()
+    };
+
+    let was_denied_without_flag = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths.clone())
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+    let was_denied_with_opt_in = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths.clone())
+        .with_partial_responses_opt_in(true)
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+    let was_denied_with_opt_out = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(restricted_paths)
+        .with_partial_responses_opt_out(true)
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[condition_set()],
+        )
+        .await?;
+
+    assert!(!was_denied_without_flag);
+    assert!(was_denied_with_opt_in);
+    assert!(was_denied_with_opt_out);
     Ok(())
 }
 
@@ -871,6 +983,150 @@ async fn empty_client_identity_regexes_with_no_other_filter_does_not_enforce(
     assert!(
         !was_denied,
         "condition set with no active filter (default) should be dropped, so no enforcement"
+    );
+    Ok(())
+}
+
+// What it tests: condition set with only `is_agent = Some(true)` and a caller
+// whose identity carries an `agent` attribute.
+// Expected: the dimension alone counts as an active filter and matches, so
+// unauthorized access is enforced.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn is_agent_true_matches_agentic_caller_triggers_enforcement(fb: FacebookInit) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_agentic_client_identity()?
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_is_agent(true)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        was_denied,
+        "caller carries an `agent` attribute, so an is_agent=Some(true) set should fire"
+    );
+    Ok(())
+}
+
+// What it tests: condition set with only `is_agent = Some(true)` and the default
+// caller, whose identity carries no `agent` attribute.
+// Expected: filter does not match, so unauthorized access is not enforced.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn is_agent_true_non_agent_caller_does_not_trigger_enforcement(
+    fb: FacebookInit,
+) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_is_agent(true)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        !was_denied,
+        "caller has no `agent` attribute, so an is_agent=Some(true) set should not fire"
+    );
+    Ok(())
+}
+
+// What it tests: AND semantics between `is_agent` and
+// `client_identity_regexes`. The agentic caller's id is still
+// `USER:myusername0`, so both dimensions match.
+// Expected: filter matches, so unauthorized access is enforced.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn is_agent_true_and_identity_regex_both_match_triggers_enforcement(
+    fb: FacebookInit,
+) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_agentic_client_identity()?
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_is_agent(true)
+                .with_client_identity_regexes(["^USER:myusername0$"])
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        was_denied,
+        "agentic caller `USER:myusername0` satisfies both is_agent=Some(true) and the regex, so enforcement should fire"
+    );
+    Ok(())
+}
+
+// What it tests: condition set with only `is_agent = Some(false)` and the
+// default caller, whose identity carries no `agent` attribute.
+// Expected: the dimension alone counts as an active filter and matches, so
+// unauthorized access is enforced.
+#[mononoke::fbinit_test]
+async fn is_agent_false_matches_non_agent_caller_triggers_enforcement(
+    fb: FacebookInit,
+) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_is_agent(false)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        was_denied,
+        "caller has no `agent` attribute, so an is_agent=Some(false) set should fire"
+    );
+    Ok(())
+}
+
+// What it tests: condition set with only `is_agent = Some(false)` and a caller
+// whose identity carries an `agent` attribute.
+// Expected: filter does not match, so unauthorized access is not enforced.
+#[cfg(fbcode_build)]
+#[mononoke::fbinit_test]
+async fn is_agent_false_agentic_caller_does_not_trigger_enforcement(
+    fb: FacebookInit,
+) -> Result<()> {
+    let restricted_acl = MononokeIdentity::from_str("REPO_REGION:restricted_acl")?;
+    let was_denied = RestrictedPathsTestDataBuilder::new()
+        .with_restricted_paths(vec![(NonRootMPath::new("restricted/dir")?, restricted_acl)])
+        .with_agentic_client_identity()?
+        .build(fb)
+        .await?
+        .observe_path_enforcement(
+            NonRootMPath::new("restricted/dir/file")?,
+            &[EnforcementConditionSetBuilder::new()
+                .with_is_agent(false)
+                .build()],
+        )
+        .await?;
+
+    assert!(
+        !was_denied,
+        "caller carries an `agent` attribute, so an is_agent=Some(false) set should not fire"
     );
     Ok(())
 }
@@ -1191,15 +1447,6 @@ async fn test_single_dir_many_restricted_changes(fb: FacebookInit) -> Result<()>
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // ContentManifest access log
             base_sample
                 .clone()
@@ -1348,15 +1595,6 @@ async fn test_single_dir_restricted_and_unrestricted(fb: FacebookInit) -> Result
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // ContentManifest access log
             base_sample
                 .clone()
@@ -1382,7 +1620,7 @@ async fn test_single_dir_restricted_and_unrestricted(fb: FacebookInit) -> Result
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Path fsnode access log - only for restricted directory
+            // Path content access log - only for restricted directory
             base_sample
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
@@ -1659,24 +1897,6 @@ async fn test_multiple_restricted_dirs(fb: FacebookInit) -> Result<()> {
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // restricted/two access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/two"])?)
-                .with_manifest_id(expected_fsnode_id_two.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_acls(vec![another_acl.clone()])
-                .build()?,
-            // restricted/one access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/one"])?)
-                .with_manifest_id(expected_fsnode_id_one.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // restricted/two access - ContentManifest log
             base_sample
                 .clone()
@@ -1916,26 +2136,6 @@ async fn test_multiple_restricted_dirs_with_partial_access(fb: FacebookInit) -> 
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/one"])?)
                 .with_full_path(NonRootMPath::new("restricted/one")?)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
-            // user_project/foo access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["user_project/foo"])?)
-                .with_manifest_id(expected_fsnode_id_user.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                // User had access to this restricted path
-                .with_has_authorization(true)
-                .with_has_acl_access(true)
-                .with_acls(vec![myusername_project_acl.clone()])
-                .build()?,
-            // restricted/one access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/one"])?)
-                .with_manifest_id(expected_fsnode_id_restricted.clone())
-                .with_manifest_type(ManifestType::Fsnode)
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
@@ -2197,27 +2397,6 @@ async fn test_overlapping_restricted_directories(fb: FacebookInit) -> Result<()>
                 .with_has_authorization(false)
                 .with_acls(vec![more_restricted_acl.clone(), project_acl.clone()])
                 .build()?,
-            // project access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["project"])?)
-                .with_manifest_id(expected_fsnode_id_root.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                // User has access to the broader project ACL
-                .with_has_authorization(true)
-                .with_has_acl_access(true)
-                .with_acls(vec![project_acl.clone()])
-                .build()?,
-            // project/restricted access - Fsnode log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["project/restricted"])?)
-                .with_manifest_id(expected_fsnode_id_subdir.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                // User has access to the broader project ACL
-                .with_has_authorization(false)
-                .with_acls(vec![more_restricted_acl.clone()])
-                .build()?,
             // project access - ContentManifest log
             base_sample
                 .clone()
@@ -2443,15 +2622,6 @@ async fn test_same_manifest_id_restricted_and_unrestricted_paths(fb: FacebookIni
                 .with_has_authorization(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // ContentManifest access log
             base_sample
                 .clone()
@@ -2560,16 +2730,6 @@ async fn test_tooling_allowlist_acl_user_in_acl(fb: FacebookInit) -> Result<()> 
                 .with_is_allowlisted_tooling(true)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(true)
-                .with_is_allowlisted_tooling(true)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // ContentManifest access log
             base_sample
                 .clone()
@@ -2598,7 +2758,7 @@ async fn test_tooling_allowlist_acl_user_in_acl(fb: FacebookInit) -> Result<()> 
                 .with_is_allowlisted_tooling(true)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Path fsnode access log
+            // Path content access log
             base_sample
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
@@ -2718,16 +2878,6 @@ async fn test_tooling_allowlist_acl_user_not_in_acl(fb: FacebookInit) -> Result<
                 .with_is_allowlisted_tooling(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Fsnode access log
-            base_sample
-                .clone()
-                .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
-                .with_manifest_id(expected_fsnode_id.clone())
-                .with_manifest_type(ManifestType::Fsnode)
-                .with_has_authorization(false)
-                .with_is_allowlisted_tooling(false)
-                .with_acls(vec![restricted_acl.clone()])
-                .build()?,
             // ContentManifest access log
             base_sample
                 .clone()
@@ -2756,7 +2906,7 @@ async fn test_tooling_allowlist_acl_user_not_in_acl(fb: FacebookInit) -> Result<
                 .with_is_allowlisted_tooling(false)
                 .with_acls(vec![restricted_acl.clone()])
                 .build()?,
-            // Path fsnode access log
+            // Path content access log
             base_sample
                 .clone()
                 .with_restricted_paths(cast_to_non_root_mpaths(vec!["restricted/dir"])?)
@@ -3066,11 +3216,7 @@ async fn test_shadow_manifest_dispatch_skips_unsupported_manifest_types(
         .observe_restricted_paths_scenario(&[])
         .await?;
 
-    for manifest_type in [
-        ManifestType::Hg,
-        ManifestType::Fsnode,
-        ManifestType::ContentManifest,
-    ] {
+    for manifest_type in [ManifestType::Hg, ManifestType::ContentManifest] {
         assert!(
             result.scuba_logs.iter().any(|log| {
                 log.manifest_type() == Some(&manifest_type)

@@ -6,9 +6,12 @@
  */
 
 #include <folly/Exception.h>
+#include <folly/Portability.h>
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/portability/GFlags.h>
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
@@ -20,6 +23,8 @@
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/takeover/TakeoverHandler.h"
 #include "eden/fs/takeover/TakeoverServer.h"
+
+DECLARE_int64(maximumChunkSize);
 
 using namespace facebook::eden;
 using folly::EventBase;
@@ -33,6 +38,8 @@ using ::testing::ElementsAreArray;
 using namespace std::chrono_literals;
 
 namespace {
+constexpr int64_t kTestChunkSize = 64 * 1024;
+
 /**
  * A TakeoverHandler that returns the TakeoverData object passed to its
  * constructor.
@@ -591,7 +598,53 @@ TEST(Takeover, manyMounts) {
   }
 }
 
+TEST(Takeover, chunksSerializedInodeMap) {
+  const auto originalChunkSize = FLAGS_maximumChunkSize;
+  SCOPE_EXIT {
+    FLAGS_maximumChunkSize = originalChunkSize;
+  };
+  FLAGS_maximumChunkSize = kTestChunkSize;
+
+  SerializedInodeMap inodeMap;
+  constexpr int64_t numInodes = 1024;
+  for (int64_t i = 0; i < numInodes; ++i) {
+    SerializedInodeMapEntry entry;
+    entry.inodeNumber() = i;
+    entry.name() = folly::to<string>(
+        "example_inode_name______________choose_a_big_name______________", i);
+    entry.hash() = folly::to<string>(
+        "example_inode_hash______________choose_a_big_hash______________", i);
+    inodeMap.unloadedInodes()->emplace_back(std::move(entry));
+  }
+  TakeoverData data;
+  data.mountPoints.emplace_back(
+      canonicalPath("/mount"),
+      canonicalPath("/state"),
+      FuseChannelData{folly::File{}, fuse_init_out{}},
+      std::move(inodeMap));
+
+  UnixSocket::Message message;
+  data.serialize(kSupportedCapabilities, message);
+  EXPECT_GT(message.data.countChainElements(), 1);
+  EXPECT_GT(message.data.computeChainDataLength(), kTestChunkSize);
+  const auto* chunk = &message.data;
+  do {
+    EXPECT_LE(chunk->length(), kTestChunkSize);
+    chunk = chunk->next();
+  } while (chunk != &message.data);
+}
+
 TEST(Takeover, manyInodes) {
+  const auto originalChunkSize = FLAGS_maximumChunkSize;
+  SCOPE_EXIT {
+    if (folly::kIsSanitizeThread) {
+      FLAGS_maximumChunkSize = originalChunkSize;
+    }
+  };
+  if (folly::kIsSanitizeThread) {
+    FLAGS_maximumChunkSize = kTestChunkSize;
+  }
+
   TemporaryDirectory tmpDir("eden_takeover_test");
   AbsolutePath tmpDirPath = canonicalPath(tmpDir.path().string());
 
@@ -606,15 +659,9 @@ TEST(Takeover, manyInodes) {
   serverData.mountdServerSocket =
       folly::File{mountdSocketPath.view(), O_RDWR | O_CREAT};
 
-  // Build a TakeoverData which is a large message(length=1102721166).
-  // Here we create a mount with 7 million inodes. The size of this
-  // TakeoverData will be 1102721166 bytes.
-
-  // This size is larger than 1 GB (the maximum data length that we chose for
-  // transferring eden TakeoverData over UnixSocket). The TakeoverServer should
-  // split the data into multiple chunks and send them in sequence.
-
-  constexpr int64_t numInodes = 7000000;
+  // The non-TSan payload exceeds UnixSocket's 1GB message limit. TSan uses a
+  // smaller payload and chunk cap to cover the same multi-message handoff.
+  constexpr int64_t numInodes = folly::kIsSanitizeThread ? 4096 : 7000000;
 
   auto mountPath =
       tmpDirPath + RelativePathPiece{folly::to<string>("mounts/foo/test")};
@@ -627,8 +674,7 @@ TEST(Takeover, manyInodes) {
     SerializedInodeMapEntry entry;
     entry.inodeNumber() = i;
     entry.parentInode() = 0;
-    // The name and hash are chosen to be long enough to make the message
-    // larger than 1 GB.
+    // The long name and hash make the non-TSan message larger than 1 GB.
     entry.name() = folly::to<string>(
         "example_inode_name______________choose_a_big_name______________", i);
     entry.isUnlinked() = false;
@@ -650,7 +696,8 @@ TEST(Takeover, manyInodes) {
   TestHandler handler{std::move(serverData)};
   auto result = runTakeover(tmpDir, &handler);
   ASSERT_TRUE(serverSendFuture.hasValue());
-  EXPECT_TRUE(result.hasValue());
+  ASSERT_FALSE(serverSendFuture.value().has_value());
+  ASSERT_TRUE(result.hasValue());
   const auto& clientData = result.value();
 
   // Make sure the received lock file and thrift socket FDs are correct
@@ -674,7 +721,35 @@ TEST(Takeover, manyInodes) {
       tmpDirPath + PathComponentPiece{folly::to<string>("fuse")};
   auto& fuseChannelData = std::get<FuseChannelData>(mountInfo.channelInfo);
   checkExpectedFile(fuseChannelData.fd.fd(), expectedFusePath);
-  EXPECT_EQ(numInodes, mountInfo.inodeMap.unloadedInodes()->size());
+  const auto& unloadedInodes = *mountInfo.inodeMap.unloadedInodes();
+  ASSERT_EQ(numInodes, unloadedInodes.size());
+  const auto checkInode = [&](int64_t i) {
+    const auto& entry = unloadedInodes[i];
+    EXPECT_EQ(i, *entry.inodeNumber());
+    EXPECT_EQ(0, *entry.parentInode());
+    EXPECT_EQ(
+        folly::to<string>(
+            "example_inode_name______________choose_a_big_name______________",
+            i),
+        *entry.name());
+    EXPECT_FALSE(*entry.isUnlinked());
+    EXPECT_EQ(1, *entry.numFsReferences());
+    ASSERT_TRUE(entry.hash().has_value());
+    EXPECT_EQ(
+        folly::to<string>(
+            "example_inode_hash______________choose_a_big_hash______________",
+            i),
+        *entry.hash());
+    EXPECT_EQ(0644, *entry.mode());
+  };
+  if (folly::kIsSanitizeThread) {
+    for (int64_t i = 0; i < numInodes; ++i) {
+      checkInode(i);
+    }
+  } else {
+    checkInode(0);
+    checkInode(numInodes - 1);
+  }
 }
 
 TEST(Takeover, error) {

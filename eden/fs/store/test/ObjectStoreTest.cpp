@@ -46,8 +46,7 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
   using TreeAuxStats = std::array<int64_t, 3>;
 
   void SetUp() override {
-    std::shared_ptr<EdenConfig> rawEdenConfig{
-        EdenConfig::createTestEdenConfig()};
+    rawEdenConfig = EdenConfig::createTestEdenConfig();
     rawEdenConfig->inMemoryTreeCacheSize.setValue(
         kTreeCacheMaximumSize, ConfigSourceType::Default, true);
     rawEdenConfig->inMemoryTreeCacheMinimumItems.setValue(
@@ -150,14 +149,6 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
     return storedTree->get().getObjectId();
   }
 
-  void putReadyGlob(
-      std::pair<RootId, std::string> suffixQuery,
-      std::vector<std::string> globPtr) {
-    StoredGlob* storedGlob =
-        fakeBackingStore->putGlob(std::move(suffixQuery), std::move(globPtr));
-    storedGlob->setReady();
-  }
-
   CaseSensitivity getOppositeCaseSensitivity() const {
     return GetParam() == CaseSensitivity::Sensitive
         ? CaseSensitivity::Insensitive
@@ -218,6 +209,7 @@ struct ObjectStoreTest : public ::testing::TestWithParam<CaseSensitivity> {
   std::shared_ptr<FakeBackingStore> fakeBackingStoreWithKeyedBlake3;
   std::shared_ptr<FakeBackingStore> fakeBackingStoreWithTreeAuxPrefetching;
   std::shared_ptr<BackingStore> backingStoreWithKeyedBlake3;
+  std::shared_ptr<EdenConfig> rawEdenConfig;
   std::shared_ptr<TreeCache> treeCache;
   EdenStatsPtr stats;
   std::shared_ptr<ObjectStore> objectStore;
@@ -397,7 +389,7 @@ TEST_P(ObjectStoreTest, getTree_doesNotCacheRestrictedTree) {
       ObjectFetchContext::FromNetworkFetch, loggingContext->requests[1].origin);
 }
 
-TEST_P(ObjectStoreTest, getTree_doesNotCacheTreeWithRestrictedChild) {
+TEST_P(ObjectStoreTest, getTree_cachesTreeWithRestrictedChildWithinTtl) {
   Tree::container entries{kPathMapDefaultCaseSensitive};
   entries.emplace(
       "restricted"_pc,
@@ -415,10 +407,12 @@ TEST_P(ObjectStoreTest, getTree_doesNotCacheTreeWithRestrictedChild) {
   EXPECT_EQ(
       ObjectFetchContext::FromNetworkFetch, loggingContext->requests[0].origin);
   EXPECT_EQ(
-      ObjectFetchContext::FromNetworkFetch, loggingContext->requests[1].origin);
+      ObjectFetchContext::FromMemoryCache, loggingContext->requests[1].origin);
 }
 
-TEST_P(ObjectStoreTest, treeCache_doesNotInsertTreeWithRestrictedChild) {
+TEST_P(
+    ObjectStoreTest,
+    treeCache_doesNotCacheTreeWithRestrictedChildWhenTtlIsZero) {
   Tree::container entries{kPathMapDefaultCaseSensitive};
   entries.emplace(
       "restricted"_pc,
@@ -430,6 +424,8 @@ TEST_P(ObjectStoreTest, treeCache_doesNotInsertTreeWithRestrictedChild) {
   auto* parentTree = fakeBackingStore->putTree(entries);
   parentTree->setReady();
   auto parentTreeId = parentTree->get().getObjectId();
+  rawEdenConfig->restrictedTreeTtlSeconds.setValue(
+      0, ConfigSourceType::Default, true);
 
   treeCache->insert(parentTreeId, parentTree->getFuture().get());
 
@@ -457,7 +453,42 @@ TEST_P(ObjectStoreTest, getTree_cachesTreeWithAccessibleAclChild) {
       ObjectFetchContext::FromMemoryCache, loggingContext->requests[1].origin);
 }
 
-TEST_P(ObjectStoreTest, getRootTree_doesNotSeedCacheWithRestrictedChild) {
+TEST_P(ObjectStoreTest, getTree_prefetchBypassesTreeCache) {
+  auto prefetchContext = ObjectFetchContext::getNullPrefetchContext();
+
+  objectStore->getTree(readyTreeId, prefetchContext).get(0ms);
+  objectStore->getTree(readyTreeId, prefetchContext).get(0ms);
+
+  EXPECT_FALSE(treeCache->contains(readyTreeId));
+  EXPECT_EQ(2, fakeBackingStore->getAccessCount(readyTreeId));
+
+  objectStore->getTree(readyTreeId, context).get(0ms);
+
+  EXPECT_TRUE(treeCache->contains(readyTreeId));
+}
+
+TEST_P(ObjectStoreTest, getTree_prefetchUsesTreeCacheWhenBypassDisabled) {
+  auto config = EdenConfig::createTestEdenConfig();
+  config->treeCacheBypassGlobAndPrefetch.setValue(
+      false, ConfigSourceType::Default, true);
+  auto cachingObjectStore = ObjectStore::create(
+      fakeBackingStore,
+      treeCache,
+      stats.copy(),
+      std::make_shared<ProcessInfoCache>(),
+      makeTestEdenFsEventsLogger(),
+      std::make_shared<ReloadableConfig>(config),
+      GetParam());
+  auto prefetchContext = ObjectFetchContext::getNullPrefetchContext();
+
+  cachingObjectStore->getTree(readyTreeId, prefetchContext).get(0ms);
+  cachingObjectStore->getTree(readyTreeId, prefetchContext).get(0ms);
+
+  EXPECT_TRUE(treeCache->contains(readyTreeId));
+  EXPECT_EQ(1, fakeBackingStore->getAccessCount(readyTreeId));
+}
+
+TEST_P(ObjectStoreTest, getRootTree_seedsCacheWithRestrictedChild) {
   Tree::container entries{kPathMapDefaultCaseSensitive};
   entries.emplace(
       "restricted"_pc,
@@ -473,13 +504,13 @@ TEST_P(ObjectStoreTest, getRootTree_doesNotSeedCacheWithRestrictedChild) {
   commit->setReady();
 
   auto rootResult = objectStore->getRootTree(rootId, context).get(0ms);
-  EXPECT_EQ(nullptr, treeCache->get(rootResult.treeId));
+  EXPECT_NE(nullptr, treeCache->get(rootResult.treeId));
 
   objectStore->getTree(rootResult.treeId, context).get(0ms);
 
   ASSERT_EQ(1, loggingContext->requests.size());
   EXPECT_EQ(
-      ObjectFetchContext::FromNetworkFetch, loggingContext->requests[0].origin);
+      ObjectFetchContext::FromMemoryCache, loggingContext->requests[0].origin);
 }
 
 TEST_P(ObjectStoreTest, getTree_prefetch_missing_aux_data) {
@@ -710,28 +741,6 @@ TEST_P(
       objectStore->areBlobsEqual(one, two, context.as<ObjectFetchContext>());
   EXPECT_TRUE(std::move(fut).get(0ms));
   EXPECT_EQ(context->getFetchCount(), 2);
-}
-
-CO_TEST_P(ObjectStoreTest, glob_files_test) {
-  RootId rootId{"00000000000000000000"};
-  auto glob = std::vector<std::string>{"foo.txt", "bar.txt"};
-  putReadyGlob(std::pair<RootId, std::string>(rootId, ".txt"), std::move(glob));
-
-  auto context = makeRefPtr<FetchContext>();
-  auto globs = std::vector<std::string>{".txt"};
-
-  auto result = co_await objectStore->getGlobFiles(
-      rootId,
-      globs,
-      std::vector<std::string>{},
-      context.as<ObjectFetchContext>());
-  EXPECT_EQ(result.globFiles.size(), 2);
-  auto sorted_result = result.globFiles;
-  std::sort(sorted_result.begin(), sorted_result.end());
-  auto expected_result = std::vector<std::string>{"bar.txt", "foo.txt"};
-  for (int i = 0; i < 2; i++) {
-    EXPECT_EQ(sorted_result[i], expected_result[i]);
-  }
 }
 
 TEST_P(ObjectStoreTest, get_tree_with_different_sensitivities) {

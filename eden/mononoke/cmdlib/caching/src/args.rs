@@ -108,6 +108,10 @@ pub struct CachelibArgs {
     #[clap(long, value_name = "SIZE", hide = true)]
     pub commit_graph_cache_size: Option<usize>,
 
+    /// Override size of the commit derived data mapping cache, in bytes
+    #[clap(long, value_name = "SIZE", hide = true)]
+    pub commit_derived_data_mapping_cache_size: Option<usize>,
+
     /// Override size of the filenodes cache (individual filenodes)
     #[clap(long, value_name = "SIZE", hide = true)]
     pub filenodes_cache_size: Option<usize>,
@@ -135,6 +139,10 @@ pub struct CachelibArgs {
     /// Override size of the bonsai-svnrevs mapping cache
     #[clap(long, value_name = "SIZE", hide = true)]
     pub svnrevs_cache_size: Option<usize>,
+
+    /// Override size of the bonsai-p4-changelists mapping cache
+    #[clap(long, value_name = "SIZE", hide = true)]
+    pub p4_changelists_cache_size: Option<usize>,
 
     /// Override size of the phases cache
     #[clap(long, value_name = "SIZE", hide = true)]

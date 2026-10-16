@@ -21,6 +21,7 @@ use mononoke_types::RepositoryId;
 use permission_checker::AclProvider;
 use permission_checker::MononokeIdentity;
 use scuba_ext::MononokeScubaSampleBuilder;
+use scuba_ext::ScubaValue;
 use serde_json::Value;
 use serde_json::json;
 
@@ -28,6 +29,7 @@ use crate::ManifestType;
 use crate::RestrictedManifestId;
 use crate::RestrictedPaths;
 use crate::restriction_check;
+use crate::restriction_check::EnforcementDecision;
 use crate::restriction_check::ManifestRestrictionSource;
 use crate::restriction_check::PathRestrictionSource;
 use crate::restriction_check::RestrictionCheckResult;
@@ -75,9 +77,61 @@ struct RestrictedPathLogData<'a> {
     access_data: RestrictedPathAccessData,
     aggregate: Option<RestrictedPathAggregateLogData<'a>>,
     considered_restricted_by: Vec<String>,
-    access_enforcement_enabled: Option<bool>,
+    enforcement_decision: Option<EnforcementDecision>,
     acl_manifest_mode: Option<AclManifestMode>,
     source_comparison: Option<SourceComparisonLogContext>,
+}
+
+/// The enforcement columns of an access-log row.
+///
+/// Raw Scuba and the schematized logger both write these, so both derive them
+/// from the enforcement decision here.
+#[derive(Debug)]
+struct EnforcementLogFields {
+    /// The `enforcement_decision` column, set on every row logged from request
+    /// enforcement.
+    enforcement_decision: Option<EnforcementDecision>,
+    /// The legacy `access_enforcement_enabled` column: `true` when enforced,
+    /// `false` when no condition matched or the access was exempted, and
+    /// omitted when enforcement was disabled, failed, or was not evaluated for
+    /// the row.
+    access_enforcement_enabled: Option<bool>,
+    /// The `has_enforcement_exemption` column: whether an exemption set
+    /// matched the request, omitted when enforcement was disabled (exemptions
+    /// are not evaluated then) or not evaluated for the row.
+    has_enforcement_exemption: Option<bool>,
+}
+
+impl EnforcementLogFields {
+    fn new(decision: Option<EnforcementDecision>) -> Self {
+        let access_enforcement_enabled = match decision {
+            Some(EnforcementDecision::Enforced) => Some(true),
+            Some(
+                EnforcementDecision::NoConditionMatched { .. } | EnforcementDecision::Exempted,
+            ) => Some(false),
+            Some(EnforcementDecision::Disabled | EnforcementDecision::Error { .. }) | None => None,
+        };
+        let has_enforcement_exemption = match decision {
+            Some(EnforcementDecision::Enforced) => Some(false),
+            Some(EnforcementDecision::Exempted) => Some(true),
+            Some(
+                EnforcementDecision::NoConditionMatched { exemption_matched }
+                | EnforcementDecision::Error { exemption_matched },
+            ) => Some(exemption_matched),
+            Some(EnforcementDecision::Disabled) | None => None,
+        };
+        Self {
+            enforcement_decision: decision,
+            access_enforcement_enabled,
+            has_enforcement_exemption,
+        }
+    }
+}
+
+impl From<EnforcementDecision> for ScubaValue {
+    fn from(decision: EnforcementDecision) -> Self {
+        ScubaValue::from(decision.as_ref())
+    }
 }
 
 /// Extra fields emitted only when a row compares config and AclManifest source
@@ -236,7 +290,7 @@ pub(crate) fn spawn_log_source_results_with_enforcement<T>(
     restricted_paths: Arc<RestrictedPaths>,
     access_data: RestrictedPathAccessData,
     acl_manifest_mode: AclManifestMode,
-    access_enforcement_enabled: Option<bool>,
+    enforcement_decision: EnforcementDecision,
     config_handle: Option<SharedFetchHandle<T>>,
     acl_manifest_handle: Option<SharedFetchHandle<T>>,
 ) where
@@ -253,7 +307,7 @@ pub(crate) fn spawn_log_source_results_with_enforcement<T>(
             &restricted_paths,
             access_data,
             acl_manifest_mode,
-            access_enforcement_enabled,
+            enforcement_decision,
             config_handle,
             acl_manifest_handle,
         )
@@ -298,7 +352,7 @@ pub(crate) fn log_source_results_to_scuba_with_enforcement<T: SourceRestrictionC
     config_result: &SourceRestrictionResult<T>,
     acl_manifest_result: Option<&SourceRestrictionResult<T>>,
     acl_manifest_mode: AclManifestMode,
-    access_enforcement_enabled: Option<bool>,
+    enforcement_decision: Option<EnforcementDecision>,
     access_data: RestrictedPathAccessData,
     scuba: MononokeScubaSampleBuilder,
 ) -> Result<()> {
@@ -333,7 +387,9 @@ pub(crate) fn log_source_results_to_scuba_with_enforcement<T: SourceRestrictionC
         None => Vec::new(),
     };
 
-    log_access_to_scuba(
+    // Shared entry point with the legacy path: applies SCSC override sampling
+    // and feeds the schematized logger, not just the legacy Scuba table.
+    log_checked_access_to_restricted_path(
         ctx,
         RestrictedPathLogData {
             repo_id,
@@ -355,7 +411,7 @@ pub(crate) fn log_source_results_to_scuba_with_enforcement<T: SourceRestrictionC
                 config_source.as_ref(),
                 acl_manifest_source.as_ref(),
             ),
-            access_enforcement_enabled,
+            enforcement_decision,
             acl_manifest_mode: None,
             source_comparison: Some(source_comparison),
         },
@@ -373,7 +429,7 @@ async fn log_source_results<T>(
     restricted_paths: &RestrictedPaths,
     access_data: RestrictedPathAccessData,
     acl_manifest_mode: AclManifestMode,
-    access_enforcement_enabled: Option<bool>,
+    enforcement_decision: EnforcementDecision,
     config_handle: Option<SharedFetchHandle<T>>,
     acl_manifest_handle: Option<SharedFetchHandle<T>>,
 ) -> Result<()>
@@ -408,7 +464,7 @@ where
             &config_result,
             acl_manifest_result.as_ref(),
             acl_manifest_mode,
-            access_enforcement_enabled,
+            Some(enforcement_decision),
             access_data,
             restricted_paths.scuba.clone(),
         );
@@ -427,7 +483,7 @@ where
         acl_manifest_mode,
         restricted_paths.scuba.clone(),
         vec![source_name.to_string()],
-        access_enforcement_enabled,
+        Some(enforcement_decision),
     )?;
     Ok(())
 }
@@ -726,7 +782,7 @@ fn log_source_result_to_legacy_scuba(
     acl_manifest_mode: AclManifestMode,
     scuba: MononokeScubaSampleBuilder,
     considered_restricted_by: Vec<String>,
-    access_enforcement_enabled: Option<bool>,
+    enforcement_decision: Option<EnforcementDecision>,
 ) -> Result<RestrictionCheckResult> {
     let summary = SourceRestrictionSummary::from_checks(result);
     let check_result = summary.clone().into_restriction_check_result();
@@ -761,7 +817,7 @@ fn log_source_result_to_legacy_scuba(
                 acls: restriction_acl_refs,
             }),
             considered_restricted_by,
-            access_enforcement_enabled,
+            enforcement_decision,
             acl_manifest_mode: Some(acl_manifest_mode),
             source_comparison: None,
         },
@@ -817,6 +873,7 @@ mod schematized_logger {
     use scuba_ext::CommonMetadata;
     use scuba_ext::CommonServerData;
 
+    use super::EnforcementLogFields;
     use super::RestrictedPathAccessData;
 
     /// Log access to the schematized logger for restricted paths.
@@ -831,7 +888,7 @@ mod schematized_logger {
         is_allowlisted_tooling: bool,
         is_rollout_allowlisted: bool,
         is_admin_bypass: bool,
-        access_enforcement_enabled: Option<bool>,
+        enforcement: EnforcementLogFields,
         acls: &[&MononokeIdentity],
     ) -> Result<()> {
         let mut logger = MononokeRestrictedPathsAccessLogger::new(ctx.fb);
@@ -844,6 +901,12 @@ mod schematized_logger {
         let metadata =
             CommonMetadata::from_metadata(ctx.metadata(), ctx.scuba().observability_context());
         apply_metadata(&mut logger, &metadata);
+        logger.set_client_path_acl_compatibility(
+            ctx.metadata()
+                .client_path_acl_compatibility()
+                .as_str()
+                .to_owned(),
+        );
 
         // Set core access fields
         logger.set_repo_id(repo_id.id() as i64);
@@ -857,8 +920,14 @@ mod schematized_logger {
         logger.set_is_allowlisted_tooling(is_allowlisted_tooling.to_string());
         logger.set_is_rollout_allowlisted(is_rollout_allowlisted.to_string());
         logger.set_is_admin_bypass(is_admin_bypass);
-        if let Some(value) = access_enforcement_enabled {
+        if let Some(value) = enforcement.enforcement_decision {
+            logger.set_enforcement_decision(value.as_ref().to_owned());
+        }
+        if let Some(value) = enforcement.access_enforcement_enabled {
             logger.set_access_enforcement_enabled(value);
+        }
+        if let Some(value) = enforcement.has_enforcement_exemption {
+            logger.set_has_enforcement_exemption(value);
         }
         logger.set_acls(acls.iter().map(|acl| acl.to_string()).collect::<Vec<_>>());
 
@@ -930,6 +999,19 @@ mod schematized_logger {
     fn apply_metadata(logger: &mut MononokeRestrictedPathsAccessLogger, data: &CommonMetadata) {
         logger.set_session_uuid(data.session_uuid.clone());
         logger.set_client_identities(data.client_identities.clone());
+        if !data.unverified_forwarded_identities.is_empty() {
+            logger
+                .set_unverified_forwarded_identities(data.unverified_forwarded_identities.clone());
+        }
+        if let Some(ref verifier) = data.forwarded_cats_verifier {
+            logger.set_forwarded_cats_verifier(verifier.clone());
+        }
+        if !data.forwarded_cats_token_verifiers.is_empty() {
+            logger.set_forwarded_cats_token_verifiers(data.forwarded_cats_token_verifiers.clone());
+        }
+        if let Some(ref client_id) = data.upstream_client_id {
+            logger.set_client_id(client_id.clone());
+        }
 
         if let Some(ref hostname) = data.source_hostname {
             logger.set_source_hostname(hostname.clone());
@@ -1032,7 +1114,7 @@ pub(crate) async fn log_access_to_restricted_path(
                 acls,
             }),
             considered_restricted_by,
-            access_enforcement_enabled: None,
+            enforcement_decision: None,
             acl_manifest_mode: Some(acl_manifest_mode),
             source_comparison: None,
         },
@@ -1087,7 +1169,7 @@ fn log_checked_access_to_restricted_path(
                 aggregate.authorization.is_allowlisted_tooling,
                 aggregate.authorization.is_rollout_allowlisted,
                 aggregate.authorization.is_admin_bypass,
-                log_data.access_enforcement_enabled,
+                EnforcementLogFields::new(log_data.enforcement_decision),
                 &aggregate.acls,
             ) {
                 tracing::error!("Failed to log to schematized logger: {:?}", e);
@@ -1104,6 +1186,11 @@ fn log_access_to_scuba(
     mut scuba: MononokeScubaSampleBuilder,
 ) -> Result<()> {
     scuba.add_metadata(ctx.metadata());
+    scuba.add(
+        "client_path_acl_compatibility",
+        ctx.metadata().client_path_acl_compatibility().as_str(),
+    );
+    scuba.add_opt("client_id", ctx.metadata().upstream_client_id());
 
     if let Some(user_agent) = ctx.metadata().user_agent() {
         scuba.add("http_user_agent", user_agent);
@@ -1174,8 +1261,15 @@ fn log_access_to_scuba(
     if let Some(source_comparison) = log_data.source_comparison {
         source_comparison.add_to_scuba(&mut scuba);
     }
-    if let Some(access_enforcement_enabled) = log_data.access_enforcement_enabled {
+    let enforcement = EnforcementLogFields::new(log_data.enforcement_decision);
+    if let Some(enforcement_decision) = enforcement.enforcement_decision {
+        scuba.add("enforcement_decision", enforcement_decision);
+    }
+    if let Some(access_enforcement_enabled) = enforcement.access_enforcement_enabled {
         scuba.add("access_enforcement_enabled", access_enforcement_enabled);
+    }
+    if let Some(has_enforcement_exemption) = enforcement.has_enforcement_exemption {
+        scuba.add("has_enforcement_exemption", has_enforcement_exemption);
     }
 
     scuba.log();

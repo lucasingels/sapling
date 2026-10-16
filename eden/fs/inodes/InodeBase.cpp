@@ -9,19 +9,54 @@
 
 #include <folly/Likely.h>
 #include <folly/logging/xlog.h>
+#include <folly/small_vector.h>
 
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeAccessLogger.h"
 #include "eden/fs/inodes/InodeMap.h"
 #include "eden/fs/inodes/InodeTable.h"
+#include "eden/fs/inodes/Overlay.h"
+#include "eden/fs/inodes/OverlayFileAccess.h"
 #include "eden/fs/inodes/ParentInodeInfo.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/journal/Journal.h"
+#include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/NotImplemented.h"
 
 namespace facebook::eden {
+
+namespace {
+
+/**
+ * Brackets a directory's location change for the path cache. Files are not
+ * cached, so their location changes need no bracket.
+ */
+class DirectoryLocationChange {
+ public:
+  DirectoryLocationChange(InodePathCache& cache, bool isDirectory)
+      : cache_{isDirectory ? &cache : nullptr} {
+    if (cache_) {
+      cache_->beginChange();
+    }
+  }
+  ~DirectoryLocationChange() {
+    if (cache_) {
+      cache_->endChange();
+    }
+  }
+  DirectoryLocationChange(const DirectoryLocationChange&) = delete;
+  DirectoryLocationChange(DirectoryLocationChange&&) = delete;
+  DirectoryLocationChange& operator=(const DirectoryLocationChange&) = delete;
+  DirectoryLocationChange& operator=(DirectoryLocationChange&&) = delete;
+
+ private:
+  InodePathCache* cache_;
+};
+
+} // namespace
 
 InodeBase::InodeBase(EdenMount* mount)
     : ino_{kRootNodeId},
@@ -94,10 +129,59 @@ InodeBase::InodeBase(
 InodeBase::~InodeBase() {
   XLOGF(
       DBG5, "inode {} ({}) destroyed: {}", fmt::ptr(this), ino_, getLogPath());
+  if (removeOverlayDataOnDestruction_) {
+    removeOverlayData();
+  }
   auto p = getParentRacy();
   while (p) {
     p->increaseInMemoryDescendants(-1);
     p = p->getParentRacy();
+  }
+}
+
+void InodeBase::removeOverlayData() noexcept {
+  try {
+    auto* overlay = mount_->getOverlay();
+    const bool isDir = getType() == dtype_t::Dir;
+#ifndef _WIN32
+    // Drop the cached descriptor of a deleted file now, so its space is freed
+    // when this scope or the GC thread closes it rather than whenever the
+    // cache happens to evict it.
+    std::shared_ptr<void> openFile;
+    if (!isDir) {
+      openFile = mount_->getOverlayFileAccess()->releaseEntry(ino_);
+    }
+    // Removing overlay data is a btrfs unlink and inode evict, several
+    // metadata tree walks that serialize on the subvolume's root lock. Doing
+    // them from many FsChannel threads at once contends with each other and
+    // with the writes being served; one GC thread doing them in sequence
+    // does not.
+    if (overlay->removeOverlayDataInBackground(
+            ino_, isDir, std::move(openFile))) {
+      return;
+    }
+#endif
+    if (isDir) {
+      overlay->removeOverlayDir(ino_);
+    } else {
+      overlay->removeOverlayFile(ino_);
+    }
+  } catch (const std::exception& ex) {
+    // Nothing more can be done: the inode is gone and fsck reclaims orphaned
+    // overlay data. The usual cause is overlay data left corrupt by a crash
+    // that did not sync the filesystem.
+    auto outcome = mount_->getServerState()->getErrorLogger().log(
+        EdenErrorInfo::overlay(ex, ino_.getRawValue())
+            .withMountPoint(mount_->getPath().asString())
+            .withErrorType("overlay_unload_failed"));
+    if (outcome != ErrorLogOutcome::RateLimited) {
+      XLOGF(
+          ERR,
+          "error removing overlay data of unlinked inode {} ({}): {}",
+          ino_,
+          getLogPath(),
+          folly::exceptionStr(ex));
+    }
   }
 }
 
@@ -125,9 +209,9 @@ folly::Future<folly::Unit> InodeBase::access(int /*mask*/) {
 }
 #endif
 
-void InodeBase::updateLastFsRequestTime() {
+void InodeBase::markGcRef() {
   auto now = getNow();
-  lastFsRequestTime_.exchange(now, std::memory_order_relaxed);
+  lastGcRefTime_.exchange(now, std::memory_order_relaxed);
 }
 
 bool InodeBase::isUnlinked() const {
@@ -188,11 +272,87 @@ std::optional<RelativePath> InodeBase::getPath() const {
     return RelativePath();
   }
 
-  std::vector<PathComponent> names;
-  if (!getPathHelper(names, true)) {
+  auto& cache = mount_->getInodePathCache();
+  // While a directory is moving, read the locations directly: see
+  // InodePathCache::changing().
+  if (!cache.enabled() || cache.changing()) {
+    std::vector<PathComponent> names;
+    if (!getPathHelper(names, true)) {
+      return std::nullopt;
+    }
+    return RelativePath(names);
+  }
+
+  const auto generation = cache.generation();
+  const bool isDirectory = getType() == dtype_t::Dir;
+  if (isDirectory) {
+    // A cached entry for this directory is current as long as no directory
+    // has moved or been removed since it was recorded, which is exactly what
+    // an unchanged generation says, so no lock is needed.
+    if (auto path = cache.find(ino_, generation)) {
+      if (cache.generation() == generation) {
+        return path;
+      }
+    }
+  }
+  // Names from this inode up to, but not including, the nearest directory
+  // whose path is cached, innermost first.
+  folly::small_vector<PathComponent, 2> names;
+  TreeInodePtr parent;
+  {
+    auto loc = location_.rlock();
+    if (loc->unlinked) {
+      return std::nullopt;
+    }
+    parent = loc->parent;
+    names.push_back(loc->name);
+  }
+  if (!parent) {
     return std::nullopt;
   }
-  return RelativePath(names);
+  const auto parentNumber = parent->ino_;
+
+  std::optional<RelativePath> path;
+  while (true) {
+    if (parent->ino_ == kRootNodeId) {
+      path = RelativePath();
+      break;
+    }
+    path = cache.find(parent->ino_, generation);
+    if (path) {
+      break;
+    }
+    auto loc = parent->location_.rlock();
+    if (loc->unlinked) {
+      return std::nullopt;
+    }
+    names.push_back(loc->name);
+    parent = loc->parent;
+    if (!parent) {
+      return std::nullopt;
+    }
+  }
+  for (auto iter = names.rbegin(); iter != names.rend(); ++iter) {
+    path = *path + *iter;
+  }
+
+  if (cache.generation() != generation) {
+    // A directory moved or was removed while this path was being built, so
+    // the cached prefix may not match the names read after it. Build the
+    // path from the locations alone.
+    std::vector<PathComponent> all;
+    if (!getPathHelper(all, true)) {
+      return std::nullopt;
+    }
+    return RelativePath(all);
+  }
+  if (names.size() > 1) {
+    cache.insert(parentNumber, path->dirname(), generation);
+  }
+  if (isDirectory) {
+    cache.insert(ino_, *path, generation);
+  }
+  return path;
 }
 
 RelativePath InodeBase::getUnsafePath() const {
@@ -223,6 +383,8 @@ std::string InodeBase::getLogPath() const {
 }
 
 void InodeBase::markUnlinkedAfterLoad() {
+  DirectoryLocationChange change{
+      mount_->getInodePathCache(), getType() == dtype_t::Dir};
   auto loc = location_.wlock();
   XDCHECK(!loc->unlinked);
   loc->unlinked = true;
@@ -236,6 +398,8 @@ std::unique_ptr<InodeBase> InodeBase::markUnlinked(
   XDCHECK(renameLock.isHeld(mount_));
 
   {
+    DirectoryLocationChange change{
+        mount_->getInodePathCache(), getType() == dtype_t::Dir};
     auto loc = location_.wlock();
     XDCHECK(!loc->unlinked);
     XDCHECK_EQ(loc->parent.get(), parent);
@@ -283,6 +447,8 @@ void InodeBase::updateLocation(
   XDCHECK(renameLock.isHeld(mount_));
   XDCHECK_EQ(mount_, newParent->mount_);
 
+  DirectoryLocationChange change{
+      mount_->getInodePathCache(), getType() == dtype_t::Dir};
   auto loc = location_.wlock();
   XDCHECK(!loc->unlinked);
   loc->parent = newParent;
@@ -484,7 +650,7 @@ void InodeBase::logAccess(const ObjectFetchContext& fetchContext) {
 
   std::optional<std::string> fetchDetail;
 
-  const auto& detail = fetchContext.getCauseDetail();
+  const auto detail = fetchContext.getCauseDetail();
   if (detail.has_value()) {
     fetchDetail.emplace(std::string{detail.value()});
   }

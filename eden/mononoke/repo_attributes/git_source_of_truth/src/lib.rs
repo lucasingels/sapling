@@ -8,10 +8,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use context::CoreContext;
+use futures_retry::retry;
 use mononoke_types::RepositoryId;
 
 mod store;
@@ -63,12 +69,15 @@ pub trait GitSourceOfTruthConfig: Send + Sync {
         mutation_id: i64,
     ) -> Result<()>;
 
+    /// Stamp the `Reserved` rows with these names with this mutation_id.
+    /// Returns the number of rows updated so callers can verify every
+    /// expected row was still present and `Reserved` at stamp time.
     async fn update_mutation_id_by_repo_names_for_reserved_repos(
         &self,
         ctx: &CoreContext,
         repo_names: &[RepositoryName],
         mutation_id: i64,
-    ) -> Result<()>;
+    ) -> Result<u64>;
 
     async fn delete_source_of_truth_by_repo_names_for_reserved_repos(
         &self,
@@ -83,6 +92,12 @@ pub trait GitSourceOfTruthConfig: Send + Sync {
     ) -> Result<()>;
 
     async fn get_max_id(&self, ctx: &CoreContext) -> Result<Option<RepositoryId>>;
+
+    /// Take `count` ids off the monotonic sequence. Nothing deletes from it, so
+    /// an id is issued at most once, unlike `get_max_id` + 1 (S709055). Ids are
+    /// not guaranteed contiguous.
+    async fn allocate_repo_ids(&self, ctx: &CoreContext, count: usize)
+    -> Result<Vec<RepositoryId>>;
 
     async fn get_by_repo_name(
         &self,
@@ -112,8 +127,53 @@ pub trait GitSourceOfTruthConfig: Send + Sync {
         mutation_id: i64,
     ) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
 
+    /// `Mononoke` entries stamped with this mutation_id; rows in any other state are excluded.
+    async fn get_redirected_to_mononoke_by_mutation_id(
+        &self,
+        ctx: &CoreContext,
+        mutation_id: i64,
+    ) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
+
     /// Get all entries, regardless of source-of-truth state, in a single query.
     async fn get_any(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
+
+    /// Compare-and-act delete of a single `Reserved` row: the row is deleted
+    /// only if it still has this exact row id, is still `Reserved`, and still
+    /// carries this exact mutation stamp (`None` means `mutation_id IS NULL`).
+    /// Returns the number of rows deleted (0 or 1); 0 means the row changed
+    /// under us (e.g. an in-flight creation stamped or flipped it) and was
+    /// left untouched.
+    async fn delete_reserved_row(
+        &self,
+        ctx: &CoreContext,
+        id: RowId,
+        mutation_id: Option<i64>,
+    ) -> Result<u64>;
+}
+
+/// The source-of-truth flip `create_repos` performs once its Configo mutation
+/// reaches `LANDED`: every row stamped with `mutation_id` becomes `Mononoke`.
+/// Shared with out-of-band repair (`mononoke_admin git-source-of-truth
+/// sweep-landed-reserved`) so a repair takes exactly the path the poller takes.
+pub async fn flip_landed_mutation_to_mononoke(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    mutation_id: i64,
+) -> Result<()> {
+    retry(
+        |_| {
+            git_source_of_truth_config.update_source_of_truth_by_mutation_id(
+                ctx,
+                GitSourceOfTruth::Mononoke,
+                mutation_id,
+            )
+        },
+        Duration::from_millis(1_000),
+    )
+    .binary_exponential_backoff()
+    .max_attempts(5)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -160,10 +220,12 @@ impl GitSourceOfTruthConfig for NoopGitSourceOfTruthConfig {
     async fn update_mutation_id_by_repo_names_for_reserved_repos(
         &self,
         _ctx: &CoreContext,
-        _repo_names: &[RepositoryName],
+        repo_names: &[RepositoryName],
         _mutation_id: i64,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<u64> {
+        // The no-op stamp "succeeds" for every requested row, so callers that
+        // verify the stamped count don't fail creations on non-SQL configs.
+        Ok(repo_names.len() as u64)
     }
 
     async fn delete_source_of_truth_by_repo_names_for_reserved_repos(
@@ -184,6 +246,18 @@ impl GitSourceOfTruthConfig for NoopGitSourceOfTruthConfig {
 
     async fn get_max_id(&self, _ctx: &CoreContext) -> Result<Option<RepositoryId>> {
         Ok(None)
+    }
+
+    async fn allocate_repo_ids(
+        &self,
+        _ctx: &CoreContext,
+        _count: usize,
+    ) -> Result<Vec<RepositoryId>> {
+        // An empty batch would let a caller create repos under ids it never
+        // reserved, so this refuses where the other no-op methods return Ok.
+        Err(anyhow!(
+            "NoopGitSourceOfTruthConfig cannot allocate repo ids"
+        ))
     }
 
     async fn get_by_repo_name(
@@ -225,21 +299,49 @@ impl GitSourceOfTruthConfig for NoopGitSourceOfTruthConfig {
         Ok(vec![])
     }
 
+    async fn get_redirected_to_mononoke_by_mutation_id(
+        &self,
+        _ctx: &CoreContext,
+        _mutation_id: i64,
+    ) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
+        Ok(vec![])
+    }
+
     async fn get_any(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
         Ok(vec![])
+    }
+
+    async fn delete_reserved_row(
+        &self,
+        _ctx: &CoreContext,
+        _id: RowId,
+        _mutation_id: Option<i64>,
+    ) -> Result<u64> {
+        Ok(0)
     }
 }
 
 #[derive(Clone)]
 pub struct TestGitSourceOfTruthConfig {
     entries: Arc<Mutex<HashMap<RepositoryName, GitSourceOfTruthConfigEntry>>>,
+    // Distinct per-entry row ids, so id-keyed operations (delete_reserved_row)
+    // match exactly one row like the SQL impls do.
+    next_id: Arc<AtomicU64>,
+    // Stands in for `repo_id_sequence`; never rewinds on removal.
+    next_repo_id: Arc<AtomicU64>,
 }
 
 impl TestGitSourceOfTruthConfig {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_repo_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    fn allocate_id(&self) -> RowId {
+        RowId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -253,10 +355,13 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
         source_of_truth: GitSourceOfTruth,
     ) -> Result<()> {
         let mut map = self.entries.lock().expect("poisoned lock");
+        let id = map
+            .get(&repo_name)
+            .map_or_else(|| self.allocate_id(), |existing| existing.id);
         map.insert(
             repo_name.to_owned(),
             GitSourceOfTruthConfigEntry {
-                id: RowId(0),
+                id,
                 repo_id,
                 repo_name,
                 source_of_truth,
@@ -286,7 +391,7 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
             map.insert(
                 repo_name.to_owned(),
                 GitSourceOfTruthConfigEntry {
-                    id: RowId(0),
+                    id: RowId(self.next_id.fetch_add(1, Ordering::Relaxed)),
                     repo_id: *repo_id,
                     repo_name: repo_name.clone(),
                     source_of_truth: *source_of_truth,
@@ -331,13 +436,19 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
         _ctx: &CoreContext,
         repo_names: &[RepositoryName],
         mutation_id: i64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let mut map = self.entries.lock().expect("poisoned lock");
+        let mut updated = 0u64;
         for repo_name in repo_names {
-            map.entry(repo_name.clone())
-                .and_modify(|entry| entry.mutation_id = Some(mutation_id));
+            // Prod only stamps rows that are still `Reserved`; mirror that.
+            if let Some(entry) = map.get_mut(repo_name)
+                && entry.source_of_truth == GitSourceOfTruth::Reserved
+            {
+                entry.mutation_id = Some(mutation_id);
+                updated += 1;
+            }
         }
-        Ok(())
+        Ok(updated)
     }
 
     async fn delete_source_of_truth_by_repo_names_for_reserved_repos(
@@ -372,6 +483,22 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
             .values()
             .map(|entry| entry.repo_id)
             .max())
+    }
+
+    async fn allocate_repo_ids(
+        &self,
+        _ctx: &CoreContext,
+        count: usize,
+    ) -> Result<Vec<RepositoryId>> {
+        let count = u64::try_from(count).context("repo id batch size does not fit in u64")?;
+        let first = self.next_repo_id.fetch_add(count, Ordering::Relaxed);
+        (first..first + count)
+            .map(|id| {
+                let id = i32::try_from(id)
+                    .with_context(|| format!("allocated repo id {id} does not fit in i32"))?;
+                Ok(RepositoryId::new(id))
+            })
+            .collect()
     }
 
     async fn get_by_repo_name(
@@ -456,6 +583,24 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
             .collect())
     }
 
+    async fn get_redirected_to_mononoke_by_mutation_id(
+        &self,
+        _ctx: &CoreContext,
+        mutation_id: i64,
+    ) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
+        Ok(self
+            .entries
+            .lock()
+            .expect("poisoned lock")
+            .values()
+            .filter(|entry| {
+                entry.source_of_truth == GitSourceOfTruth::Mononoke
+                    && entry.mutation_id == Some(mutation_id)
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn get_any(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
         Ok(self
             .entries
@@ -464,5 +609,21 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn delete_reserved_row(
+        &self,
+        _ctx: &CoreContext,
+        id: RowId,
+        mutation_id: Option<i64>,
+    ) -> Result<u64> {
+        let mut map = self.entries.lock().expect("poisoned lock");
+        let before = map.len();
+        map.retain(|_, entry| {
+            !(entry.id == id
+                && entry.source_of_truth == GitSourceOfTruth::Reserved
+                && entry.mutation_id == mutation_id)
+        });
+        Ok((before - map.len()) as u64)
     }
 }

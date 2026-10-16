@@ -133,12 +133,12 @@ amend=
 automv=
 blackbox=
 chistedit=
-clindex=
 conflictinfo=
 debugnetwork=
 dialect=
 directaccess=
 dirsync=
+drop=
 errorredirect=!
 fastpartialmatch=
 fbhistedit=
@@ -149,7 +149,6 @@ gitrevset=!
 hgsubversion=!
 histedit=
 journal=
-logginghelper=
 morestatus=
 myparent=
 obsshelve=
@@ -218,7 +217,6 @@ useruststore=True
 manifestlimit=4GB
 http=True
 retryprefetch=True
-fetchpacks=True
 getpackversion=2
 
 [remotenames]
@@ -328,7 +326,7 @@ github_sl_difflabel="{case(github_pr_state,
     )}"
 
 phab_sl_diffstatus="{phabstatus}{case(phabstatus, 'Waiting For Author', '*', 'Needs Revision', '*')}"
-phab_sl_difflabel="{case(phabstatus,
+phab_sl_difflabel="{if(phabbadgestatus, phab_sl_badgelabel, case(phabstatus,
  'Landing', 'ssl.landing',
  'Accepted', 'ssl.accepted',
  'Waiting For Author', 'ssl.revision',
@@ -351,6 +349,44 @@ phab_sl_difflabel="{case(phabstatus,
  'Needs DRS Review', 'ssl.review',
  'Needs CRS Review', 'ssl.review',
  'AI Approved', 'ssl.aiapproved',
+ 'sl.diff'
+ ))}"
+# Keyed on the badge state: its label can embed counts, like the number of
+# AI review findings.
+phab_sl_badgelabel="{case(phabbadgestatus,
+ 'ACCEPTED', 'ssl.accepted',
+ 'NEEDS_REVIEW', 'ssl.review',
+ 'AI_REVIEWING', 'ssl.review',
+ 'AI_REVIEWED', 'ssl.review',
+ 'AWAITING_STEWARD_REVIEW', 'ssl.review',
+ 'AWAITING_ACL_REVIEWER', 'ssl.review',
+ 'AWAITING_OWNER_REVIEW', 'ssl.review',
+ 'AWAITING_CRS_REVIEWER', 'ssl.review',
+ 'AWAITING_DRS_REVIEW', 'ssl.review',
+ 'NEEDS_EXTRA_REVIEW', 'ssl.review',
+ 'NEEDS_SECOND_REVIEW', 'ssl.review',
+ 'CHANGES_PLANNED', 'ssl.revision',
+ 'WAITING_FOR_AUTHOR', 'ssl.revision',
+ 'WAITING_FOR_AGENT', 'ssl.revision',
+ 'WAITING_FOR_CODEMOD_AUTHOR', 'ssl.revision',
+ 'LANDING', 'ssl.landing',
+ 'PARSING_COMMIT', 'ssl.landing',
+ 'LAND_ENQUEUED', 'ssl.landenqueued',
+ 'LAND_SCHEDULED', 'ssl.landscheduled',
+ 'RECENTLY_FAILED_TO_LAND', 'ssl.landfailed',
+ 'COMMITTED', 'ssl.committed',
+ 'NEEDS_FINAL_REVIEW', 'ssl.finalreview',
+ 'POST_LAND_NEEDS_REVIEW', 'ssl.finalreview',
+ 'NEEDS_STEWARD_REVIEW', 'ssl.finalreview',
+ 'NEEDS_OWNER_REVIEW', 'ssl.finalreview',
+ 'NEEDS_PRESCREENER', 'ssl.finalreview',
+ 'NEEDS_CONFIRMATION', 'ssl.finalreview',
+ 'DEFERRED_REVIEW', 'ssl.aiapproved',
+ 'ABANDONED', 'ssl.abandoned',
+ 'UNPUBLISHED', 'ssl.unpublished',
+ 'PUBLISH_PENDING', 'ssl.unpublished',
+ 'PUBLISH_FAILED', 'ssl.unpublished',
+ 'FAILED_TESTS', 'ssl.unpublished',
  'sl.diff'
  )}"
 
@@ -475,7 +511,6 @@ automigrate=True
 
 [treemanifest]
 sendtrees=True
-treeonly=True
 http=True
 usecunionstore=False
 rustmanifest=True
@@ -493,7 +528,6 @@ singlecolonwarn=True
 [ui]
 enableincomingoutgoing=False
 hyperlink=True
-interface=curses
 logmeasuredtimes=True
 merge:interactive=editmerge
 mergemarkers=detailed
@@ -513,12 +547,7 @@ skipmanifests=True
 enabled=true
 
 [worker]
-rustworkers=True
 numcpus=4
-
-[clindex]
-nodemap=True
-verify=False
 
 [committemplate]
 changeset = {if(desc, desc, emptymsg)}\n
@@ -636,4 +665,90 @@ use-rust=true
 
 [commitcloud]
 supported-url-regex = ^.*\.(facebook|tfbnw|mononoke)\..*$
+
+[help]
+agent-interactive=## Interactive Chunk Selection
+ 
+ `sl commit -i`, `sl amend -i` and `sl revert -i` select individual files, hunks
+ or changed lines instead of operating on the whole working copy. Sapling gives
+ agents a line-oriented REPL instead of the full-screen curses UI.
+ 
+ ## What the Selection Means
+ 
+ Selection means something different per command. Getting this backwards loses work:
+ 
+ | Command | Selected chunks are | Unselected chunks are |
+ |---|---|---|
+ | `sl commit -i -m MSG` | committed | left in the working copy |
+ | `sl amend -i` | folded into the current commit | left in the working copy |
+ | `sl revert -i` | discarded, restoring the working-copy parent | left untouched |
+ | `sl revert -i -r REV` | changed to match `REV` | left untouched |
+ 
+ ALWAYS pass `-m MSG`, or `-l FILE` for a long commit message, to `sl commit -i`.
+ Without either, Sapling opens an editor once selection finishes and the command
+ hangs.
+ 
+ `sl revert -i` is destructive. ALWAYS run `preview` before `confirm`.
+ 
+ If you see a full-screen UI instead of the `chunk-select> ` prompt, stop and
+ report it. Do not try to send arrow keys.
+ 
+ ## `revert -i` Whole-File Actions
+ 
+ Unlike `commit -i` and `amend -i`, the `revert -i` selector does not control
+ every whole-file addition or removal. In particular, these prompts happen
+ before the selector:
+ 
+ - `forget added file X (Yn)?`: Yes untracks a locally added file but keeps its
+ contents on disk.
+ - `remove added file X (Yn)?`: Yes deletes a file that exists now but not in
+ the target revision.
+ 
+ With a tty, answer these prompts before waiting for `chunk-select> `.
+ 
+ Without a tty, they take the default Yes and are only echoed. These actions
+ happen before the selector, so `abort` does not undo them. Before using non-tty
+ `revert -i`, inspect the same paths with `sl status`; with `-r REV`, also use
+ `sl status --rev REV`. Do not proceed when whole-file additions or removals are
+ in scope unless the default actions are intended.
+ 
+ ## Driving the REPL
+ 
+ Sapling holds the working copy lock until you `confirm` or `abort`. Other `sl`
+ commands block until then.
+ 
+ The REPL is ready for the next command when the last line of its output is
+ exactly `chunk-select> ` with no trailing newline. Wait for that rather than
+ sleeping a fixed time, and bound the wait so a crashed process fails fast
+ instead of hanging.
+ 
+ ### Codex
+ 
+ Call `exec_command` with `tty: true`. Use the returned session ID with
+ `write_stdin`, including a trailing newline.
+ 
+ ### Claude Code
+ 
+ The Bash tool has no tty option. Feed stdin from a file that `tail -f` follows,
+ and run the pipeline with `run_in_background: true`:
+ 
+ ```
+ dir=$(mktemp -d)
+ echo "REPL directory: $dir" >&2
+ : > "$dir/in"
+ tail -n +1 -f "$dir/in" | sl commit -i -l MSG_FILE > "$dir/out" 2>&1
+ ```
+ 
+ Use the printed directory in later Bash calls. To read only the response to your
+ last command, record the output line count before sending:
+ 
+ ```
+ n=$(wc -l < /tmp/.../out)
+ printf '%s\n' 'select F1.H2' >> /tmp/.../in
+ tail -n +$((n+1)) /tmp/.../out
+ ```
+ 
+ After `confirm` or `abort`, wait for the background task and remove the temporary
+ directory.
+
 "###);

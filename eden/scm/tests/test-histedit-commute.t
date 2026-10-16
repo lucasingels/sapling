@@ -74,6 +74,7 @@ show the edit commands offered
   #  b, base = checkout changeset and apply further changesets from there
   #  d, drop = remove commit from history
   #  f, fold = use commit, but combine it with the one above
+  #  i, into = like fold, but keep only this commit's description
   #  r, roll = like fold, but discard this commit's description and date
   #
 
@@ -346,6 +347,7 @@ Verify that revsetalias entries work with histedit:
   #  b, base = checkout changeset and apply further changesets from there
   #  d, drop = remove commit from history
   #  f, fold = use commit, but combine it with the one above
+  #  i, into = like fold, but keep only this commit's description
   #  r, roll = like fold, but discard this commit's description and date
   #
 
@@ -382,6 +384,7 @@ Now, let's try to fold the second commit into the first:
   > EOF
 
   $ HGEDITOR="sh ./editor.sh" sl histedit 'desc(initial)'
+  folded 1d3a289dd962, 53b73a71a9f7 -> 3002b6bb02b6 "pick 1d3a289dd962 0 initial commit"
 
   $ sl --config diff.git=yes export 'desc(pick)'
   # SL changeset patch

@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use commit_graph_types::edges::ChangesetEdges;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::FetchedChangesetEdges;
 use commit_graph_types::storage::Prefetch;
+use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
 use mononoke_types::ChangesetId;
@@ -132,6 +134,17 @@ impl CommitGraphStorage for MemWritesCommitGraphStorage {
         Ok(fetched_edges)
     }
 
+    async fn prefetch_many_edges(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: &[ChangesetId],
+        target: PrefetchTarget,
+    ) -> Result<()> {
+        self.persistent_storage
+            .prefetch_many_edges(ctx, cs_ids, target)
+            .await
+    }
+
     async fn find_by_prefix(
         &self,
         ctx: &CoreContext,
@@ -155,6 +168,8 @@ impl CommitGraphStorage for MemWritesCommitGraphStorage {
                         .to_vec()
                         .into_iter()
                         .chain(persistent_matches.to_vec())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
                         .collect(),
                     limit,
                 ))

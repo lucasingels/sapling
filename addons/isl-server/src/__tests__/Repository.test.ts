@@ -19,7 +19,8 @@ import os from 'node:os';
 import path from 'node:path';
 import * as ejeca from 'shared/ejeca';
 import * as fsUtils from 'shared/fs';
-import {clone, mockLogger, nextTick} from 'shared/testUtils';
+import {clone, mockLogger} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import {Internal} from '../Internal';
 import {absolutePathForFileInRepo, isDotGitDotDir, Repository} from '../Repository';
 import {makeServerSideTracker} from '../analytics/serverSideTracker';
@@ -176,6 +177,40 @@ describe('Repository', () => {
       });
     });
 
+    it('prefers the upstream repo over the fork it was cloned from', async () => {
+      setConfigOverrideForTests(
+        [
+          ['paths.default', 'https://github.com/myUsername/myRepo.git'],
+          ['paths.upstream', 'https://github.com/upstreamOrg/myRepo.git'],
+        ],
+        false,
+      );
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      expect(info.codeReviewSystem).toEqual({
+        type: 'github',
+        owner: 'upstreamOrg',
+        repo: 'myRepo',
+        hostname: 'github.com',
+      });
+    });
+
+    it('falls back to the default path when upstream is not a github repo', async () => {
+      setConfigOverrideForTests(
+        [
+          ['paths.default', 'https://github.com/myUsername/myRepo.git'],
+          ['paths.upstream', 'https://gitlab.myCompany.com/myUsername/myRepo.git'],
+        ],
+        false,
+      );
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      expect(info.codeReviewSystem).toEqual({
+        type: 'github',
+        owner: 'myUsername',
+        repo: 'myRepo',
+        hostname: 'github.com',
+      });
+    });
+
     it('handles non-github-enterprise unknown code review providers', async () => {
       setPathsDefault('https://gitlab.myCompany.com/myUsername/myRepo.git');
       const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
@@ -213,6 +248,19 @@ describe('Repository', () => {
       [/^sl root --dotdir/, {stdout: '/path/to/myRepo/.sl'}],
       [/^sl root/, {stdout: '/path/to/myRepo'}],
       [/^sl debugroots/, {stdout: '/path/to/myRepo/submodule\n/path/to/myRepo'}],
+      [
+        /^sl debuggitmodules/,
+        {
+          stdout: JSON.stringify([
+            {
+              name: 'submodule',
+              url: 'https://example.com/submodule',
+              path: 'submodule',
+              active: true,
+            },
+          ]),
+        },
+      ],
     ]);
     const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
     const repo = new Repository(info, ctx);
@@ -241,6 +289,34 @@ describe('Repository', () => {
     const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
     expect(info.isEdenFs).toBe(false);
     expect(info.worktreesSupported).toBe(true);
+  });
+
+  it('drops ancestor repos that are not really submodules', async () => {
+    setConfigOverrideForTests([]);
+    setPathsDefault('mononoke://0.0.0.0/fbsource');
+    // A checkout cloned inside another repo's working copy. `debugroots` reports both, but the
+    // outer repo does not declare it as a submodule, so only the most local repo survives.
+    mockEjeca([
+      [/^sl root --dotdir/, {stdout: '/workspace/project/.sl'}],
+      [/^sl root/, {stdout: '/workspace/project'}],
+      [/^sl debugroots/, {stdout: '/workspace/project\n/workspace'}],
+      [/^sl debuggitmodules/, {stdout: '[]'}],
+    ]);
+    const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+    expect(info.repoRoots).toEqual(['/workspace/project']);
+  });
+
+  it('drops ancestor repos when submodules cannot be listed', async () => {
+    setConfigOverrideForTests([]);
+    setPathsDefault('mononoke://0.0.0.0/fbsource');
+    mockEjeca([
+      [/^sl root --dotdir/, {stdout: '/workspace/project/.sl'}],
+      [/^sl root/, {stdout: '/workspace/project'}],
+      [/^sl debugroots/, {stdout: '/workspace/project\n/workspace'}],
+      [/^sl debuggitmodules/, new Error('unknown command debuggitmodules')],
+    ]);
+    const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+    expect(info.repoRoots).toEqual(['/workspace/project']);
   });
 
   it('handles cwd not exists', async () => {
@@ -369,6 +445,43 @@ describe('Repository', () => {
         ['add', '../repo/path/to/file.txt', '--noninteractive'],
         expect.anything(),
       );
+    });
+
+    it('produces repo-root-relative file args when cwd is a deeper subdir of the root', async () => {
+      // Regression for "cwd relative path ... is not under root": once cwd is canonicalized to the
+      // root's namespace, the relativized file arg must not climb above the root with `../`.
+      const canonicalRoot = '/data/repos/fbsource';
+      const canonicalCwd = '/data/repos/fbsource/www';
+
+      const symlinkedRepoInfo: ValidatedRepoInfo = {
+        ...repoInfo,
+        dotdir: `${canonicalRoot}/.sl`,
+        repoRoot: canonicalRoot,
+        isEdenFs: true,
+      };
+      const symlinkedCtx: RepositoryContext = {...ctx, cwd: canonicalCwd};
+      const repo = new Repository(symlinkedRepoInfo, symlinkedCtx);
+      const relativeFile =
+        'flib/intern/aurora/lint_rules/ast_linters/graphql/__tests__/GraphQLBuildSandboxCacheTopologyLintRuleTest.php';
+
+      await repo.runOrQueueOperation(
+        symlinkedCtx,
+        {
+          id: '1',
+          trackEventName: 'AmendFileSubsetOperation',
+          runner: CommandRunner.Sapling,
+          args: ['amend', {type: 'repo-relative-file', path: `www/${relativeFile}`}],
+        },
+        jest.fn(),
+      );
+
+      expect(ejecaSpy).toHaveBeenCalledWith(
+        'sl',
+        ['amend', relativeFile, '--noninteractive'],
+        expect.anything(),
+      );
+      const passedArgs = ejecaSpy.mock.calls[0][1] as Array<string>;
+      expect(passedArgs.some(arg => arg.startsWith('..'))).toBe(false);
     });
 
     it('handles allowed configs', async () => {
@@ -607,6 +720,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
           {path: '/path/to/other', role: 'linked', node: 'def456'},
           {path: '/path/to/no-hash', role: 'linked'},
         ],
+        supportsMutation: false,
       };
 
       const ejecaSpy = mockEjeca([]);
@@ -626,6 +740,7 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
           {path: '/path/to/other', role: 'linked', node: 'def456'},
           {path: '/path/to/other2', role: 'linked', node: 'def456'},
         ],
+        supportsMutation: false,
       };
 
       expect(repo.getOtherWorktreeDotHashes()).toEqual(['def456']);
@@ -1279,7 +1394,7 @@ describe('fetchSubmoduleMap', () => {
         {stdout: JSON.stringify(submodulesOfMyRepo)},
       ],
       [/^sl root/, {stdout: submoduleBRoot}],
-      [/^sl debugroots/, {stdout: myRepoRoot + '\n' + submoduleARoot + '\n' + submoduleBRoot}],
+      [/^sl debugroots/, {stdout: submoduleBRoot + '\n' + submoduleARoot + '\n' + myRepoRoot}],
     ]);
     const updatedCtx = {...ctx, cwd: submoduleBRoot};
     const info = (await Repository.getRepoInfo(updatedCtx)) as ValidatedRepoInfo;
@@ -1351,6 +1466,7 @@ describe('fetchSubmoduleMap', () => {
           {path: '/repo/main', role: 'main'},
           {path: '/repo/feature', label: 'feature-x', role: 'linked', node: 'bbb'},
         ],
+        supportsMutation: false,
       });
     });
 
@@ -1374,6 +1490,7 @@ describe('fetchSubmoduleMap', () => {
       expect(repo.getWorktreeInfo()).toEqual({
         sharedRoot: '/repo/main',
         worktrees: [{path: '/repo/main', role: 'main'}],
+        supportsMutation: false,
       });
     });
 
@@ -1395,6 +1512,7 @@ describe('fetchSubmoduleMap', () => {
       expect(repo.getWorktreeInfo()).toEqual({
         sharedRoot: '/repo/main',
         worktrees: [{path: '/repo/main', role: 'main'}],
+        supportsMutation: false,
       });
     });
 
@@ -1456,7 +1574,34 @@ describe('fetchSubmoduleMap', () => {
           {path: '/repo/main', role: 'main'},
           {path: '/repo/feature', label: 'feature-x', role: 'linked'},
         ],
+        supportsMutation: false,
       });
+    });
+
+    it('reports worktree mutations as supported only for EdenFS and git-backed repos', async () => {
+      mockEjeca([
+        [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
+        [/^sl root --shared/, {stdout: '/repo/main'}],
+        [/^sl root/, {stdout: '/repo/main'}],
+        [/^sl debugroots/, {stdout: '/repo/main'}],
+        [
+          /^sl --config worktree\.enabled=true worktree list/,
+          {stdout: JSON.stringify([{path: '/repo/main', role: 'main'}])},
+        ],
+      ]);
+
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      const edenRepo = new Repository({...info, isEdenFs: true}, ctx);
+      await edenRepo.refreshWorktreeInfo();
+      expect(edenRepo.getWorktreeInfo()?.supportsMutation).toBe(true);
+
+      const gitRepo = new Repository({...info, isEdenFs: false}, ctx);
+      await gitRepo.refreshWorktreeInfo();
+      expect(gitRepo.getWorktreeInfo()?.supportsMutation).toBe(false);
+
+      const dotGitRepo = new Repository({...info, isEdenFs: false, worktreesSupported: true}, ctx);
+      await dotGitRepo.refreshWorktreeInfo();
+      expect(dotGitRepo.getWorktreeInfo()?.supportsMutation).toBe(true);
     });
 
     it('leaves worktreeInfo undefined when sharedRoot is unavailable', async () => {

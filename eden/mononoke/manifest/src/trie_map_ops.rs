@@ -9,7 +9,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use blobstore::KeyedBlobstore;
 use context::CoreContext;
-use either::Either;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
@@ -28,16 +27,20 @@ use mononoke_types::content_manifest::ContentManifestFile;
 use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifest;
 use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifestEntry;
 use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifestFile;
+use mononoke_types::history_manifest::HistoryManifestEntry;
 use mononoke_types::sharded_map_v2::LoadableShardedMapV2Node;
 use mononoke_types::skeleton_manifest_v2::SkeletonManifestV2;
 use mononoke_types::skeleton_manifest_v2::SkeletonManifestV2Entry;
 use mononoke_types::test_sharded_manifest::TestShardedManifestDirectory;
 use mononoke_types::test_sharded_manifest::TestShardedManifestEntry;
 use mononoke_types::typed_hash::AclManifestId;
+use mononoke_types::typed_hash::HistoryManifestDirectoryId;
+use mononoke_types::typed_hash::HistoryManifestFileId;
 use smallvec::SmallVec;
 
 use crate::types::Entry;
 use crate::types::Weight;
+use crate::types::history_manifest_to_mf_entry;
 
 #[async_trait]
 pub trait TrieMapOps<Store, Value>: Sized {
@@ -336,6 +339,53 @@ impl<Store: KeyedBlobstore>
 }
 
 #[async_trait]
+impl<Store: KeyedBlobstore>
+    TrieMapOps<Store, Entry<HistoryManifestDirectoryId, HistoryManifestFileId>>
+    for LoadableShardedMapV2Node<HistoryManifestEntry>
+{
+    async fn expand(
+        self,
+        ctx: &CoreContext,
+        blobstore: &Store,
+    ) -> Result<(
+        Option<Entry<HistoryManifestDirectoryId, HistoryManifestFileId>>,
+        Vec<(u8, Self)>,
+    )> {
+        let (entry, children) = self.expand(ctx, blobstore).await?;
+        Ok((entry.and_then(history_manifest_to_mf_entry), children))
+    }
+
+    async fn into_stream(
+        self,
+        ctx: &CoreContext,
+        blobstore: &Store,
+    ) -> Result<
+        BoxStream<
+            'async_trait,
+            Result<(
+                SmallVec<[u8; 24]>,
+                Entry<HistoryManifestDirectoryId, HistoryManifestFileId>,
+            )>,
+        >,
+    > {
+        Ok(self
+            .load(ctx, blobstore)
+            .await?
+            .into_entries(ctx, blobstore)
+            .try_filter_map(|(key, entry)| async move {
+                Ok(history_manifest_to_mf_entry(entry).map(|entry| (key, entry)))
+            })
+            .boxed())
+    }
+
+    fn is_empty(&self) -> bool {
+        // A nonempty shard may contain only deleted entries. Checking that
+        // requires loading it, so only prune shards known to be empty here.
+        self.size() == 0
+    }
+}
+
+#[async_trait]
 impl<Store: KeyedBlobstore> TrieMapOps<Store, Entry<AclManifestId, AclManifestRestriction>>
     for LoadableShardedMapV2Node<AclManifestEntry>
 {
@@ -571,186 +621,5 @@ impl<Store: KeyedBlobstore>
 
     fn is_empty(&self) -> bool {
         self.size() == 0
-    }
-}
-
-/// `TrieMapOps` for `Either`, mirroring the `Manifest`/`OrderedManifest` impls
-/// for `Either` in `combined.rs`. This lets `compare_manifest` (and hence
-/// `diff_manifests`) operate over the compat `Either<ContentManifest, Fsnode>`
-/// manifest used by `commit_compare`: for a content-manifest repo every node is
-/// the `Left` (sharded) variant, so identical sub-shards are still pruned by id.
-#[async_trait]
-impl<Store, A, B, TA, LA, TB, LB> TrieMapOps<Store, Entry<Either<TA, TB>, Either<LA, LB>>>
-    for Either<A, B>
-where
-    Store: Send + Sync + 'static,
-    A: TrieMapOps<Store, Entry<TA, LA>> + Send + 'static,
-    B: TrieMapOps<Store, Entry<TB, LB>> + Send + 'static,
-    TA: Send + 'static,
-    LA: Send + 'static,
-    TB: Send + 'static,
-    LB: Send + 'static,
-{
-    async fn expand(
-        self,
-        ctx: &CoreContext,
-        blobstore: &Store,
-    ) -> Result<(
-        Option<Entry<Either<TA, TB>, Either<LA, LB>>>,
-        Vec<(u8, Self)>,
-    )> {
-        match self {
-            Either::Left(a) => {
-                let (entry, children) = a.expand(ctx, blobstore).await?;
-                Ok((
-                    entry.map(|e| e.left_entry()),
-                    children
-                        .into_iter()
-                        .map(|(byte, child)| (byte, Either::Left(child)))
-                        .collect(),
-                ))
-            }
-            Either::Right(b) => {
-                let (entry, children) = b.expand(ctx, blobstore).await?;
-                Ok((
-                    entry.map(|e| e.right_entry()),
-                    children
-                        .into_iter()
-                        .map(|(byte, child)| (byte, Either::Right(child)))
-                        .collect(),
-                ))
-            }
-        }
-    }
-
-    async fn into_stream(
-        self,
-        ctx: &CoreContext,
-        blobstore: &Store,
-    ) -> Result<
-        BoxStream<
-            'async_trait,
-            Result<(SmallVec<[u8; 24]>, Entry<Either<TA, TB>, Either<LA, LB>>)>,
-        >,
-    > {
-        match self {
-            Either::Left(a) => Ok(a
-                .into_stream(ctx, blobstore)
-                .await?
-                .map_ok(|(key, value)| (key, value.left_entry()))
-                .boxed()),
-            Either::Right(b) => Ok(b
-                .into_stream(ctx, blobstore)
-                .await?
-                .map_ok(|(key, value)| (key, value.right_entry()))
-                .boxed()),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Either::Left(a) => a.is_empty(),
-            Either::Right(b) => b.is_empty(),
-        }
-    }
-}
-
-/// Weighted counterpart of the `Either` impl above. The weight has to move
-/// inside the `Either` -- `(w, Left(id))` rather than `Left((w, id))` -- to match
-/// `Entry<(Weight, Self::TreeId), Self::Leaf>` for `Either<M, N>`.
-#[async_trait]
-impl<Store, A, B, TA, LA, TB, LB> TrieMapOps<Store, Entry<(Weight, Either<TA, TB>), Either<LA, LB>>>
-    for Either<A, B>
-where
-    Store: Send + Sync + 'static,
-    A: TrieMapOps<Store, Entry<(Weight, TA), LA>> + Send + 'static,
-    B: TrieMapOps<Store, Entry<(Weight, TB), LB>> + Send + 'static,
-    TA: Send + 'static,
-    LA: Send + 'static,
-    TB: Send + 'static,
-    LB: Send + 'static,
-{
-    async fn expand(
-        self,
-        ctx: &CoreContext,
-        blobstore: &Store,
-    ) -> Result<(
-        Option<Entry<(Weight, Either<TA, TB>), Either<LA, LB>>>,
-        Vec<(u8, Self)>,
-    )> {
-        match self {
-            Either::Left(a) => {
-                let (entry, children) = a.expand(ctx, blobstore).await?;
-                Ok((
-                    entry.map(weighted_left_entry),
-                    children
-                        .into_iter()
-                        .map(|(byte, child)| (byte, Either::Left(child)))
-                        .collect(),
-                ))
-            }
-            Either::Right(b) => {
-                let (entry, children) = b.expand(ctx, blobstore).await?;
-                Ok((
-                    entry.map(weighted_right_entry),
-                    children
-                        .into_iter()
-                        .map(|(byte, child)| (byte, Either::Right(child)))
-                        .collect(),
-                ))
-            }
-        }
-    }
-
-    async fn into_stream(
-        self,
-        ctx: &CoreContext,
-        blobstore: &Store,
-    ) -> Result<
-        BoxStream<
-            'async_trait,
-            Result<(
-                SmallVec<[u8; 24]>,
-                Entry<(Weight, Either<TA, TB>), Either<LA, LB>>,
-            )>,
-        >,
-    > {
-        match self {
-            Either::Left(a) => Ok(a
-                .into_stream(ctx, blobstore)
-                .await?
-                .map_ok(|(key, value)| (key, weighted_left_entry(value)))
-                .boxed()),
-            Either::Right(b) => Ok(b
-                .into_stream(ctx, blobstore)
-                .await?
-                .map_ok(|(key, value)| (key, weighted_right_entry(value)))
-                .boxed()),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Either::Left(a) => a.is_empty(),
-            Either::Right(b) => b.is_empty(),
-        }
-    }
-}
-
-fn weighted_left_entry<TA, LA, TB, LB>(
-    entry: Entry<(Weight, TA), LA>,
-) -> Entry<(Weight, Either<TA, TB>), Either<LA, LB>> {
-    match entry {
-        Entry::Tree((weight, tree)) => Entry::Tree((weight, Either::Left(tree))),
-        Entry::Leaf(leaf) => Entry::Leaf(Either::Left(leaf)),
-    }
-}
-
-fn weighted_right_entry<TA, LA, TB, LB>(
-    entry: Entry<(Weight, TB), LB>,
-) -> Entry<(Weight, Either<TA, TB>), Either<LA, LB>> {
-    match entry {
-        Entry::Tree((weight, tree)) => Entry::Tree((weight, Either::Right(tree))),
-        Entry::Leaf(leaf) => Entry::Leaf(Either::Right(leaf)),
     }
 }

@@ -153,6 +153,12 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
                 let _guard = span.enter();
 
                 sampling::init(dispatcher.config());
+                let _trace = distributed_tracing::scope(
+                    dispatcher
+                        .config()
+                        .get_or_default("experimental", "enable-distributed-tracing")
+                        .unwrap_or_default(),
+                );
 
                 dispatch_command(
                     io,
@@ -356,6 +362,7 @@ fn dispatch_command(
     }
 
     drop(scoped_profiler);
+    log_logged_configs(config);
     if let Err(err) = log_perftrace(io, config, start_time) {
         tracing::error!(?err, "error logging perftrace");
     }
@@ -831,6 +838,26 @@ impl StartTime {
 
 fn is_inside_test() -> bool {
     std::env::var_os("TESTTMP").is_some()
+}
+
+/// Log the configs listed under `[loggedconfigs]` (`name = section.key`)
+/// to the "logginghelper" sampling key. Entries whose value is not exactly
+/// `section.key` are skipped.
+fn log_logged_configs(config: &dyn Config) {
+    let logged: HashMap<String, String> = config
+        .keys("loggedconfigs")
+        .into_iter()
+        .filter_map(|name| {
+            let target = config.get("loggedconfigs", &name)?;
+            let (section, key) = target.split_once('.')?;
+            if key.contains('.') {
+                return None;
+            }
+            let value = config.get(section, key)?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    sampling::append_sample_map("logginghelper", &logged);
 }
 
 fn log_repo_path_and_exe_version(repo: Option<&Repo>) {

@@ -40,20 +40,13 @@ use sql_ext::mononoke_queries;
 use stats::prelude::*;
 
 use crate::EquivalentWorkingCopyEntry;
-use crate::ErrorKind;
 use crate::FetchedMappingEntry;
 use crate::SyncedCommitMapping;
 use crate::SyncedCommitMappingEntry;
+use crate::SyncedCommitMappingError;
 use crate::SyncedCommitSourceRepo;
 use crate::WorkingCopyEquivalence;
 use crate::types::get_maybe_stale_many_targets_serially;
-
-/// Kill switch for resolving many target repos in one query instead of one query
-/// per target repo. Off -> the previous per-target-repo behaviour. Read by every
-/// layer that batches on this axis, so that turning it off restores the old
-/// behaviour of the stack as a whole and not just of this one.
-pub(crate) const BATCH_TARGET_REPOS_KNOB: &str =
-    "scm/mononoke:synced_commit_mapping_batch_target_repos";
 
 define_stats! {
     prefix = "mononoke.synced_commit_mapping";
@@ -434,7 +427,7 @@ impl SqlSyncedCommitMapping {
                     };
                     let expected_version = Some(expected_version);
                     if (expected_bcs_id != small_bcs_id) || (expected_version != version_name) {
-                        let err = ErrorKind::InconsistentWorkingCopyEntry {
+                        let err = SyncedCommitMappingError::InconsistentWorkingCopyEntry {
                             expected_bcs_id,
                             expected_config_version: expected_version,
                             actual_bcs_id: small_bcs_id,
@@ -484,7 +477,7 @@ impl SqlSyncedCommitMapping {
 
                 if let Some(actual_version_name) = maybe_large_repo_version {
                     if &actual_version_name != version_name {
-                        let err = ErrorKind::InconsistentLargeRepoCommitVersion {
+                        let err = SyncedCommitMappingError::InconsistentLargeRepoCommitVersion {
                             large_repo_id,
                             large_cs_id,
                             expected_version_name: version_name.clone(),
@@ -604,9 +597,16 @@ impl SyncedCommitMapping for SqlSyncedCommitMapping {
             return Ok(HashMap::new());
         }
 
-        // One target has nothing to batch, so keep the rendezvous, which can still
-        // coalesce it with concurrent lookups of the same repo pair.
-        if target_repo_ids.len() == 1 || !justknobs::eval(BATCH_TARGET_REPOS_KNOB, None, None) {
+        // With the knob on, several target repos are fetched in one query. Otherwise,
+        // and for a single target, each target goes through the rendezvous, which
+        // coalesces concurrent lookups of the same repo pair.
+        if target_repo_ids.len() == 1
+            || !justknobs::eval(
+                "scm/mononoke:synced_commit_mapping_batch_target_repos",
+                None,
+                None,
+            )
+        {
             return get_maybe_stale_many_targets_serially(
                 self,
                 ctx,

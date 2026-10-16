@@ -7,8 +7,10 @@
 
 #include "eden/fs/service/EdenStateDir.h"
 
+#include <fmt/core.h>
 #include <folly/Exception.h>
 #include <folly/FileUtil.h>
+#include <folly/String.h>
 #include <folly/logging/xlog.h>
 
 using folly::StringPiece;
@@ -24,10 +26,11 @@ constexpr PathComponentPiece kMountdSocketName{"mountd.socket"_pc};
 // Written by edenfsctl; see eden/fs/cli/daemon_util.py. The name is also
 // hardcoded in eden/fs/facebook/packaging/systemd/edenfs@.service.
 constexpr PathComponentPiece kDaemonArgsName{".edenfs_start_args"_pc};
-// Created by the daemon once it arms the privhelper, removed when it shuts
-// down on purpose. One fixed name per state dir, so a daemon that starts while
-// a previous generation's privhelper is still alive overwrites its sentinel.
-constexpr PathComponentPiece kRestartSentinelName{".edenfs_restart_armed"_pc};
+// One restart sentinel per daemon generation, named <prefix><pid>.<token>.
+constexpr std::string_view kRestartSentinelNamePrefix{".edenfs_restart_armed."};
+// Also named in eden/fs/cli/daemon_util.py.
+constexpr PathComponentPiece kRestartSentinelLockName{
+    ".edenfs_restart.lock"_pc};
 constexpr StringPiece kHeartbeatFileNamePrefix{"heartbeat_"};
 } // namespace
 
@@ -71,16 +74,20 @@ std::optional<std::string> EdenStateDir::takeoverLock(folly::File lockFile) {
 
   std::string oldDaemonPid;
   std::optional<std::string> oldDaemonPidContents = std::nullopt;
-  const auto pidContents = folly::to<std::string>(getpid(), "\n");
+  const auto pidContents = folly::to<std::string>(getpid());
   // If the pid file already exists, we have an eden already running. We need to
   // keep its pid as old eden pid. However, the takeoverLock() function get
   // called multiple times during the startup process. We only want to keep the
   // old pid if the contents of the pid file are different from the current
   // running eden pid. Otherwise, it is the new eden pid that get into the pid
   // file before.
-  if (folly::readFile(pidFilePath.c_str(), oldDaemonPid) &&
-      pidContents != oldDaemonPid) {
-    oldDaemonPidContents = oldDaemonPid;
+  if (folly::readFile(pidFilePath.c_str(), oldDaemonPid)) {
+    // The pid file ends with a newline. Callers need the bare pid to build
+    // the name of the old daemon heartbeat file.
+    auto oldPid = folly::trimWhitespace(oldDaemonPid);
+    if (!oldPid.empty() && oldPid != pidContents) {
+      oldDaemonPidContents = oldPid.str();
+    }
   }
 
   folly::File pidFile(pidFilePath.c_str(), O_WRONLY | O_CREAT, 0644);
@@ -158,8 +165,21 @@ AbsolutePath EdenStateDir::getDaemonArgsPath() const {
   return path_ + kDaemonArgsName;
 }
 
-AbsolutePath EdenStateDir::getRestartSentinelPath() const {
-  return path_ + kRestartSentinelName;
+AbsolutePath EdenStateDir::getRestartSentinelPath(pid_t pid, uint64_t token)
+    const {
+  // PathComponent validates its input; the literal prefix, a decimal pid and
+  // hex digits can yield no directory separator, and never "", "." or "..".
+  const auto name =
+      fmt::format("{}{}.{:016x}", kRestartSentinelNamePrefix, pid, token);
+  return path_ + PathComponent(name);
+}
+
+std::string_view EdenStateDir::getRestartSentinelNamePrefix() const {
+  return kRestartSentinelNamePrefix;
+}
+
+AbsolutePath EdenStateDir::getRestartSentinelLockPath() const {
+  return path_ + kRestartSentinelLockName;
 }
 
 AbsolutePath EdenStateDir::getCheckoutStateDir(StringPiece checkoutID) const {

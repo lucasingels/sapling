@@ -10,7 +10,6 @@ use std::hash::Hash;
 use anyhow::Result;
 use async_trait::async_trait;
 use context::CoreContext;
-use either::Either;
 use futures::future;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
@@ -27,6 +26,7 @@ pub(crate) use self::ccsm::convert_ccsm_to_weighted;
 pub(crate) use self::content_manifests::convert_content_manifest;
 pub(crate) use self::content_manifests::convert_content_manifest_weighted;
 pub(crate) use self::dbcm::dbcm_to_mf_entry;
+pub(crate) use self::history_manifests::history_manifest_to_mf_entry;
 pub(crate) use self::skeleton_manifests::convert_skeleton_manifest_v2_to_weighted;
 pub(crate) use self::skeleton_manifests::skeleton_manifest_v2_to_mf_entry;
 pub(crate) use self::test_manifests::convert_test_sharded_manifest;
@@ -173,20 +173,6 @@ impl<T, L> Entry<T, L> {
         match self {
             Entry::Tree(tree) => Entry::Tree(m(tree)),
             Entry::Leaf(leaf) => Entry::Leaf(leaf),
-        }
-    }
-
-    pub fn left_entry<T2, L2>(self) -> Entry<Either<T, T2>, Either<L, L2>> {
-        match self {
-            Entry::Tree(tree) => Entry::Tree(Either::Left(tree)),
-            Entry::Leaf(leaf) => Entry::Leaf(Either::Left(leaf)),
-        }
-    }
-
-    pub fn right_entry<T2, L2>(self) -> Entry<Either<T2, T>, Either<L2, L>> {
-        match self {
-            Entry::Tree(tree) => Entry::Tree(Either::Right(tree)),
-            Entry::Leaf(leaf) => Entry::Leaf(Either::Right(leaf)),
         }
     }
 

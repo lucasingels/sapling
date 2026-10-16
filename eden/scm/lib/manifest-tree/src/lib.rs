@@ -18,6 +18,7 @@ mod trait_impls;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt;
@@ -30,9 +31,9 @@ use manifest::DiffEntry;
 use manifest::DirDiffEntry;
 use manifest::Directory;
 use manifest::File;
-use manifest::FileMetadata;
+pub use manifest::FileMetadata;
 pub use manifest::FileType;
-use manifest::FsNodeMetadata;
+pub use manifest::FsNodeMetadata;
 use manifest::List;
 pub use manifest::Manifest;
 use manifest::PersistOpts;
@@ -48,6 +49,7 @@ use storemodel::SerializationFormat;
 use thiserror::Error;
 use try_once_lock::OnceLock;
 use types::HgId;
+use types::Key;
 pub use types::PathComponent;
 pub use types::PathComponentBuf;
 use types::RepoPath;
@@ -83,6 +85,193 @@ pub struct TreeManifest {
     //
     // When set, Manifest methods transparently encode input paths and decode output paths.
     path_translator: Option<Arc<dyn PathTranslator>>,
+}
+
+/// A logical node encountered while reading a [`TreeManifest`].
+///
+/// The node retains its current directory position, so looking up children continues from this
+/// node instead of traversing again from the manifest root. A logical path may have both file
+/// content and a directory position when a path translator stores the file under an encoded name.
+pub struct TreeManifestReadNode {
+    store: InnerStore,
+    path_translator: Option<Arc<dyn PathTranslator>>,
+    path: RepoPathBuf,
+    metadata: FsNodeMetadata,
+    directory: Option<DirLink>,
+}
+
+impl Clone for TreeManifestReadNode {
+    fn clone(&self) -> Self {
+        let directory = self.directory.as_ref().map(|directory| DirLink {
+            path: directory.path.clone(),
+            link: directory.link.thread_copy(),
+        });
+        Self {
+            store: self.store.clone(),
+            path_translator: self.path_translator.clone(),
+            path: self.path.clone(),
+            metadata: self.metadata,
+            directory,
+        }
+    }
+}
+
+impl fmt::Debug for TreeManifestReadNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TreeManifestReadNode")
+            .field("path", &self.path)
+            .field("metadata", &self.metadata)
+            .field("directory_hgid", &self.directory_hgid())
+            .finish()
+    }
+}
+
+impl TreeManifestReadNode {
+    /// Return the logical path represented by this node.
+    pub fn path(&self) -> &RepoPath {
+        &self.path
+    }
+
+    /// Return the content visible when this exact logical path is queried.
+    pub fn metadata(&self) -> FsNodeMetadata {
+        self.metadata
+    }
+
+    /// Return whether this node can be traversed as a directory.
+    pub fn is_directory(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    /// Return the persisted directory ID, or `None` if the node has no directory or the directory
+    /// is ephemeral.
+    pub fn directory_hgid(&self) -> Option<HgId> {
+        self.directory.as_ref().and_then(DirLink::hgid)
+    }
+
+    /// Prefetch the unloaded durable directories of `nodes` in one batch.
+    ///
+    /// All nodes must use the same store. Nodes from different manifests can share directories,
+    /// so the keys are deduplicated.
+    pub fn prefetch(nodes: &[TreeManifestReadNode]) -> Result<()> {
+        let Some(first) = nodes.first() else {
+            return Ok(());
+        };
+
+        let mut keys = nodes
+            .iter()
+            .filter_map(|node| node.directory.as_ref())
+            .filter_map(DirLink::prefetch_key)
+            .collect::<Vec<Key>>();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.is_empty() {
+            Ok(())
+        } else {
+            first.store.prefetch(keys)
+        }
+    }
+
+    /// Look up logical children directly below this node.
+    ///
+    /// Results retain the input order. A node without a directory returns `None` for every name.
+    pub fn lookup_children(
+        &self,
+        names: &[PathComponentBuf],
+    ) -> Result<Vec<Option<TreeManifestReadNode>>> {
+        let Some(directory) = &self.directory else {
+            return Ok(names.iter().map(|_| None).collect());
+        };
+
+        names
+            .iter()
+            .map(|name| self.lookup_child(directory, name.as_path_component()))
+            .collect()
+    }
+
+    /// List logical children directly below this node in sorted order.
+    pub fn children(&self) -> Result<Vec<(PathComponentBuf, TreeManifestReadNode)>> {
+        let Some(directory) = &self.directory else {
+            return Ok(Vec::new());
+        };
+
+        let names = directory
+            .links(&self.store)?
+            .map(|(name, link)| {
+                if link.is_leaf() {
+                    match &self.path_translator {
+                        Some(translator) => translator.decode_file_name(name.as_path_component()),
+                        None => Ok(name.clone()),
+                    }
+                } else {
+                    Ok(name.clone())
+                }
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let names = names.into_iter().collect::<Vec<_>>();
+        let children = names
+            .iter()
+            .map(|name| self.lookup_child(directory, name.as_path_component()))
+            .collect::<Result<Vec<_>>>()?;
+
+        names
+            .into_iter()
+            .zip(children)
+            .map(|(name, node)| {
+                // Each name came from this directory. A miss means inconsistent path
+                // translation, not an absent child.
+                let node = node.ok_or_else(|| {
+                    anyhow!(
+                        "listed child '{name}' was not found during lookup from directory '{}'",
+                        self.path
+                    )
+                })?;
+                Ok((name, node))
+            })
+            .collect()
+    }
+
+    /// Look up one logical child in a known directory.
+    ///
+    /// The metadata comes from the encoded file entry when one exists, and from the directory entry
+    /// otherwise.
+    fn lookup_child(
+        &self,
+        directory: &DirLink,
+        name: &PathComponent,
+    ) -> Result<Option<TreeManifestReadNode>> {
+        let raw_link = directory.lookup(&self.store, name)?;
+        let mut logical_path = self.path.clone();
+        logical_path.push(name);
+        let mut storage_path = directory.path.clone();
+        storage_path.push(name);
+        let child_directory = raw_link
+            .as_ref()
+            .and_then(|link| DirLink::from_link(link, storage_path));
+
+        let storage_name = match &self.path_translator {
+            Some(translator) => translator.encode_file_name(name)?,
+            None => name.to_owned(),
+        };
+        let content_link = if storage_name.as_path_component() == name {
+            raw_link
+        } else {
+            directory.lookup(&self.store, storage_name.as_path_component())?
+        };
+
+        let metadata = content_link.as_ref().map(Link::to_fs_node).or_else(|| {
+            child_directory
+                .as_ref()
+                .map(|directory| FsNodeMetadata::Directory(directory.hgid()))
+        });
+
+        Ok(metadata.map(|metadata| TreeManifestReadNode {
+            store: self.store.clone(),
+            path_translator: self.path_translator.clone(),
+            path: logical_path,
+            metadata,
+            directory: child_directory,
+        }))
+    }
 }
 
 /// Diff several manifest pairs through one parallel breadth-first traversal.
@@ -170,6 +359,20 @@ impl TreeManifest {
             diff_grafts: Vec::new(),
             path_translator: self.path_translator.clone(),
         }
+    }
+
+    /// Return a read node positioned at the manifest root.
+    pub fn read_root(&self) -> Result<TreeManifestReadNode> {
+        let directory = DirLink::from_root(&self.root)
+            .ok_or_else(|| anyhow!("tree manifest root is a file"))?;
+        let metadata = FsNodeMetadata::Directory(directory.hgid());
+        Ok(TreeManifestReadNode {
+            store: self.store.clone(),
+            path_translator: self.path_translator.clone(),
+            path: RepoPathBuf::new(),
+            metadata,
+            directory: Some(directory),
+        })
     }
 
     pub fn set_path_translator(&mut self, translator: Arc<dyn PathTranslator>) {
@@ -1016,6 +1219,10 @@ pub trait PathTranslator: Send + Sync + fmt::Debug {
     fn encode_file(&self, path: &RepoPath) -> Result<RepoPathBuf>;
     /// Decode a storage file path to the user-facing path.
     fn decode_file(&self, path: &RepoPath) -> Result<RepoPathBuf>;
+    /// Encode a user-facing file name to the storage name.
+    fn encode_file_name(&self, name: &PathComponent) -> Result<PathComponentBuf>;
+    /// Decode a storage file name to the user-facing name.
+    fn decode_file_name(&self, name: &PathComponent) -> Result<PathComponentBuf>;
 }
 
 /// Matcher adapter that decodes encoded file paths before matching
@@ -1041,6 +1248,14 @@ pub trait TreeResolver: Send + Sync + 'static {
     fn get(&self, commit_id: &HgId) -> Result<TreeManifest>;
     fn get_root_id(&self, commit_id: &HgId) -> Result<HgId>;
     fn get_by_root_id(&self, root_id: &HgId) -> Result<TreeManifest>;
+
+    /// Resolve a batch of root tree IDs while preserving input order.
+    fn get_by_root_ids(&self, root_ids: &[HgId]) -> Result<Vec<TreeManifest>> {
+        root_ids
+            .iter()
+            .map(|root_id| self.get_by_root_id(root_id))
+            .collect()
+    }
 }
 
 /// The purpose of this function is to provide compatible behavior with the C++ implementation
@@ -1202,6 +1417,139 @@ mod tests {
     }
     fn store_element(path: &str, hex: &str, flag: store::Flag) -> store::Element {
         store::Element::new(path_component_buf(path), hgid(hex), flag)
+    }
+
+    #[derive(Debug)]
+    struct SuffixPathTranslator;
+
+    impl PathTranslator for SuffixPathTranslator {
+        fn encode_file(&self, path: &RepoPath) -> Result<RepoPathBuf> {
+            Ok(RepoPathBuf::from_string(format!("{}\x7f", path.as_str()))?)
+        }
+
+        fn decode_file(&self, path: &RepoPath) -> Result<RepoPathBuf> {
+            let decoded = path.as_str().strip_suffix('\x7f').unwrap_or(path.as_str());
+            Ok(RepoPathBuf::from_string(decoded.to_owned())?)
+        }
+
+        fn encode_file_name(&self, name: &PathComponent) -> Result<PathComponentBuf> {
+            Ok(PathComponentBuf::from_string(format!(
+                "{}\x7f",
+                name.as_str()
+            ))?)
+        }
+
+        fn decode_file_name(&self, name: &PathComponent) -> Result<PathComponentBuf> {
+            let decoded = name.as_str().strip_suffix('\x7f').unwrap_or(name.as_str());
+            Ok(PathComponentBuf::from_string(decoded.to_owned())?)
+        }
+    }
+
+    #[derive(Debug)]
+    struct InconsistentPathTranslator;
+
+    impl PathTranslator for InconsistentPathTranslator {
+        fn encode_file(&self, path: &RepoPath) -> Result<RepoPathBuf> {
+            Ok(path.to_owned())
+        }
+
+        fn decode_file(&self, path: &RepoPath) -> Result<RepoPathBuf> {
+            Ok(path.to_owned())
+        }
+
+        fn encode_file_name(&self, _name: &PathComponent) -> Result<PathComponentBuf> {
+            Ok(path_component_buf("missing"))
+        }
+
+        fn decode_file_name(&self, _name: &PathComponent) -> Result<PathComponentBuf> {
+            Ok(path_component_buf("logical"))
+        }
+    }
+
+    #[test]
+    fn test_read_node_retains_directory_position_for_overlapping_path() -> Result<()> {
+        let store = Arc::new(TestStore::new());
+        let mut source = TreeManifest::ephemeral(store.clone());
+        source.set_path_translator(Arc::new(SuffixPathTranslator));
+        source.insert(repo_path_buf("a"), make_meta("10"))?;
+        source.insert(repo_path_buf("a/b"), make_meta("20"))?;
+        let root_hgid = source.persist(&[])?;
+
+        let mut tree = TreeManifest::durable(store, root_hgid);
+        tree.set_path_translator(Arc::new(SuffixPathTranslator));
+        let root = tree.read_root()?;
+        let children = root.children()?;
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].0, path_component_buf("a"));
+        let a = &children[0].1;
+        assert_eq!(a.path(), repo_path("a"));
+        assert_eq!(a.metadata(), FsNodeMetadata::File(make_meta("10")));
+        assert!(a.is_directory());
+        assert!(a.directory_hgid().is_some());
+
+        let children =
+            a.lookup_children(&[path_component_buf("b"), path_component_buf("missing")])?;
+        let b = children[0].as_ref().expect("a/b should exist");
+        assert_eq!(b.metadata(), FsNodeMetadata::File(make_meta("20")));
+        assert!(!b.is_directory());
+        assert!(children[1].is_none());
+
+        let below_file = b.lookup_children(&[path_component_buf("child")])?;
+        assert!(below_file[0].is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_node_prefetch_deduplicates_shared_directories() -> Result<()> {
+        let store = Arc::new(TestStore::new());
+        let mut source = TreeManifest::ephemeral(store.clone());
+        source.insert(repo_path_buf("a/b"), make_meta("10"))?;
+        let root_hgid = source.persist(&[])?;
+
+        let left = TreeManifest::durable(store.clone(), root_hgid).read_root()?;
+        let right = TreeManifest::durable(store.clone(), root_hgid).read_root()?;
+        TreeManifestReadNode::prefetch(&[left.clone(), right])?;
+        assert_eq!(
+            store.prefetches(),
+            vec![vec![Key::new(RepoPathBuf::new(), root_hgid)]],
+            "two manifests with one root should prefetch the root once"
+        );
+
+        let a = left
+            .lookup_children(&[path_component_buf("a")])?
+            .pop()
+            .flatten()
+            .expect("a should exist");
+        let a_hgid = a.directory_hgid().expect("a should be a durable directory");
+        TreeManifestReadNode::prefetch(&[left, a.clone()])?;
+        assert_eq!(
+            store.prefetches().last(),
+            Some(&vec![Key::new(repo_path_buf("a"), a_hgid)]),
+            "the loaded root should be skipped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_node_children_rejects_inconsistent_translation() -> Result<()> {
+        let store = Arc::new(TestStore::new());
+        let mut source = TreeManifest::ephemeral(store.clone());
+        source.insert(repo_path_buf("stored"), make_meta("10"))?;
+        let root_hgid = source.persist(&[])?;
+
+        let mut tree = TreeManifest::durable(store, root_hgid);
+        tree.set_path_translator(Arc::new(InconsistentPathTranslator));
+        let error = tree
+            .read_root()?
+            .children()
+            .expect_err("inconsistent path translation should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "listed child 'logical' was not found during lookup from directory ''"
+        );
+        Ok(())
     }
 
     fn get_hgid(tree: &TreeManifest, path: &RepoPath) -> HgId {
@@ -2392,10 +2740,23 @@ mod tests {
         fn encode_file(&self, path: &RepoPath) -> anyhow::Result<RepoPathBuf> {
             Ok(RepoPathBuf::from_string(format!("{}?", path.as_str()))?)
         }
+
         fn decode_file(&self, path: &RepoPath) -> anyhow::Result<RepoPathBuf> {
             let s = path.as_str();
             let decoded = s.strip_suffix('?').unwrap_or(s);
             Ok(RepoPathBuf::from_string(decoded.to_string())?)
+        }
+
+        fn encode_file_name(&self, name: &PathComponent) -> anyhow::Result<PathComponentBuf> {
+            Ok(PathComponentBuf::from_string(format!(
+                "{}?",
+                name.as_str()
+            ))?)
+        }
+        fn decode_file_name(&self, name: &PathComponent) -> anyhow::Result<PathComponentBuf> {
+            let s = name.as_str();
+            let decoded = s.strip_suffix('?').unwrap_or(s);
+            Ok(PathComponentBuf::from_string(decoded.to_string())?)
         }
     }
 

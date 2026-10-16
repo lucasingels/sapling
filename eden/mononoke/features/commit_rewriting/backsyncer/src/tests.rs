@@ -19,7 +19,9 @@ use assert_matches::assert_matches;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bookmarks::BookmarkCategory;
 use bookmarks::BookmarkKey;
+use bookmarks::BookmarkPrefix;
 use bookmarks::BookmarkUpdateLogArc;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateLogRef;
@@ -62,6 +64,7 @@ use manifest::Entry;
 use manifest::ManifestOps;
 use maplit::btreemap;
 use maplit::hashmap;
+use maplit::hashset;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgChangesetId;
 use metaconfig_types::CommitSyncConfig;
@@ -76,6 +79,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use movers::Movers;
+use mutable_counters::MAX_COUNTER_NAME_LENGTH;
 use mutable_counters::MutableCountersArc;
 use pretty_assertions::assert_eq;
 use rendezvous::RendezVousOptions;
@@ -98,14 +102,646 @@ use tests_utils::store_files;
 use tests_utils::store_rename;
 use wireproto_handler::TargetRepoDbs;
 
+use crate::BOOKMARK_DISCOVERY_PAGE_SIZE_JUST_KNOB;
 use crate::BacksyncLimit;
+use crate::MAX_DISCOVERED_BOOKMARKS_JUST_KNOB;
+use crate::advance_global_counter_for_completed_bookmark;
+use crate::backsync_deleted_by_prefix;
 use crate::backsync_latest;
+use crate::backsync_latest_by_prefix;
+use crate::backsync_latest_for_bookmark;
+use crate::discover_deleted_bookmarks;
+use crate::ensure_backsynced;
+use crate::format_bookmark_counter;
 use crate::format_counter;
 use crate::sync_entries;
 
 const REPOMERGE_FOLDER: &str = "repomerge";
 const REPOMERGE_FILE: &str = "repomergefile";
 const BRANCHMERGE_FILE: &str = "branchmerge";
+
+#[mononoke::test]
+fn bookmark_counter_name_is_bounded_and_category_specific() -> Result<(), Error> {
+    let repo_id = RepositoryId::new(2100);
+    let branch = BookmarkKey::new("whatsapp/common/master")?;
+    let same_branch = BookmarkKey::new("whatsapp/common/master")?;
+    let tag = BookmarkKey::with_name_and_category(branch.name().clone(), BookmarkCategory::Tag);
+
+    let branch_counter = format_bookmark_counter(&repo_id, &branch)?;
+    assert_eq!(
+        branch_counter,
+        "backsync_by_bookmark_v1_2100_branch_whatsapp/common/master"
+    );
+    assert_eq!(
+        branch_counter,
+        format_bookmark_counter(&repo_id, &same_branch)?
+    );
+    assert_ne!(branch_counter, format_bookmark_counter(&repo_id, &tag)?);
+
+    let longest_persisted_bookmark = BookmarkKey::new("a".repeat(512))?;
+    assert!(
+        format_bookmark_counter(&repo_id, &longest_persisted_bookmark)?.len()
+            <= MAX_COUNTER_NAME_LENGTH
+    );
+    let overlong_bookmark = BookmarkKey::new("a".repeat(MAX_COUNTER_NAME_LENGTH))?;
+    assert!(format_bookmark_counter(&repo_id, &overlong_bookmark).is_err());
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn backsync_single_bookmark_uses_independent_cursor(fb: FacebookInit) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let expected_log_id = commit_sync_data
+        .get_source_repo()
+        .bookmark_update_log()
+        .read_next_bookmark_log_entries_by_bookmark(
+            ctx.clone(),
+            bookmark.clone(),
+            BookmarkUpdateLogId(0),
+            u64::MAX,
+            Freshness::MostRecent,
+        )
+        .try_collect::<Vec<_>>()
+        .await?
+        .last()
+        .unwrap()
+        .id;
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+
+    backsync_latest_for_bookmark(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        bookmark.clone(),
+        BacksyncLimit::NoLimit,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_bookmark_counter(&source_repo_id, &bookmark)?)
+            .await?,
+        Some(expected_log_id.try_into()?),
+    );
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_counter(&source_repo_id))
+            .await?,
+        Some(0),
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn ensure_backsynced_accepts_bookmark_or_global_progress(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let log_id = commit_sync_data
+        .get_source_repo()
+        .bookmark_update_log()
+        .read_next_bookmark_log_entries_by_bookmark(
+            ctx.clone(),
+            bookmark.clone(),
+            BookmarkUpdateLogId(0),
+            u64::MAX,
+            Freshness::MostRecent,
+        )
+        .try_collect::<Vec<_>>()
+        .await?
+        .last()
+        .expect("fixture has an update for anotherbookmark")
+        .id;
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+    let bookmark_counter_name = format_bookmark_counter(&source_repo_id, &bookmark)?;
+
+    small_repo_dbs
+        .counters
+        .set_counter_if_absent(&ctx, &bookmark_counter_name, log_id.try_into()?)
+        .await?;
+    let jk = JustKnobsInMemory::new(hashmap! {
+        crate::PREFIX_POLLING_JUST_KNOB.to_string() => KnobVal::Bool(true),
+    });
+    with_just_knobs_async(
+        jk,
+        ensure_backsynced(
+            ctx.clone(),
+            commit_sync_data.clone(),
+            small_repo_dbs.clone(),
+            &bookmark,
+            log_id,
+        )
+        .boxed(),
+    )
+    .await?;
+
+    let global_only_bookmark = BookmarkKey::new("master")?;
+    let global_log_id = commit_sync_data
+        .get_source_repo()
+        .bookmark_update_log()
+        .read_next_bookmark_log_entries_by_bookmark(
+            ctx.clone(),
+            global_only_bookmark.clone(),
+            BookmarkUpdateLogId(0),
+            u64::MAX,
+            Freshness::MostRecent,
+        )
+        .try_collect::<Vec<_>>()
+        .await?
+        .last()
+        .expect("fixture has an update for master")
+        .id;
+    small_repo_dbs
+        .counters
+        .set_counter(
+            &ctx,
+            &format_counter(&source_repo_id),
+            global_log_id.try_into()?,
+            Some(0),
+        )
+        .await?;
+    let jk = JustKnobsInMemory::new(hashmap! {
+        crate::PREFIX_POLLING_JUST_KNOB.to_string() => KnobVal::Bool(false),
+    });
+    with_just_knobs_async(
+        jk,
+        ensure_backsynced(
+            ctx,
+            commit_sync_data,
+            small_repo_dbs,
+            &global_only_bookmark,
+            global_log_id,
+        )
+        .boxed(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn backsync_single_bookmark_honors_zero_limit(fb: FacebookInit) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+
+    backsync_latest_for_bookmark(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        bookmark.clone(),
+        BacksyncLimit::Limit(0),
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_bookmark_counter(&source_repo_id, &bookmark)?)
+            .await?,
+        Some(0),
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn existing_bookmark_cursor_does_not_jump_to_global_cursor(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let bookmark_counter = format_bookmark_counter(&source_repo_id, &bookmark)?;
+    let bookmark_target =
+        resolve_cs_id(&ctx, commit_sync_data.get_source_repo(), "anotherbookmark").await?;
+    move_bookmark(
+        ctx.clone(),
+        commit_sync_data.get_source_repo().clone(),
+        &BookmarkKey::new("master")?,
+        bookmark_target,
+    )
+    .await?;
+    let max_log_id = BookmarkUpdateLogId(
+        commit_sync_data
+            .get_source_repo()
+            .bookmark_update_log()
+            .get_largest_log_id(ctx.clone(), Freshness::MostRecent)
+            .await?
+            .unwrap(),
+    );
+    let bookmark_log_id = commit_sync_data
+        .get_source_repo()
+        .bookmark_update_log()
+        .read_next_bookmark_log_entries_by_bookmark(
+            ctx.clone(),
+            bookmark.clone(),
+            BookmarkUpdateLogId(0),
+            u64::MAX,
+            Freshness::MostRecent,
+        )
+        .try_collect::<Vec<_>>()
+        .await?
+        .last()
+        .expect("fixture has an update for anotherbookmark")
+        .id;
+    assert!(bookmark_log_id < max_log_id);
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+    small_repo_dbs
+        .counters
+        .set_counter_if_absent(&ctx, &bookmark_counter, 0)
+        .await?;
+
+    let (_, commit_only_future) = backsync_latest(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        BacksyncLimit::NoLimit,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+        Box::new(future::ready(())),
+    )
+    .await?;
+    commit_only_future.await;
+
+    backsync_latest_for_bookmark(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        bookmark.clone(),
+        BacksyncLimit::NoLimit,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &bookmark_counter)
+            .await?,
+        Some(bookmark_log_id.try_into()?),
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn global_cursor_catches_up_when_bookmark_worker_applied_move(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let max_log_id = BookmarkUpdateLogId(
+        commit_sync_data
+            .get_source_repo()
+            .bookmark_update_log()
+            .get_largest_log_id(ctx.clone(), Freshness::MostRecent)
+            .await?
+            .unwrap(),
+    );
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+
+    backsync_latest_for_bookmark(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        bookmark.clone(),
+        BacksyncLimit::NoLimit,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    let (_, commit_only_future) = backsync_latest(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        BacksyncLimit::NoLimit,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+        Box::new(future::ready(())),
+    )
+    .await?;
+    commit_only_future.await;
+
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_counter(&source_repo_id))
+            .await?,
+        Some(max_log_id.try_into()?),
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn global_cursor_does_not_skip_an_uncovered_bookmark_entry(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let bookmark = BookmarkKey::new("anotherbookmark")?;
+    let source_repo_id = commit_sync_data.get_source_repo().repo_identity().id();
+    let global_counter_name = format_counter(&source_repo_id);
+    let bookmark_counter_name = format_bookmark_counter(&source_repo_id, &bookmark)?;
+    let entry = commit_sync_data
+        .get_source_repo()
+        .bookmark_update_log()
+        .read_next_bookmark_log_entries_by_bookmark(
+            ctx.clone(),
+            bookmark,
+            BookmarkUpdateLogId(0),
+            1,
+            Freshness::MostRecent,
+        )
+        .try_next()
+        .await?
+        .expect("fixture has an update for anotherbookmark");
+    let mut global_counter = BookmarkUpdateLogId(0);
+
+    assert!(
+        !advance_global_counter_for_completed_bookmark(
+            &ctx,
+            &commit_sync_data,
+            &small_repo_dbs,
+            &entry,
+            &mut global_counter,
+            &global_counter_name,
+        )
+        .await?
+    );
+
+    small_repo_dbs
+        .counters
+        .set_counter_if_absent(&ctx, &bookmark_counter_name, 0)
+        .await?;
+    assert!(
+        !advance_global_counter_for_completed_bookmark(
+            &ctx,
+            &commit_sync_data,
+            &small_repo_dbs,
+            &entry,
+            &mut global_counter,
+            &global_counter_name,
+        )
+        .await?
+    );
+    assert_eq!(global_counter, BookmarkUpdateLogId(0));
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn prefix_backsync_processes_prefix_and_common_bookmarks(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let source_repo = commit_sync_data.get_source_repo();
+    let source_repo_id = source_repo.repo_identity().id();
+    let prefixed_bookmark = BookmarkKey::new("anotherbookmark")?;
+    let common_bookmark = BookmarkKey::new("master")?;
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+
+    backsync_latest_by_prefix(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        BookmarkPrefix::new("another")?,
+        std::slice::from_ref(&common_bookmark),
+        BacksyncLimit::NoLimit,
+        2,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    assert_eq!(
+        small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_counter(&source_repo_id))
+            .await?,
+        Some(0),
+    );
+    for bookmark in [prefixed_bookmark, common_bookmark] {
+        let cursor = small_repo_dbs
+            .counters
+            .get_counter(&ctx, &format_bookmark_counter(&source_repo_id, &bookmark)?)
+            .await?;
+        assert!(cursor.is_some_and(|cursor| cursor > 0));
+    }
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn prefix_backsync_enforces_discovery_limit(fb: FacebookInit) -> Result<(), Error> {
+    let (commit_sync_data, small_repo_dbs) =
+        init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+
+    let result = with_just_knobs_async(
+        JustKnobsInMemory::new(hashmap! {
+            BOOKMARK_DISCOVERY_PAGE_SIZE_JUST_KNOB.to_string() => KnobVal::Int(1),
+            MAX_DISCOVERED_BOOKMARKS_JUST_KNOB.to_string() => KnobVal::Int(1),
+        }),
+        backsync_latest_by_prefix(
+            CoreContext::test_mock(fb),
+            commit_sync_data,
+            Arc::new(small_repo_dbs),
+            BookmarkPrefix::empty(),
+            &[],
+            BacksyncLimit::NoLimit,
+            1,
+            Arc::new(AtomicBool::new(false)),
+            CommitSyncContext::Backsyncer,
+            false,
+        )
+        .boxed(),
+    )
+    .await;
+
+    assert_matches!(
+        result,
+        Err(error) if error.to_string().contains("matched more than 1 publishing bookmarks")
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn deleted_bookmark_discovery_filters_and_rewrites_names(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let (commit_sync_data, _) = init_repos(fb, MoverType::Noop, BookmarkRenamerType::Noop).await?;
+    let ctx = CoreContext::test_mock(fb);
+    let source_repo = commit_sync_data.get_source_repo();
+    let target_repo = commit_sync_data.get_target_repo();
+    let source_repo_id = source_repo.repo_identity().id();
+    let target_repo_id = target_repo.repo_identity().id();
+    let source_value = source_repo
+        .bookmarks()
+        .get(
+            ctx.clone(),
+            &BookmarkKey::new("master")?,
+            Freshness::MostRecent,
+        )
+        .await?
+        .expect("source fixture has master");
+    let target_value = CreateCommitContext::new_root(&ctx, target_repo)
+        .commit()
+        .await?;
+
+    for name in ["source/present", "source/source-only"] {
+        move_bookmark(
+            ctx.clone(),
+            source_repo.clone(),
+            &BookmarkKey::new(name)?,
+            source_value,
+        )
+        .await?;
+    }
+    for name in ["target/present", "target/deleted", "target/filtered"] {
+        move_bookmark(
+            ctx.clone(),
+            target_repo.clone(),
+            &BookmarkKey::new(name)?,
+            target_value,
+        )
+        .await?;
+    }
+
+    let deleted = discover_deleted_bookmarks(
+        &ctx,
+        &commit_sync_data,
+        (source_repo_id, BookmarkPrefix::new("source/")?),
+        (target_repo_id, BookmarkPrefix::new("target/")?),
+        |_, bookmark| bookmark.as_str() != "target/filtered",
+        move |repo_id, bookmark| {
+            let prefix = if repo_id == source_repo_id {
+                "source/"
+            } else {
+                "target/"
+            };
+            let name = bookmark
+                .as_str()
+                .strip_prefix(prefix)
+                .ok_or_else(|| anyhow!("bookmark {bookmark} does not start with {prefix}"))?;
+            Ok(Some(BookmarkKey::new(name)?))
+        },
+    )
+    .await?;
+
+    assert_eq!(deleted, hashset! { BookmarkKey::new("deleted")? });
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn prefix_backsync_processes_target_only_bookmark_deletion(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let common_bookmark = BookmarkKey::new("master")?;
+    let bookmark_prefix = BookmarkPrefix::new("small/")?;
+    let source_bookmark = BookmarkKey::new("small/to-delete")?;
+    let target_bookmark = BookmarkKey::new("to-delete")?;
+    let (commit_sync_data, small_repo_dbs) = init_repos(
+        fb,
+        MoverType::Noop,
+        BookmarkRenamerType::CommonAndPrefix(common_bookmark.clone(), "small/".to_string()),
+    )
+    .await?;
+    let ctx = CoreContext::test_mock(fb);
+    let source_repo = commit_sync_data.get_source_repo();
+    let target_repo = commit_sync_data.get_target_repo();
+    let source_target = source_repo
+        .bookmarks()
+        .get(ctx.clone(), &common_bookmark, Freshness::MostRecent)
+        .await?
+        .expect("fixture has master");
+    move_bookmark(
+        ctx.clone(),
+        source_repo.clone(),
+        &source_bookmark,
+        source_target,
+    )
+    .await?;
+    let small_repo_dbs = Arc::new(small_repo_dbs);
+
+    backsync_latest_by_prefix(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs.clone(),
+        bookmark_prefix.clone(),
+        std::slice::from_ref(&common_bookmark),
+        BacksyncLimit::NoLimit,
+        2,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+    assert!(
+        target_repo
+            .bookmarks()
+            .get(ctx.clone(), &target_bookmark, Freshness::MostRecent)
+            .await?
+            .is_some()
+    );
+
+    delete_bookmark(ctx.clone(), source_repo.clone(), &source_bookmark).await?;
+    let delay = backsync_deleted_by_prefix(
+        ctx.clone(),
+        commit_sync_data.clone(),
+        small_repo_dbs,
+        bookmark_prefix,
+        std::slice::from_ref(&common_bookmark),
+        BacksyncLimit::NoLimit,
+        2,
+        Arc::new(AtomicBool::new(false)),
+        CommitSyncContext::Backsyncer,
+        false,
+    )
+    .await?;
+
+    assert_eq!(delay.failed_bookmarks, 0);
+    assert_eq!(
+        target_repo
+            .bookmarks()
+            .get(ctx, &target_bookmark, Freshness::MostRecent)
+            .await?,
+        None
+    );
+    Ok(())
+}
 
 #[mononoke::fbinit_test]
 async fn backsync_linear_simple(fb: FacebookInit) -> Result<(), Error> {
@@ -214,6 +850,8 @@ async fn test_sync_entries(fb: FacebookInit) -> Result<(), Error> {
         small_repo_dbs.clone(),
         next_log_entries.clone(),
         BookmarkUpdateLogId(0),
+        &format_counter(&large_repo.repo_identity().id()),
+        None,
         Arc::new(AtomicBool::new(false)),
         CommitSyncContext::Backsyncer,
         false,
@@ -1322,6 +1960,8 @@ async fn init_repos(
     override_just_knobs(JustKnobsInMemory::new(hashmap! {
         "scm/mononoke:cross_repo_skip_backsyncing_ordinary_empty_commits".to_string() => KnobVal::Bool(false),
         "scm/mononoke:ignore_change_xrepo_mapping_extra".to_string() => KnobVal::Bool(false),
+        BOOKMARK_DISCOVERY_PAGE_SIZE_JUST_KNOB.to_string() => KnobVal::Int(10_000),
+        MAX_DISCOVERED_BOOKMARKS_JUST_KNOB.to_string() => KnobVal::Int(100_000),
     }));
     let ctx = CoreContext::test_mock(fb);
     let mut factory = TestRepoFactory::new(fb)?;
@@ -2058,6 +2698,24 @@ async fn move_bookmark(
         }
     }
 
+    assert!(txn.commit().await?.is_some());
+    Ok(())
+}
+
+async fn delete_bookmark(
+    ctx: CoreContext,
+    repo: TestRepo,
+    bookmark: &BookmarkKey,
+) -> Result<(), Error> {
+    let previous = repo
+        .bookmarks()
+        .get(ctx.clone(), bookmark, Freshness::MostRecent)
+        .await?
+        .ok_or_else(|| anyhow!("bookmark {bookmark} does not exist"))?;
+    let mut txn = repo.bookmarks().create_transaction(ctx);
+    // TestMove is the only test-specific update reason; reasons identify the
+    // writer, while the transaction operation records that this is a delete.
+    txn.delete(bookmark, previous, BookmarkUpdateReason::TestMove)?;
     assert!(txn.commit().await?.is_some());
     Ok(())
 }

@@ -70,6 +70,20 @@ OverlayFileAccess::State::State(size_t cacheSize) : entries{cacheSize} {
   }
 }
 
+OverlayFileAccess::EntryPtr OverlayFileAccess::State::insert(
+    InodeNumber ino,
+    EntryPtr entry) {
+  EntryPtr evicted;
+  entries.set(
+      ino,
+      std::move(entry),
+      /*promote=*/true,
+      [&evicted](InodeNumber, EntryPtr&& victim) {
+        evicted = std::move(victim);
+      });
+  return evicted;
+}
+
 OverlayFileAccess::OverlayFileAccess(Overlay* overlay, size_t cacheSize)
     : overlay_{overlay}, state_{std::in_place, cacheSize} {}
 
@@ -79,19 +93,22 @@ void OverlayFileAccess::createEmptyFile(
     InodeNumber ino,
     const std::optional<std::string>& maybeBlake3Key) {
   auto file = overlay_->createOverlayFile(ino, folly::ByteRange{});
-  auto state = state_.wlock();
-  XCHECK(!state->entries.exists(ino)) << fmt::format(
-      "Cannot create overlay file {} when it's already open!", ino);
 
   // Computing the empty BLAKE3 hash for the given key
   auto blake3 = Blake3::create(maybeBlake3Key);
   Hash32 emptyBlake3;
   blake3.finalize(emptyBlake3.mutableBytes());
 
-  state->entries.set(
-      ino,
-      std::make_shared<Entry>(
-          std::move(file), size_t{0}, kEmptySha1, std::move(emptyBlake3)));
+  EntryPtr evicted;
+  {
+    auto state = state_.wlock();
+    XCHECK(!state->entries.exists(ino)) << fmt::format(
+        "Cannot create overlay file {} when it's already open!", ino);
+    evicted = state->insert(
+        ino,
+        std::make_shared<Entry>(
+            std::move(file), size_t{0}, kEmptySha1, std::move(emptyBlake3)));
+  }
 }
 
 void OverlayFileAccess::createFile(
@@ -100,30 +117,47 @@ void OverlayFileAccess::createFile(
     const std::optional<Hash20>& sha1,
     const std::optional<Hash32>& blake3) {
   auto file = overlay_->createOverlayFile(ino, blob.getContents());
-  auto state = state_.wlock();
-  XCHECK(!state->entries.exists(ino)) << fmt::format(
-      "Cannot create overlay file {} when it's already open!", ino);
-  state->entries.set(
-      ino,
-      std::make_shared<Entry>(std::move(file), blob.getSize(), sha1, blake3));
+  EntryPtr evicted;
+  {
+    auto state = state_.wlock();
+    XCHECK(!state->entries.exists(ino)) << fmt::format(
+        "Cannot create overlay file {} when it's already open!", ino);
+    evicted = state->insert(
+        ino,
+        std::make_shared<Entry>(std::move(file), blob.getSize(), sha1, blake3));
+  }
 }
 
 bool OverlayFileAccess::cacheCreatedFile(
     InodeNumber ino,
     OverlayFile file,
     size_t size) {
-  auto state = state_.wlock();
-  if (state->entries.exists(ino)) {
-    // A request that resolved the new inode by number (e.g. an NFS
-    // filehandle probe) can beat us here and open the same overlay file
-    // via getEntryForInode. That entry is equally valid; keep it.
-    return false;
+  EntryPtr evicted;
+  {
+    auto state = state_.wlock();
+    if (state->entries.exists(ino)) {
+      // A request that resolved the new inode by number (e.g. an NFS
+      // filehandle probe) can beat us here and open the same overlay file
+      // via getEntryForInode. That entry is equally valid; keep it.
+      return false;
+    }
+    evicted = state->insert(
+        ino,
+        std::make_shared<Entry>(
+            std::move(file), size, std::nullopt, std::nullopt));
   }
-  state->entries.set(
-      ino,
-      std::make_shared<Entry>(
-          std::move(file), size, std::nullopt, std::nullopt));
   return true;
+}
+
+std::shared_ptr<void> OverlayFileAccess::releaseEntry(InodeNumber ino) {
+  auto state = state_.wlock();
+  auto iter = state->entries.findWithoutPromotion(ino);
+  if (iter == state->entries.end()) {
+    return nullptr;
+  }
+  std::shared_ptr<void> entry = iter->second;
+  state->entries.erase(iter);
+  return entry;
 }
 
 FileOffset OverlayFileAccess::getFileSize(FileInode& inode) {
@@ -155,13 +189,15 @@ FileOffset OverlayFileAccess::getFileSize(InodeNumber ino, InodeBase* inode) {
     // Truncated overlay files can sometimes occur after a hard reboot
     // where the overlay file data was not flushed to disk before the
     // system powered off.
-    XLOGF(
-        ERR,
-        "overlay file for {} is too short for header: size={}",
-        ino,
-        st.st_size);
-    overlay_->getErrorLogger().log(
+    auto outcome = overlay_->getErrorLogger().log(
         EdenErrorInfo::overlay("corrupt overlay file", ino.get()));
+    if (outcome != ErrorLogOutcome::RateLimited) {
+      XLOGF(
+          ERR,
+          "overlay file for {} is too short for header: size={}",
+          ino,
+          st.st_size);
+    }
     throw InodeError(
         EIO,
         inode ? inode->inodePtrFromThis() : InodePtr{},
@@ -385,9 +421,10 @@ OverlayFileAccess::EntryPtr OverlayFileAccess::getEntryForInode(
   auto entry = std::make_shared<Entry>(
       overlay_->openFileNoVerify(ino), std::nullopt, std::nullopt);
 
+  EntryPtr evicted;
   {
     auto state = state_.wlock();
-    state->entries.set(ino, entry);
+    evicted = state->insert(ino, entry);
   }
 
   return entry;

@@ -6,6 +6,8 @@
  */
 
 mod acl_overlay_manifest;
+pub mod augmented_backfill;
+mod augmented_derivation;
 mod augmented_manifest_v2;
 mod augmented_pipeline;
 pub mod derive_hg_augmented_manifest;
@@ -16,6 +18,7 @@ pub mod derive_hg_manifest;
 mod indexed_augmented_manifest;
 mod mapping;
 pub mod pipeline;
+pub mod upload_augmented_manifest;
 
 pub use augmented_manifest_v2::RootHgAugmentedManifestV2Id;
 pub use derive_hg_changeset::DeriveHgChangeset;

@@ -21,27 +21,29 @@ Add a linked worktree on its own branch:
   $ git worktree add -q $TESTTMP/wt -b agent
   $ cd $TESTTMP/wt
 
-`sl root` prints the worktree itself, `--shared` the main checkout, and
-`--dotdir` the per-worktree dot dir living under the main repo's `.git`:
+`sl root` and `sl root --shared` print the worktree itself (the shared root is
+not a working copy of the worktree), `--dotdir` the per-worktree dot dir living
+under the main repo's `.git`, and `--shared --dotdir` the shared one:
 
   $ sl root
   $TESTTMP/wt
   $ sl root --shared
-  $TESTTMP/git-repo
+  $TESTTMP/wt
   $ sl root --dotdir
   $TESTTMP/git-repo/.git/worktrees/wt/sl
+  $ sl root --shared --dotdir
+  $TESTTMP/git-repo/.git/sl
 
-The per-worktree dot dir has its own requires/sharedpath/dirstate, and points
-at the main checkout's shared store:
+The per-worktree dot dir has its own requires/dirstate; the store lives in the
+main repo's shared dot dir:
 
   $ cat $(sl root --dotdir)/requires
   store
   dotgit
-  shared
-  $ cat $(sl root --dotdir)/sharedpath; echo
-  $TESTTMP/git-repo/.git/sl
   $ test -f $(sl root --dotdir)/dirstate && echo dirstate-ok
   dirstate-ok
+  $ test ! -e $(sl root --dotdir)/store && echo no-local-store
+  no-local-store
 
 The worktree has no repo config of its own: it reads the main checkout's, the way
 git shares `.git/config`:

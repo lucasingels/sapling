@@ -260,7 +260,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let log_middleware = if args.test_friendly_logging {
         LogMiddleware::test_friendly()
     } else {
-        LogMiddleware::tracing("scm/mononoke:request_log_enabled".to_string())
+        LogMiddleware::tracing()
     };
 
     app.start_monitoring(app.runtime(), SERVICE_NAME, AliveService)?;
@@ -381,11 +381,11 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                         capture_session_data,
                         connection_security_checker,
                         handler,
-                        false, // http1_vectored_writes - not enabled for LFS server
+                        true, // http1_vectored_writes
                     )
                     .await
                 } else {
-                    serve::http(listener, handler, false).await
+                    serve::http(listener, handler, true).await
                 }
             };
             pin_mut!(serve);

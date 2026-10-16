@@ -44,10 +44,12 @@ pub mod builtin_types;
 pub mod clap;
 pub mod compact_protocol;
 pub mod context_stack;
+pub mod default_box;
 pub mod deserialize;
 pub mod errors;
 pub mod export;
 pub mod framing;
+pub mod json5_protocol;
 pub mod metadata;
 pub mod processor;
 pub mod request_context;
@@ -99,6 +101,8 @@ pub use crate::framing::FramingDecoded;
 pub use crate::framing::FramingEncoded;
 pub use crate::framing::FramingEncodedFinal;
 pub use crate::help::NoopSpawner;
+pub use crate::json5_protocol::Json5Mode;
+pub use crate::json5_protocol::Json5WriterOptions;
 pub use crate::processor::NullServiceProcessor;
 pub use crate::processor::ReplyState;
 pub use crate::processor::SerializedStreamElement;
@@ -118,6 +122,7 @@ pub use crate::simplejson_protocol::SimpleJsonProtocol;
 pub use crate::thrift_protocol::MessageType;
 pub use crate::thrift_protocol::ProtocolID;
 pub use crate::ttype::GetTType;
+pub use crate::ttype::MapKeyType;
 pub use crate::ttype::TType;
 pub use crate::type_name_type::GetTypeNameType;
 pub use crate::type_name_type::TypeNameType;
@@ -140,4 +145,22 @@ pub trait ThriftEnum: Sized {
 
     /// Convert the numerical representation of a variant to the enum variant.
     fn from_inner_value(value: i32) -> Result<Self>;
+
+    /// The variant name of this enum value, if it is a known variant.
+    ///
+    /// This is a naive linear scan over `enumerate()`; enums are expected to
+    /// be small in variant count so this is cheap enough. Returns `None` for
+    /// unknown (open-enum) values, which have no static name.
+    fn variant_name(&self) -> Option<&'static str>
+    where
+        Self: 'static,
+    {
+        let inner = self.inner_value();
+        // Compare via inner values rather than `==` so this stays available
+        // to implementors without `PartialEq`.
+        Self::enumerate()
+            .iter()
+            .find(|(variant, _)| variant.inner_value() == inner)
+            .map(|(_, name)| *name)
+    }
 }

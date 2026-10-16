@@ -57,8 +57,10 @@ use crate::CheckedBypassIdentities;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
+use crate::HookExecutionPurpose;
 use crate::HookOutcome;
 use crate::HookRepo;
+use crate::LogOnlyRejections;
 use crate::PushAuthoredBy;
 use crate::errors::HookManagerError;
 
@@ -680,6 +682,10 @@ impl HookManager {
         if let Some(cri) = ctx.metadata().client_request_info() {
             scuba.add_client_request_info(cri);
         }
+        scuba.add(
+            "originating_purpose",
+            HookExecutionPurpose::LandAttempt.as_str(),
+        );
 
         for hook_name in hooks {
             let hook = self
@@ -735,10 +741,12 @@ impl HookManager {
         maybe_pushvars: Option<&HashMap<String, Bytes>>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         // When the hooks are being run as a different set of identities than the
         // caller's (e.g. `commit_run_hooks` with `run_as`), this holds the
         // caller's real identities for audit logging. `None` for real pushes.
         run_as_original_identities: Option<&MononokeIdentitySet>,
+        log_only_rejections: LogOnlyRejections,
     ) -> Result<Vec<HookOutcome>, Error> {
         debug!("Running hooks for bookmark {:?}", bookmark);
 
@@ -754,6 +762,7 @@ impl HookManager {
         if let Some(cri) = ctx.metadata().client_request_info() {
             scuba.add_client_request_info(cri);
         }
+        scuba.add("originating_purpose", purpose.as_str());
 
         if let Some(user) = user_option {
             scuba.add("user", user);
@@ -866,8 +875,9 @@ impl HookManager {
                     scuba,
                     cross_repo_push_source,
                     push_authored_by,
+                    purpose,
                     maybe_pushvars,
-                    hook.get_config().log_only,
+                    log_only_rejections.suppresses(hook.get_config().log_only),
                     bypass_by_cs,
                 )
             })
@@ -1122,6 +1132,7 @@ impl<'a> HookInstance<'a> {
         changesets: Vec<&'a BonsaiChangeset>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         maybe_pushvars: Option<&'a HashMap<String, Bytes>>,
         log_only: bool,
         bypass_by_cs: Arc<HashMap<ChangesetId, BypassDecision>>,
@@ -1141,6 +1152,7 @@ impl<'a> HookInstance<'a> {
                 changesets,
                 cross_repo_push_source,
                 push_authored_by,
+                purpose,
                 maybe_pushvars,
                 hook_name,
                 scuba,
@@ -1159,6 +1171,7 @@ impl<'a> HookInstance<'a> {
         cs: &'cs BonsaiChangeset,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         annotated_tags: Option<&AnnotatedTags>,
         maybe_pushvars: Option<&'cs HashMap<String, Bytes>>,
         log_only: bool,
@@ -1186,6 +1199,7 @@ impl<'a> HookInstance<'a> {
                 cs,
                 cross_repo_push_source,
                 push_authored_by,
+                purpose,
                 maybe_pushvars,
                 hook_name,
                 scuba,
@@ -1298,6 +1312,7 @@ impl Hook {
                 to,
                 cross_repo_push_source,
                 push_authored_by,
+                HookExecutionPurpose::LandAttempt,
                 annotated_tags,
                 maybe_pushvars,
                 log_only,
@@ -1320,6 +1335,7 @@ impl Hook {
         scuba: MononokeScubaSampleBuilder,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         maybe_pushvars: Option<&'a HashMap<String, Bytes>>,
         log_only: bool,
         bypass_by_cs: Arc<HashMap<ChangesetId, BypassDecision>>,
@@ -1335,6 +1351,7 @@ impl Hook {
                     changesets,
                     cross_repo_push_source,
                     push_authored_by,
+                    purpose,
                     maybe_pushvars,
                     log_only,
                     bypass_by_cs,
@@ -1362,6 +1379,7 @@ impl Hook {
                                         cs,
                                         cross_repo_push_source,
                                         push_authored_by,
+                                        purpose,
                                         None,
                                         maybe_pushvars,
                                         log_only,

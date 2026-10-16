@@ -26,13 +26,12 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableUntopologicallyVariant;
 use mononoke_types::HistoryManifestDirectoryId;
+use mononoke_types::blame_v3::BLAME_V3_VERSION;
 
 use crate::batch_v3::derive_blame_v3_in_batch;
 use crate::derive_from_predecessor_v3::derive_blame_v3_from_predecessor;
 use crate::derive_v3::derive_blame_v3;
 use crate::mapping_v2::RootBlameV2;
-
-const BLAME_V3_VERSION: i32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootBlameV3 {
@@ -106,6 +105,44 @@ impl BonsaiDerivable for RootBlameV3 {
                 derivation_ctx.xdb_shard_id(Self::VARIANT)?,
             )
             .await
+    }
+
+    async fn store_mapping_batch(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        derived: Vec<(ChangesetId, Self)>,
+    ) -> Result<()> {
+        if derived.is_empty() {
+            return Ok(());
+        }
+
+        let entries = derived
+            .into_iter()
+            .map(|(csid, derived)| {
+                (
+                    csid,
+                    BLAME_V3_VERSION,
+                    derived
+                        .root_manifest
+                        .into_history_manifest_directory_id()
+                        .blake2()
+                        .as_ref()
+                        .to_vec(),
+                )
+            })
+            .collect();
+        derivation_ctx
+            .commit_derived_data_mapping()?
+            .store_mapping_batch(
+                ctx,
+                derivation_ctx.repo_id(),
+                entries,
+                Self::VARIANT,
+                BLAME_V3_VERSION,
+                derivation_ctx.xdb_shard_id(Self::VARIANT)?,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn fetch(

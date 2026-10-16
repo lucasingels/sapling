@@ -15,6 +15,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use record::SerializableRecord;
 use service_catalog::FunctionQualifier;
@@ -27,6 +28,7 @@ use service_catalog::SerializableStreamingResponse;
 use service_catalog_digest::SERVICE_CATALOG_DIGEST_VERSION;
 use service_catalog_digest::ServiceCatalogDigest;
 use service_catalog_digest_expected_values::DIGEST_CALCULATOR;
+use service_catalog_digest_expected_values::DIGEST_PERFORMED_INTERACTION;
 use service_catalog_digest_expected_values::DIGEST_RICH_DESCRIPTOR;
 use service_catalog_digest_expected_values::DIGEST_RICH_DESCRIPTOR_STRUCTURAL;
 use type_id::TypeId;
@@ -80,20 +82,32 @@ fn rich_annotation_type_system() -> type_system::SerializableTypeSystem {
         ),
     ];
     type_system::SerializableTypeSystem {
-        types: BTreeMap::from([(
-            "test.com/RichAnnotation".to_owned(),
-            type_system::SerializableTypeDefinitionEntry {
-                definition: type_system::SerializableTypeDefinition::structDef(
-                    type_system::SerializableStructDefinition {
-                        fields,
-                        isSealed: false,
-                        annotations: BTreeMap::new(),
-                        ..Default::default()
-                    },
-                ),
+        types: BTreeMap::from([
+            (
+                "facebook.com/thrift/service_catalog_digest_test/RichAnnotation".to_owned(),
+                struct_entry(fields),
+            ),
+            (
+                "facebook.com/thrift/service_catalog_digest_test/AppError".to_owned(),
+                struct_entry(Vec::new()),
+            ),
+        ]),
+        ..Default::default()
+    }
+}
+
+fn struct_entry(
+    fields: Vec<type_system::SerializableFieldDefinition>,
+) -> type_system::SerializableTypeDefinitionEntry {
+    type_system::SerializableTypeDefinitionEntry {
+        definition: type_system::SerializableTypeDefinition::structDef(
+            type_system::SerializableStructDefinition {
+                fields,
+                isSealed: false,
+                annotations: BTreeMap::new(),
                 ..Default::default()
             },
-        )]),
+        ),
         ..Default::default()
     }
 }
@@ -137,7 +151,7 @@ fn map_type(key: TypeId, value: TypeId) -> TypeId {
 
 fn calculator_descriptor() -> ServiceDescriptor {
     let mut descriptor = ServiceDescriptor::new(
-        "test.com/Calculator",
+        "facebook.com/thrift/service_catalog_digest_test/Calculator",
         TypeUniverse::Inline(empty_type_system()),
     );
     descriptor.functions = vec![calculator_function("subtract"), calculator_function("add")];
@@ -179,7 +193,7 @@ fn exception(id: i16, name: &str, type_id: TypeId) -> Exception {
 
 fn rich_descriptor() -> ServiceDescriptor {
     let mut descriptor = ServiceDescriptor::new(
-        "test.com/CatalogGolden",
+        "facebook.com/thrift/service_catalog_digest_test/CatalogGolden",
         TypeUniverse::Inline(rich_annotation_type_system()),
     );
     descriptor.annotations = rich_annotations();
@@ -191,7 +205,9 @@ fn rich_descriptor() -> ServiceDescriptor {
                 ..param(1, "seed", TypeId::i32Type(Default::default()))
             }],
             qualifier: FunctionQualifier(1),
-            created_interaction_uri: Some("test.com/CatalogGoldenSession".to_owned()),
+            created_interaction_uri: Some(
+                "facebook.com/thrift/service_catalog_digest_test/CatalogGoldenSession".to_owned(),
+            ),
             annotations: rich_annotations(),
             ..Default::default()
         },
@@ -216,7 +232,9 @@ fn rich_descriptor() -> ServiceDescriptor {
             exceptions: vec![exception(
                 1,
                 "appError",
-                TypeId::stringType(Default::default()),
+                TypeId::userDefinedType(
+                    "facebook.com/thrift/service_catalog_digest_test/AppError".to_owned(),
+                ),
             )],
             sink: Some(Sink {
                 payload_type: TypeId::i32Type(Default::default()),
@@ -234,7 +252,7 @@ fn rich_descriptor() -> ServiceDescriptor {
         },
     ];
     descriptor.interactions = vec![Interaction {
-        uri: "test.com/CatalogGoldenSession".to_owned(),
+        uri: "facebook.com/thrift/service_catalog_digest_test/CatalogGoldenSession".to_owned(),
         functions: vec![Function {
             name: "get".to_owned(),
             response_type: Some(TypeId::i64Type(Default::default())),
@@ -247,14 +265,37 @@ fn rich_descriptor() -> ServiceDescriptor {
     descriptor
 }
 
+fn performed_interaction_descriptor() -> ServiceDescriptor {
+    let mut descriptor = ServiceDescriptor::new(
+        "facebook.com/thrift/service_catalog_digest_test/SessionService",
+        TypeUniverse::Inline(empty_type_system()),
+    );
+    descriptor.functions = vec![Function {
+        name: "openSession".to_owned(),
+        created_interaction_uri: Some(
+            "facebook.com/thrift/service_catalog_digest_test/Session".to_owned(),
+        ),
+        ..Default::default()
+    }];
+    descriptor.performed_interactions =
+        BTreeSet::from(["facebook.com/thrift/service_catalog_digest_test/Session".to_owned()]);
+    descriptor.interactions = vec![Interaction {
+        uri: "facebook.com/thrift/service_catalog_digest_test/Session".to_owned(),
+        functions: vec![Function {
+            name: "get".to_owned(),
+            response_type: Some(TypeId::i32Type(Default::default())),
+            ..Default::default()
+        }],
+        annotations: AnnotationsMap::new(),
+    }];
+    descriptor
+}
+
 fn rich_annotations() -> AnnotationsMap {
     BTreeMap::from([(
-        "test.com/RichAnnotation".to_owned(),
+        "facebook.com/thrift/service_catalog_digest_test/RichAnnotation".to_owned(),
         SerializableRecord::fieldSetDatum(BTreeMap::from([
-            (
-                1,
-                SerializableRecord::textDatum("runtime\0value".to_owned()),
-            ),
+            (1, SerializableRecord::textDatum("runtime value".to_owned())),
             (2, SerializableRecord::boolDatum(true)),
             (3, SerializableRecord::int8Datum(-7)),
             (4, SerializableRecord::int16Datum(-1234)),
@@ -262,7 +303,7 @@ fn rich_annotations() -> AnnotationsMap {
             (6, SerializableRecord::int64Datum(1234567890123)),
             (7, SerializableRecord::float32Datum(1.25)),
             (8, SerializableRecord::float64Datum(-2.5)),
-            (9, SerializableRecord::byteArrayDatum(b"bin\0data".to_vec())),
+            (9, SerializableRecord::byteArrayDatum(b"bin data".to_vec())),
             (
                 10,
                 SerializableRecord::listDatum(vec![
@@ -308,6 +349,7 @@ fn to_serializable(descriptor: &ServiceDescriptor) -> SerializableServiceCatalog
                     .map(to_serializable_function)
                     .collect(),
                 baseService: None,
+                performedInteractions: descriptor.performed_interactions.clone(),
                 annotations: descriptor.annotations.clone(),
                 ..Default::default()
             },
@@ -463,6 +505,30 @@ fn version_constant_exists() {
 }
 
 #[test]
+fn interaction_constructor_differs_from_factory() {
+    let session = Interaction {
+        uri: "facebook.com/thrift/service_catalog_digest_test/CalculatorSession".to_owned(),
+        ..Default::default()
+    };
+    let mut constructor = calculator_descriptor();
+    constructor.performed_interactions = BTreeSet::from([session.uri.clone()]);
+    constructor.interactions = vec![session.clone()];
+    let mut factory = calculator_descriptor();
+    factory.functions.push(Function {
+        name: "createCalculatorSession".to_owned(),
+        created_interaction_uri: Some(session.uri.clone()),
+        ..Default::default()
+    });
+    factory.interactions = vec![session];
+
+    assert_ne!(
+        constructor.digest(),
+        factory.digest(),
+        "a `performs` constructor is not an RPC and must not hash like a factory function",
+    );
+}
+
+#[test]
 fn golden_calculator_digest_matches_cpp() {
     let descriptor = calculator_descriptor();
     let catalog = to_serializable(&descriptor);
@@ -481,6 +547,18 @@ fn golden_rich_descriptor_digest_matches_cpp() {
 
     assert_eq!(hex_digest(&descriptor), DIGEST_RICH_DESCRIPTOR);
     assert_eq!(hex_digest(&catalog), DIGEST_RICH_DESCRIPTOR);
+}
+
+#[test]
+fn golden_performed_interaction_digest_matches_cpp() {
+    let descriptor = performed_interaction_descriptor();
+    let catalog = to_serializable(&descriptor);
+    let mut out_of_band = catalog.clone();
+    out_of_band.types = None;
+
+    assert_eq!(hex_digest(&descriptor), DIGEST_PERFORMED_INTERACTION);
+    assert_eq!(hex_digest(&catalog), DIGEST_PERFORMED_INTERACTION);
+    assert_eq!(hex_digest(&out_of_band), DIGEST_PERFORMED_INTERACTION);
 }
 
 #[test]
@@ -524,12 +602,12 @@ fn function_and_parameter_order_independent() {
 fn structural_mode_ignores_annotations() {
     let mut first = calculator_descriptor();
     first.annotations = BTreeMap::from([(
-        "test.com/Annotation".to_owned(),
+        "facebook.com/thrift/service_catalog_digest_test/Annotation".to_owned(),
         SerializableRecord::textDatum("first".to_owned()),
     )]);
     let mut second = calculator_descriptor();
     second.annotations = BTreeMap::from([(
-        "test.com/Annotation".to_owned(),
+        "facebook.com/thrift/service_catalog_digest_test/Annotation".to_owned(),
         SerializableRecord::textDatum("second".to_owned()),
     )]);
 

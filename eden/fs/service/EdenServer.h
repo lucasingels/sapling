@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -29,6 +30,7 @@
 #include <folly/ThreadLocal.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/SharedPromise.h>
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/synchronization/LifoSem.h>
 
 #include "eden/common/utils/PathFuncs.h"
@@ -40,6 +42,7 @@
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/service/EdenStateDir.h"
 #include "eden/fs/service/PeriodicTask.h"
+#include "eden/fs/service/RestartArmer.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/takeover/TakeoverData.h"
@@ -71,6 +74,9 @@ namespace facebook::eden {
 class BackingStore;
 class BlobCache;
 class CheckoutConfig;
+#ifdef __linux__
+class CgroupFileCacheReclaimState;
+#endif
 class Dirstate;
 class EdenConfig;
 class EdenFsEventsLogger;
@@ -407,6 +413,14 @@ class EdenServer : private TakeoverHandler {
     return edenDir_.getPath();
   }
 
+  /**
+   * Arm the privhelper to relaunch this daemon after a crash. A no-op once a
+   * shutdown is intended.
+   *
+   * Acquires runningState_; the caller must not hold it.
+   */
+  void armPrivHelperRestart();
+
   std::string getEdenHeartbeatFileNameStr() const;
   std::optional<std::string> getOldEdenHeartbeatFileNameStr() const;
   folly::StringPiece getHeartbeatFileNamePrefix() const {
@@ -565,6 +579,20 @@ class EdenServer : private TakeoverHandler {
    */
   void clearStartupStatusPublishers();
 
+  /**
+   * Whether the mount health check should probe a mount in this state.
+   *
+   * The probe asks whether the kernel agrees with a mount the daemon believes
+   * it is serving, which is only a meaningful question once the mount is
+   * RUNNING. Every other state either has not asked the kernel to mount yet or
+   * has already torn the mount down, so probing it would report a
+   * DaemonRunningKernelMountMissing that is guaranteed to be false.
+   *
+   * Static and public so the policy can be exercised directly, without
+   * standing up a mount in each state.
+   */
+  static bool shouldProbeMountHealth(MountState state);
+
  private:
   // Struct to store EdenMount along with SharedPromise that is set
   // during unmount to allow synchronization between unmountFinished
@@ -705,6 +733,10 @@ class EdenServer : private TakeoverHandler {
   // Report memory usage statistics to ServiceData.
   void reportMemoryStats();
 
+#ifdef __linux__
+  void scheduleCgroupFileCacheReclaim();
+#endif
+
   // some backing store may require periodic maintenance, specifically rust
   // datapack store needs to release file descriptor it holds every once in a
   // while.
@@ -720,6 +752,10 @@ class EdenServer : private TakeoverHandler {
   // attempts to recover it.
   void accidentalUnmountRecovery();
 
+  // Probes every mount the daemon believes it is serving and reports the ones
+  // the kernel disagrees about.
+  void checkMountHealth();
+
   // Checks a running mount point without blocking the main EventBase.
   void scheduleRunningMountHealthCheck(
       const AbsolutePath& mountPath,
@@ -727,6 +763,10 @@ class EdenServer : private TakeoverHandler {
 
   // Detects when NFS backed repos are being crawled.
   void detectNfsCrawl();
+
+  // Rechecks restricted roots that omitted mode hides from their parent's
+  // listing, so that a re-grant becomes visible without an explicit access.
+  void refreshRestrictedRoots();
 
   // Cancel all subscribers on all mounts so that we can tear
   // down the thrift server without blocking
@@ -757,6 +797,20 @@ class EdenServer : private TakeoverHandler {
   // This is used because at some point we have both edenfs daemon processes
   // running and we need to be able to tell which one is the old one.
   std::optional<std::string> oldDaemonPid_ = std::nullopt;
+
+  /**
+   * The thread that serves the NFS sockets: mountd, rpcbind and every
+   * mount's nfsd. NFS requests must not wait behind the main EventBase,
+   * whose periodic tasks can block it for tens of seconds (the backing
+   * store flush syncs the hgcache), and soft mounts turn such a stall into
+   * ETIMEDOUT for the application. Declared before the Thrift server,
+   * mountPoints_ and serverState_: a mount's NFS channel and the NFS servers
+   * are destroyed on this thread, so it must outlive every holder of the
+   * ServerState, including the Thrift connections that server_ drops when
+   * it is destroyed.
+   */
+  folly::ScopedEventBaseThread nfsEventBaseThread_{"NfsEventBase"};
+
   std::shared_ptr<EdenServiceHandler> handler_;
   std::shared_ptr<apache::thrift::ThriftServer> server_;
   std::shared_ptr<ThriftServerEventHandler> serverEventHandler_;
@@ -786,6 +840,8 @@ class EdenServer : private TakeoverHandler {
    */
   struct RunStateData {
     RunState state{RunState::STARTING};
+    // Advances when shutdown starts, even if takeover recovery resumes us.
+    uint64_t restartArmGeneration{0};
     folly::File takeoverThriftSocket;
     /**
      * In the case of a takeover shutdown, this will be fulfilled after the
@@ -801,18 +857,14 @@ class EdenServer : private TakeoverHandler {
   folly::Synchronized<RunStateData> runningState_;
 
   /**
-   * Move the server into RunState::SHUTTING_DOWN.
-   *
-   * The single entry point for that transition, so that everything which has
-   * to happen once a shutdown is intended happens on every path that intends
-   * one.
+   * Move the server into RunState::SHUTTING_DOWN and disarm the privhelper's
+   * crash detection. The two belong together: any path that reaches
+   * SHUTTING_DOWN without disarming gets edenfs relaunched behind the user's
+   * back.
    *
    * Caller must hold runningState_ write-locked.
    */
-  void markShuttingDownLocked(RunStateData& state);
-
-  /** Remove this daemon's restart sentinel. Idempotent. */
-  void removeRestartSentinel();
+  void markShuttingDownLocked(RunStateData& state, folly::StringPiece reason);
 
 #ifdef __APPLE__
   folly::dynamic nfsStatOutput_;
@@ -887,6 +939,16 @@ class EdenServer : private TakeoverHandler {
    * Common state shared by all of the EdenMount objects.
    */
   const std::shared_ptr<ServerState> serverState_;
+
+  /**
+   * The privhelper-driven restart state machine.
+   * Declared after serverState_ so it can receive the PrivHelper.
+   */
+  RestartArmer restartArmer_;
+
+#ifdef __linux__
+  std::shared_ptr<CgroupFileCacheReclaimState> cgroupFileCacheReclaimState_;
+#endif
 
   /**
    * HeartbeatManager to handle all heartbeat-related operations.
@@ -1039,8 +1101,22 @@ class EdenServer : private TakeoverHandler {
   PeriodicFnTask<&EdenServer::detectNfsCrawl> detectNfsCrawlTask_{
       this,
       "detect_nfs_crawl"};
+#ifdef __linux__
+  PeriodicFnTask<&EdenServer::scheduleCgroupFileCacheReclaim>
+      cgroupFileCacheReclaimTask_{this, "cgroup_file_cache_reclaim"};
+#endif
+  PeriodicFnTask<&EdenServer::refreshRestrictedRoots>
+      refreshRestrictedRootsTask_{this, "refresh_restricted_roots"};
+  // Set while a refresh round is walking on the server pool; a tick that finds
+  // it set is skipped so rounds cannot pile up. Owned through a shared_ptr so
+  // a walk that outlives this EdenServer clears its own copy, not a member.
+  const std::shared_ptr<std::atomic<bool>> restrictedRootRefreshInFlight_{
+      std::make_shared<std::atomic<bool>>(false)};
   PeriodicFnTask<&EdenServer::accidentalUnmountRecovery>
       accidentalUnmountRecoveryTask_{this, "accidental_unmount_recovery"};
+  PeriodicFnTask<&EdenServer::checkMountHealth> mountHealthCheckTask_{
+      this,
+      "mount_health_check"};
 #ifndef _WIN32
   PeriodicFnTask<&EdenServer::createOrUpdateEdenHeartbeatFile>
       updateEdenHeartbeatFileTask_{this, "update-eden-heartbeat"};

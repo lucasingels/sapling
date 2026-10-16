@@ -493,3 +493,32 @@ struct DeclareHashSpecialization {}
 @scope.Structured
 @scope.Typedef
 struct DeclareEqualToSpecialization {}
+
+/**
+ * Allows a field of a `cpp.allocator` struct to declare a custom default, and
+ * applies that default in the allocator-extended constructors.
+ *
+ * Those constructors value-initialize every field, so without this annotation
+ * a custom default would never reach them; declaring one is an error instead.
+ *
+ * `legacy_ignore_custom_default = true` keeps the older behavior, where the
+ * allocator-extended constructors value-initialize the field and drop the
+ * default. It exists for the structs written against that behavior, whose
+ * constructed values must not change; do not set it in new code.
+ */
+@scope.Field
+struct AllowCustomDefaultInAllocCtor {
+  1: bool legacy_ignore_custom_default;
+}
+
+/**
+ * Allows the unstructured `cpp.allocator` annotation on this union, which
+ * unions otherwise reject.
+ *
+ * Internal and experimental: Thrift's own unit tests use it while support for
+ * `cpp.allocator` unions is incomplete. Do not use it elsewhere; it may change
+ * or go away without notice.
+ */
+@scope.Union
+@thrift.Experimental
+struct InternalExperimentalAllowAllocatorOnUnion {}

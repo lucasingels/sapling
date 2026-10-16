@@ -17,8 +17,11 @@ pub(crate) mod restriction_info;
 #[cfg(test)]
 mod test_utils;
 
+use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use anyhow::Result;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
@@ -37,10 +40,13 @@ use thiserror::Error;
 
 pub use crate::access_log::ACCESS_LOG_SCUBA_TABLE;
 use crate::access_log::log_access_to_restricted_path;
+use crate::restriction_check::AccessEnforcementOutcome;
+use crate::restriction_check::EnforcementDecision;
 pub use crate::restriction_check::ManifestRestrictionCheckResult;
 pub use crate::restriction_check::PathRestrictionCheckResult;
 pub use crate::restriction_check::PermissionRequestGroup;
 use crate::restriction_check::PreFilterResult;
+use crate::restriction_check::PreFilteredRequest;
 pub use crate::restriction_check::RestrictionCheckResult;
 use crate::restriction_check::SharedFetchHandle;
 use crate::restriction_check::SourceRestrictionCheck;
@@ -56,28 +62,42 @@ pub enum RestrictedPathAccess {
 }
 
 #[derive(Clone, Debug, Error)]
-#[error("Access denied: unauthorized access to restricted path: {access}")]
 pub struct RestrictedPathsAuthorizationError {
     access: RestrictedPathAccess,
     // Boxed because `PermissionRequestGroup` is a `MononokeIdentity`, i.e. a whole
     // `AuthenticatedIdentity` thrift struct, which would otherwise make every
     // `Result<_, MononokeError>` in the codebase 248 bytes wide.
-    permission_request_group: Box<PermissionRequestGroup>,
+    details: Box<RestrictedPathsDenialDetails>,
+}
+
+#[derive(Clone, Debug)]
+struct RestrictedPathsDenialDetails {
+    permission_request_group: PermissionRequestGroup,
+    denial_message: Option<String>,
 }
 
 impl RestrictedPathsAuthorizationError {
     pub fn new(
         access: RestrictedPathAccess,
         permission_request_group: PermissionRequestGroup,
+        denial_message: Option<String>,
     ) -> Self {
         Self {
             access,
-            permission_request_group: Box::new(permission_request_group),
+            details: Box::new(RestrictedPathsDenialDetails {
+                permission_request_group,
+                denial_message,
+            }),
         }
     }
 
     pub fn permission_request_group(&self) -> &PermissionRequestGroup {
-        &self.permission_request_group
+        &self.details.permission_request_group
+    }
+
+    /// Repo-configured text appended to the error message, if any.
+    pub fn denial_message(&self) -> Option<&str> {
+        self.details.denial_message.as_deref()
     }
 
     pub fn access(&self) -> &RestrictedPathAccess {
@@ -89,13 +109,50 @@ impl RestrictedPathsAuthorizationError {
     }
 }
 
+/// Why creation-time validation rejected a change to an ACL (`.slacl`) file.
+#[derive(Clone, Debug, Error)]
+pub enum AclFileChangeRejection {
+    /// The caller lacks maintainer access to the restriction covering `dir`.
+    #[error(
+        "Cannot modify ACL file at {dir}: directory is restricted by {repo_region_acl} \
+         (restriction root: {restriction_root}). Caller does not have maintainer access."
+    )]
+    Unauthorized {
+        dir: MPath,
+        repo_region_acl: String,
+        restriction_root: NonRootMPath,
+    },
+    /// An earlier changeset in the same stack already changed the ACL file in `dir`.
+    #[error(
+        "Cannot modify ACL file at {dir}: .slacl at this path was already modified by an \
+         earlier changeset in this stack. Split into separate submissions."
+    )]
+    ModifiedEarlierInStack { dir: MPath },
+}
+
 /// Error type for restricted paths enforcement.
 #[derive(Debug, Error)]
 pub enum RestrictedPathsError {
     #[error(transparent)]
     AuthorizationError(RestrictedPathsAuthorizationError),
+    #[error(transparent)]
+    AclFileChangeRejected(#[from] AclFileChangeRejection),
     #[error("Internal error: {0}")]
     InternalError(#[from] anyhow::Error),
+}
+
+impl std::fmt::Display for RestrictedPathsAuthorizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Access denied: unauthorized access to restricted path: {}",
+            self.access
+        )?;
+        if let Some(denial_message) = self.denial_message() {
+            write!(f, "\n{denial_message}")?;
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for RestrictedPathAccess {
@@ -344,6 +401,146 @@ impl RestrictedPaths {
     }
 
     // -----------------------------------------------------------------------
+    // Public ACL file change validation
+    // -----------------------------------------------------------------------
+
+    /// Validate that the caller may modify any `.slacl` files touched by
+    /// the given changesets in this stack.
+    ///
+    /// # COVERED
+    /// - Explicit add / modify / delete of files whose basename equals
+    ///   `acl_file_name` (typically `.slacl`).
+    /// - Stack-internal add-then-modify of the same `.slacl` path.
+    ///
+    /// # NOT COVERED (deliberately, for performance)
+    /// - **Implicit `.slacl` deletes** (e.g., a file added at `secret`
+    ///   that replaces directory `secret/` and its `.slacl`). Detecting
+    ///   this would require `find_restricted_descendants`, which triggers
+    ///   `AclManifest` derivation — too expensive for the changeset
+    ///   creation hot path. Land-time hooks catch this before it becomes
+    ///   public, and the read-time path still blocks unauthorized access.
+    /// - **Non-`.slacl` file modifications inside restricted directories.**
+    ///   The threat model is read access; deleting/modifying protected
+    ///   code does not grant access to it.
+    /// - **Root-level `.slacl`** (a `.slacl` file at the repository root).
+    ///   Degenerate case: the validator's `NonRootMPath::try_from(MPath::ROOT)`
+    ///   path silently returns no restriction info. Acceptable because
+    ///   no real repo currently uses a root-level `.slacl`; documented
+    ///   here for reviewer awareness.
+    ///
+    /// Skips entirely if the repo has no restricted paths configured, or if
+    /// the JustKnob `scm/mononoke:enforce_acl_file_protection_on_create` is
+    /// off.
+    pub async fn validate_acl_file_changes_in_changesets(
+        &self,
+        ctx: &CoreContext,
+        repo_name: &str,
+        parent_cs_ids: &[ChangesetId],
+        touched_paths_per_changeset: &[&[NonRootMPath]],
+    ) -> std::result::Result<(), RestrictedPathsError> {
+        // 1. Early return if no restricted paths. Checked before the JustKnob
+        //    so repos without restrictions never evaluate it.
+        if !self.may_have_restricted_paths() {
+            return Ok(());
+        }
+
+        // 2. JustKnob gate — owned by this method, NOT duplicated at call sites.
+        if !justknobs::eval(
+            "scm/mononoke:enforce_acl_file_protection_on_create",
+            ctx.metadata()
+                .client_request_info()
+                .map(|info| info.correlator.as_str()),
+            Some(repo_name),
+        ) {
+            return Ok(());
+        }
+
+        let acl_file_name = self.config().acl_file_name();
+
+        // 3. Extract `.slacl` parent dirs by basename match (pure, sync).
+        //    Per-changeset list. Root-path .slacl uses MPath::ROOT.
+        let acl_file_dirs_stack: Vec<Vec<MPath>> = touched_paths_per_changeset
+            .iter()
+            .map(|touched| {
+                touched
+                    .iter()
+                    .filter(|path| path.basename().as_ref() == acl_file_name.as_bytes())
+                    .map(|path| {
+                        let (parent_opt, _) = path.split_dirname();
+                        parent_opt.map_or(MPath::ROOT, MPath::from)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // 4. Track dirs touched by earlier stack entries — block
+        //    add-then-modify of the same .slacl in a single stack.
+        let mut dirs_touched_in_stack: BTreeSet<MPath> = BTreeSet::new();
+
+        for touched_dirs in &acl_file_dirs_stack {
+            for dir_path in touched_dirs {
+                if dirs_touched_in_stack.contains(dir_path) {
+                    return Err(AclFileChangeRejection::ModifiedEarlierInStack {
+                        dir: dir_path.clone(),
+                    }
+                    .into());
+                }
+
+                // Targeted restriction lookup using the existing primitive.
+                // Root-path .slacl falls through to the empty-slice branch
+                // (NonRootMPath::try_from(MPath::ROOT) errs), which returns
+                // no restrictions — see method docstring NOT COVERED list.
+                let restriction_infos: Vec<PathRestrictionInfo> =
+                    match NonRootMPath::try_from(dir_path.clone()) {
+                        Ok(non_root) => {
+                            // Merge changesets: the caller needs access in EVERY
+                            // parent, so gather restrictions from all of them.
+                            let parents: Vec<Option<ChangesetId>> = if parent_cs_ids.is_empty() {
+                                vec![None]
+                            } else {
+                                parent_cs_ids.iter().copied().map(Some).collect()
+                            };
+                            futures::future::try_join_all(parents.into_iter().map(|parent| {
+                                self.get_path_restriction_info(
+                                    ctx,
+                                    parent,
+                                    std::slice::from_ref(&non_root),
+                                )
+                            }))
+                            .await?
+                            .into_iter()
+                            .flatten()
+                            .collect()
+                        }
+                        Err(_) => {
+                            // Root path — no restriction lookup possible via this
+                            // primitive. Skip (degenerate case).
+                            Vec::new()
+                        }
+                    };
+
+                for info in &restriction_infos {
+                    let acl = MononokeIdentity::from_str(&info.repo_region_acl)
+                        .context("Failed to parse repo_region_acl")?;
+                    let has_access = self.has_maintainer_access(ctx, &[&acl]).await?;
+                    if !has_access {
+                        return Err(AclFileChangeRejection::Unauthorized {
+                            dir: dir_path.clone(),
+                            repo_region_acl: info.repo_region_acl.clone(),
+                            restriction_root: info.restriction_root.clone(),
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            dirs_touched_in_stack.extend(touched_dirs.iter().cloned());
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Public access logging methods
     // -----------------------------------------------------------------------
 
@@ -504,8 +701,11 @@ impl RestrictedPaths {
 /// This function:
 /// 1. Spawns any source fetches needed by logging or enforcement
 /// 2. Spawns logging as a fire-and-forget task when logging is enabled
-/// 3. Checks whether enforcement is enabled for a matching condition set
-/// 4. If match AND user lacks authorization, returns `RestrictedPathsError::AuthorizationError`
+/// 3. Checks whether a condition set matches the access and no exemption set
+///    matches the request
+/// 4. If so AND the user lacks authorization, returns
+///    `RestrictedPathsError::AuthorizationError`; an exempted access that fails
+///    to read a restriction source returns that source error
 ///
 /// # Returns
 /// * `Ok(())` if access is allowed or enforcement is disabled
@@ -574,10 +774,11 @@ pub async fn spawn_enforce_restricted_path_access<'a, 'b>(
                 })
                 .flatten(),
         },
-        move |permission_request_group| {
+        move |permission_request_group, denial_message| {
             RestrictedPathsError::AuthorizationError(RestrictedPathsAuthorizationError::new(
                 RestrictedPathAccess::Path((*path).clone()),
                 permission_request_group,
+                denial_message,
             ))
         },
     )
@@ -589,8 +790,11 @@ pub async fn spawn_enforce_restricted_path_access<'a, 'b>(
 /// This function:
 /// 1. Spawns any source fetches needed by logging or enforcement
 /// 2. Spawns logging as a fire-and-forget task when logging is enabled
-/// 3. Checks whether enforcement is enabled for a matching condition set
-/// 4. If match AND user lacks authorization, returns `RestrictedPathsError::AuthorizationError`
+/// 3. Checks whether a condition set matches the access and no exemption set
+///    matches the request
+/// 4. If so AND the user lacks authorization, returns
+///    `RestrictedPathsError::AuthorizationError`; an exempted access that fails
+///    to read a restriction source returns that source error
 ///
 /// # Returns
 /// * `Ok(())` if access is allowed or enforcement is disabled
@@ -660,10 +864,11 @@ pub async fn spawn_enforce_restricted_manifest_access<'a>(
                 })
                 .flatten(),
         },
-        move |permission_request_group| {
+        move |permission_request_group, denial_message| {
             RestrictedPathsError::AuthorizationError(RestrictedPathsAuthorizationError::new(
                 RestrictedPathAccess::Manifest(manifest_id),
                 permission_request_group,
+                denial_message,
             ))
         },
     )
@@ -718,7 +923,7 @@ async fn spawn_enforce_restricted_access<T>(
     access_type: &'static str,
     access_data: access_log::RestrictedPathAccessData,
     build_handles: impl FnOnce(SourceFetches) -> SourceHandles<T>,
-    authorization_error: impl FnOnce(PermissionRequestGroup) -> RestrictedPathsError,
+    authorization_error: impl FnOnce(PermissionRequestGroup, Option<String>) -> RestrictedPathsError,
 ) -> Result<(), RestrictedPathsError>
 where
     T: SourceRestrictionCheck + Send + Sync + 'static,
@@ -731,14 +936,18 @@ where
         return Ok(());
     }
 
-    let pre_filter_result = if enforcement_enabled {
-        restriction_check::pre_filter_condition_sets(ctx, &config.enforcement_condition_sets)
+    let pre_filter = if enforcement_enabled {
+        restriction_check::pre_filter_request(ctx, config)
     } else {
-        PreFilterResult::NoMatch
+        PreFilteredRequest {
+            conditions: PreFilterResult::NoMatch,
+            exemption_matched: false,
+        }
     };
+    let exemption_matched = pre_filter.exemption_matched;
     let fetches = source_fetches_for_access(
         source_options,
-        &pre_filter_result,
+        &pre_filter.conditions,
         effective_mode,
         config_source_may_restrict,
         acl_manifest_available,
@@ -751,7 +960,7 @@ where
             restricted_paths.clone(),
             access_data,
             effective_mode,
-            None,
+            EnforcementDecision::Disabled,
             fetches
                 .logging_config
                 .then(|| handles.config.clone())
@@ -768,7 +977,7 @@ where
         fetches.enforcement_config,
         fetches.enforcement_acl_manifest,
         &handles,
-        pre_filter_result,
+        pre_filter,
         missing_authoritative_source_error(
             access_type,
             effective_mode,
@@ -783,10 +992,7 @@ where
         restricted_paths.clone(),
         access_data,
         effective_mode,
-        enforcement_outcome
-            .as_ref()
-            .ok()
-            .map(|outcome| outcome.access_enforcement_enabled),
+        EnforcementDecision::from_outcome(&enforcement_outcome, exemption_matched),
         fetches
             .logging_config
             .then(|| handles.config.clone())
@@ -797,12 +1003,18 @@ where
             .flatten(),
     );
 
-    let enforcement_outcome = enforcement_outcome?;
-
-    if let Some(permission_request_group) = enforcement_outcome.denial_permission_request_group {
-        Err(authorization_error(permission_request_group))
-    } else {
-        Ok(())
+    match enforcement_outcome? {
+        AccessEnforcementOutcome::Enforced {
+            denial_permission_request_group: Some(permission_request_group),
+        } => Err(authorization_error(
+            permission_request_group,
+            config.denial_message.clone(),
+        )),
+        AccessEnforcementOutcome::NotEnforced
+        | AccessEnforcementOutcome::Enforced {
+            denial_permission_request_group: None,
+        }
+        | AccessEnforcementOutcome::Exempted => Ok(()),
     }
 }
 
@@ -966,18 +1178,16 @@ async fn enforce_with_source_handles<'a, T>(
     fetch_config: bool,
     fetch_acl_manifest: bool,
     handles: &SourceHandles<T>,
-    pre_filter_result: PreFilterResult<'a>,
+    pre_filter: PreFilteredRequest<'a>,
     missing_source_error: anyhow::Error,
-) -> Result<restriction_check::AccessEnforcementOutcome>
+) -> Result<AccessEnforcementOutcome>
 where
     T: SourceRestrictionCheck + Send + Sync + 'static,
 {
-    let (candidates, pre_filter_variant) = match pre_filter_result {
+    let exemption_matched = pre_filter.exemption_matched;
+    let (candidates, pre_filter_variant) = match pre_filter.conditions {
         PreFilterResult::NoMatch => {
-            return Ok(restriction_check::AccessEnforcementOutcome {
-                access_enforcement_enabled: false,
-                denial_permission_request_group: None,
-            });
+            return Ok(AccessEnforcementOutcome::NotEnforced);
         }
         PreFilterResult::DefiniteMatch { candidates } => {
             (candidates, restriction_check::PreFilterVariant::Definite)
@@ -997,7 +1207,17 @@ where
         source_outcomes.push(Err(missing_source_error));
     }
 
+    if exemption_matched && let Some(first_error) = source_outcomes.iter().position(Result::is_err)
+    {
+        // An exempted request that could not read every source fails with the
+        // first source error rather than a denial: it would not have been
+        // enforced had the read succeeded, so an authorization error would
+        // send the caller to request an ACL they don't need.
+        return source_outcomes.swap_remove(first_error);
+    }
+
     restriction_check::authoritative_sources_enforcement_outcome(source_outcomes)
+        .map(|outcome| outcome.exempt_if(exemption_matched))
 }
 
 #[cfg(test)]
@@ -1013,9 +1233,101 @@ mod tests {
     use permission_checker::dummy::DummyAclProvider;
 
     use super::*;
+    use crate::restriction_check::AuthorizationCheckResult;
     use crate::test_utils::RestrictedPathsConfigBuilder;
     use crate::test_utils::build_test_restricted_paths_with_dummy_acl_provider as build_test_restricted_paths;
     use crate::test_utils::build_test_restricted_paths_with_options;
+
+    // What it tests: a matching exemption does not apply when a source fails.
+    // Expected: the first source error is returned, both when the other
+    // source denies and when it also fails, so an exempted request fails
+    // closed with the source error rather than an authorization error. Without
+    // an exemption the denial still wins over the error.
+    #[mononoke::test]
+    async fn test_enforcement_exemption_returns_source_error() -> Result<()> {
+        let error = enforce_with_results(
+            Ok(vec![denied_check()?]),
+            Err(anyhow::anyhow!("AclManifest source failed")),
+            true,
+        )
+        .await
+        .err()
+        .context("an exempted request with a failed source should return an error")?;
+        assert!(
+            format!("{error:#}").contains("AclManifest source failed"),
+            "the source error should be returned instead of the denial: {error:#}",
+        );
+
+        let error = enforce_with_results(
+            Err(anyhow::anyhow!("config source failed")),
+            Err(anyhow::anyhow!("AclManifest source failed")),
+            true,
+        )
+        .await
+        .err()
+        .context("an exemption must not turn a failed lookup into an allow")?;
+        assert!(
+            format!("{error:#}").contains("config source failed"),
+            "the first source's error (config) should be returned: {error:#}",
+        );
+
+        assert_eq!(
+            enforce_with_results(
+                Ok(vec![denied_check()?]),
+                Err(anyhow::anyhow!("AclManifest source failed")),
+                false,
+            )
+            .await?
+            .denial_permission_request_group(),
+            Some(&MononokeIdentity::from_str("REPO_REGION:denied")?),
+            "without an exemption the denial should still win over the source error",
+        );
+        Ok(())
+    }
+
+    // What it tests: enforcement with both authoritative sources read
+    // successfully, with and without a matching exemption.
+    // Expected: the denial is returned without an exemption, and the access is
+    // exempted with one.
+    #[mononoke::test]
+    async fn test_enforcement_exemption_applies_when_sources_succeed() -> Result<()> {
+        assert_eq!(
+            enforce_with_results(Ok(vec![denied_check()?]), Ok(vec![]), false)
+                .await?
+                .denial_permission_request_group(),
+            Some(&MononokeIdentity::from_str("REPO_REGION:denied")?),
+            "without an exemption the unauthorized access should be denied",
+        );
+        assert_eq!(
+            enforce_with_results(Ok(vec![denied_check()?]), Ok(vec![]), true).await?,
+            AccessEnforcementOutcome::Exempted,
+            "a matching exemption should exempt the enforced access",
+        );
+        Ok(())
+    }
+
+    // What it tests: `denial_message` is appended to the error text on its own line.
+    // Expected: no message keeps the base text unchanged.
+    #[mononoke::test]
+    fn test_authorization_error_display_appends_denial_message() -> Result<()> {
+        let access = RestrictedPathAccess::Path(MPath::new("restricted/file")?);
+        let group: PermissionRequestGroup = "REPO_REGION:test_acl".parse()?;
+        let base = "Access denied: unauthorized access to restricted path: restricted/file";
+
+        let without = RestrictedPathsAuthorizationError::new(access.clone(), group.clone(), None);
+        assert_eq!(without.to_string(), base);
+
+        let with = RestrictedPathsAuthorizationError::new(
+            access,
+            group,
+            Some("see https://fburl.com/example".to_string()),
+        );
+        assert_eq!(
+            with.to_string(),
+            format!("{base}\nsee https://fburl.com/example")
+        );
+        Ok(())
+    }
 
     #[mononoke::fbinit_test]
     async fn test_empty_config(fb: FacebookInit) -> Result<()> {
@@ -1216,6 +1528,46 @@ mod tests {
         assert_eq!(lookup.len(), 1);
         assert_eq!(lookup[0].repo_region_acl, "SERVICE_IDENTITY:restricted_acl");
         Ok(())
+    }
+
+    /// Runs enforcement over both authoritative sources with the given source
+    /// results and a definite pre-filter match, so enforcement only depends on
+    /// the source results and the exemption.
+    async fn enforce_with_results(
+        config_result: Result<Vec<PathRestrictionCheckResult>>,
+        acl_manifest_result: Result<Vec<PathRestrictionCheckResult>>,
+        exemption_matched: bool,
+    ) -> Result<AccessEnforcementOutcome> {
+        let handles = SourceHandles {
+            config: Some(SharedFetchHandle::from_result(config_result)),
+            acl_manifest: Some(SharedFetchHandle::from_result(acl_manifest_result)),
+        };
+        enforce_with_source_handles(
+            true,
+            true,
+            &handles,
+            PreFilteredRequest {
+                conditions: PreFilterResult::DefiniteMatch { candidates: vec![] },
+                exemption_matched,
+            },
+            anyhow::anyhow!("missing source"),
+        )
+        .await
+    }
+
+    /// A source check for `restricted` that denies the caller.
+    fn denied_check() -> Result<PathRestrictionCheckResult> {
+        let denied_acl = MononokeIdentity::from_str("REPO_REGION:denied")?;
+        Ok(PathRestrictionCheckResult::new(
+            PathRestrictionInfo {
+                restriction_root: NonRootMPath::new("restricted")?,
+                repo_region_acl: denied_acl.to_string(),
+                permission_request_group: denied_acl.clone(),
+                rollout_allowlist_group: None,
+            },
+            AuthorizationCheckResult::new(false, false, false, false),
+            denied_acl,
+        ))
     }
 
     fn assert_error_chain_contains(err: &anyhow::Error, needle: &str) {

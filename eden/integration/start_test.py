@@ -23,13 +23,22 @@ from .lib.find_executables import FindExe
 from .lib.service_test_case import service_test, ServiceTestCaseBase
 
 
-@testcase.eden_test
+@testcase.eden_test(run_io_uring=True)
 class StartTest(testcase.EdenTestCase):
     def test_start_if_necessary(self) -> None:
-        # Confirm there are no checkouts configured, then stop edenfs
+        # Confirm there are no checkouts configured
         checkouts = self.eden.list_cmd_simple()
         self.assertEqual({}, checkouts)
         self.assertTrue(self.eden.is_healthy())
+
+        # No checkouts and edenfs already running. The no-checkouts case is
+        # answered before the health check, so the message names that rather
+        # than the running daemon, and the daemon is left alone.
+        output = self.eden.run_cmd("start", "--if-necessary")
+        self.assertEqual("No EdenFS mount points configured.\n", output)
+        self.assertTrue(self.eden.is_healthy())
+
+        # Stop edenfs
         self.eden.shutdown()
         self.assertFalse(self.eden.is_healthy())
 
@@ -52,6 +61,12 @@ class StartTest(testcase.EdenTestCase):
 
         checkouts = self.eden.list_cmd_simple()
         self.assertEqual({checkout_dir: "RUNNING"}, checkouts)
+
+        # A checkout exists and edenfs is already serving it, so
+        # `eden start --if-necessary` has nothing left to do and should succeed.
+        output = self.eden.run_cmd("start", "--if-necessary", *self.edenfsctl_args())
+        self.assertRegex(output, r"EdenFS is already running \(pid [0-9]+\)\n")
+        self.assertTrue(self.eden.is_healthy())
 
         # Stop edenfs
         self.eden.shutdown()
@@ -76,13 +91,13 @@ class StartTest(testcase.EdenTestCase):
                 *self.edenfs_args(),
                 capture_stderr=True,
             )
-        self.assertIn("Started EdenFS", output)
-        self.assertTrue(self.eden.is_healthy())
-
-        # Stop edenfs.  We didn't start it through self.eden.start()
-        # so the self.eden class doesn't really know it is running and that
-        # it needs to be shut down.
-        self.eden.run_cmd("stop")
+        try:
+            self.assertIn("Started EdenFS", output)
+            self.assertTrue(self.eden.is_healthy())
+            self.eden.assert_running_fuse_transports()
+        finally:
+            # Raw CLI startup leaves self.eden without a process to clean up.
+            self.eden.run_cmd("stop")
 
     def test_start_if_not_running(self) -> None:
         # EdenFS is already running when the test starts, so
@@ -176,6 +191,7 @@ class StartWithRepoTest(testcase.EdenRepoTest):
             home_dir=pathlib.Path(self.home_dir),
         ):
             self.assert_checkout_is_mounted()
+            self.eden.assert_running_fuse_transports()
 
     def assert_checkout_is_mounted(self) -> None:
         file = pathlib.Path(self.mount) / "hello"

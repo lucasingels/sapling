@@ -15,9 +15,9 @@ use ::manifest::find_intersection_of_diffs;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::format_err;
 pub use blobrepo_common::changed_files::compute_changed_files;
-use blobstore::ErrorKind as BlobstoreError;
 use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
@@ -64,8 +64,6 @@ use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
 use stats::prelude::*;
 use tracing::error;
-
-use crate::errors::*;
 
 define_stats! {
     prefix = "mononoke.blobrepo_commit";
@@ -130,7 +128,9 @@ impl ChangesetHandle {
                     .bonsai_hg_mapping()
                     .get_bonsai_from_hg(&ctx, hg_cs)
                     .await?
-                    .ok_or(ErrorKind::BonsaiMappingNotFound(hg_cs))?;
+                    .ok_or_else(|| {
+                        anyhow!("Bonsai changeset not found for hg changeset {hg_cs}")
+                    })?;
                 let bonsai_cs = csid.load(&ctx, repo.repo_blobstore()).await?;
                 Ok::<_, Error>(bonsai_cs)
             }
@@ -306,7 +306,10 @@ impl UploadEntries {
                 let exists = aug_present?.assume_not_found_if_unsure()
                     || hg_present?.assume_not_found_if_unsure();
                 if !exists {
-                    return Err(BlobstoreError::NotFound(mfid.blobstore_key()).into());
+                    return Err(anyhow!(
+                        "Blob {key} not found in blobstore",
+                        key = mfid.blobstore_key()
+                    ));
                 }
             }
             Entry::Leaf(fnid) => {
@@ -318,7 +321,7 @@ impl UploadEntries {
 
                 let key = envelope.content_id().blobstore_key();
                 if !blobstore.is_present(ctx, &key).await?.fail_if_unsure()? {
-                    return Err(BlobstoreError::NotFound(key).into());
+                    return Err(anyhow!("Blob {key} not found in blobstore"));
                 }
             }
         }
@@ -506,7 +509,7 @@ pub async fn process_entries<'a>(
                     entry_processor.process_root_manifest(ctx, mfid).await?;
                     Ok(Some(mfid))
                 } else {
-                    Err(Error::from(ErrorKind::BadRootManifest(mfid)))
+                    Err(anyhow!("Root manifest is not a manifest (type {mfid})"))
                 }
             }
         }

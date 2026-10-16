@@ -23,7 +23,16 @@ added and removed in the working directory.
 
 from typing import Optional
 
-from .. import cmdutil, context, copies, error, rewriteutil, scmutil, treestate
+from .. import (
+    cmdutil,
+    context,
+    copies,
+    error,
+    mutation,
+    rewriteutil,
+    scmutil,
+    treestate,
+)
 from ..i18n import _
 from ..node import nullid
 from .cmdtable import command
@@ -132,6 +141,10 @@ def commitfilteredctx(repo, ctx, match, allowempty):
         )
         return mctx
 
+    extra = dict(ctx.extra())
+    mutinfo = mutation.record(repo, extra, [ctx.node()], "uncommit")
+    loginfo = {"predecessors": ctx.hex(), "mutation": "uncommit"}
+
     new = context.memctx(
         repo,
         parents=[base],
@@ -140,7 +153,9 @@ def commitfilteredctx(repo, ctx, match, allowempty):
         filectxfn=filectxfn,
         user=ctx.user(),
         date=ctx.date(),
-        extra=ctx.extra(),
+        extra=extra,
+        loginfo=loginfo,
+        mutinfo=mutinfo,
     )
     # phase handling
     commitphase = ctx.phase()
@@ -209,7 +224,8 @@ def fixdirstate(repo, oldctx, newctx, status) -> None:
     copies = dict((dst, oldcopies.get(src, src)) for dst, src in oldcopies.items())
     # Adjust the dirstate copies
     for dst, src in copies.items():
-        if dst not in newctx:
+        if ds[dst] == "?":
+            # A copy whose pending removal untracked it above.
             continue
         if src not in newctx or dst in newctx or ds[dst] != "a":
             src = None

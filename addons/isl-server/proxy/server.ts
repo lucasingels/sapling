@@ -19,7 +19,7 @@ import {repositoryCache} from '../src/RepositoryCache';
 import {CLOSED_AND_SHOULD_NOT_RECONNECT_CODE} from '../src/constants';
 import {onClientConnection} from '../src/index';
 import {makeBrowserServerPlatform} from '../src/serverPlatform';
-import {areTokensEqual} from './proxyUtils';
+import {areTokensEqual, startWebSocketKeepAlive} from './proxyUtils';
 
 const ossSmartlogDir = path.join(__dirname, '../../isl');
 
@@ -255,8 +255,14 @@ export function startServer({
         case 'obsidian':
           platformImpl = (await import('../platform/obsidianServerPlatform')).platform;
           break;
+        case 'vscode-agents':
+          // @fb-only: platformImpl = (await import('../src/facebook/vscodeAgentsServerPlatform')).platform;
+          break;
         case 'agentHome':
-          platformImpl = (await import('../platform/agentHomeServerPlatform')).platform;
+          // @fb-only: platformImpl = (await import('../src/facebook/agentHomeServerPlatform')).platform;
+          break;
+        case 'agentCloud':
+          // @fb-only: platformImpl = (await import('../src/facebook/agentCloudServerPlatform')).platform;
           break;
         default:
         case undefined:
@@ -267,6 +273,14 @@ export function startServer({
         platformImpl.sessionId = sessionId;
       }
 
+      // Registered before onClientConnection so a throw there cannot leak
+      // the timer.
+      socket.on(
+        'close',
+        startWebSocketKeepAlive(socket, undefined, error =>
+          logInfo('websocket keepalive ping failed:', error.message),
+        ),
+      );
       const dispose = onClientConnection({
         postMessage(message: string | ArrayBuffer) {
           socket.send(message);

@@ -10,12 +10,15 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::BufWriter;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use fs_err as fs;
 use pathmatcher_types::AlwaysMatcher;
 use pathmatcher_types::DirectoryMatch;
@@ -39,6 +42,11 @@ pub enum ReferenceValue {
 /// Ref name -> value
 type ReferenceMap = BTreeMap<String, ReferenceValue>;
 
+pub(crate) struct ReftableRefCache {
+    generation: Vec<u8>,
+    references: Arc<ReferenceMap>,
+}
+
 // This is a macro, not a function, because it uses "return".
 macro_rules! return_ok_if_not_found {
     ($expr:expr) => {{
@@ -58,44 +66,13 @@ impl BareGit {
         Ok(id)
     }
 
-    /// Resolve the `HEAD` of every linked worktree of this repo, i.e.
-    /// `<common>/worktrees/<name>/HEAD`. Does not include this repo's own
-    /// `HEAD` (see `resolve_head`). Unresolvable or unborn heads are skipped.
-    pub fn resolve_linked_worktree_heads(&self) -> Result<Vec<HgId>> {
-        let worktrees_dir = self.git_common_dir().join("worktrees");
-        let entries = match fs::read_dir(&worktrees_dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut heads = Vec::new();
-        for entry in entries {
-            let admin_dir = entry?.path();
-            if admin_dir == self.git_dir() {
-                continue;
-            }
-            // Per-worktree HEAD; symbolic refs resolve against the shared refs.
-            let worktree_git = BareGit {
-                git_dir: admin_dir,
-                git_common_dir: self.git_common_dir.clone(),
-                parent: self.parent.clone(),
-            };
-            match worktree_git.resolve_head() {
-                Ok(id) if !id.is_null() => heads.push(id),
-                Ok(_) => {}
-                Err(e) => tracing::debug!(
-                    "ignoring unreadable HEAD of linked worktree {}: {}",
-                    worktree_git.git_dir().display(),
-                    e
-                ),
-            }
-        }
-        Ok(heads)
-    }
-
     /// Lookup a reference by full name like "refs/heads/main".
     /// Returns `None` if the reference does not exist.
     pub fn lookup_reference(&self, name: &str) -> Result<Option<ReferenceValue>> {
+        if let Some(generation) = self.read_reftable_generation()? {
+            return Ok(self.reftable_references(generation)?.get(name).cloned());
+        }
+
         let mut result = None;
         // Access to "result.is_empty()" without offending borrowck.
         let has_result = Cell::new(false);
@@ -136,8 +113,8 @@ impl BareGit {
     /// If `matcher` is specified, it can be used to filter out uninteresting references
     /// like tags, remote references, eetc.
     ///
-    /// Calling this function will re-read references from disk. There is no caching
-    /// at this layer.
+    /// Calling this function will re-read file-backed references from disk. Reftable-backed
+    /// references are cached until `tables.list` changes.
     pub fn list_references(&self, matcher: Option<&dyn Matcher>) -> Result<ReferenceMap> {
         let default_matcher;
         let matcher = match matcher {
@@ -147,35 +124,35 @@ impl BareGit {
             }
             Some(v) => v,
         };
+
+        if let Some(generation) = self.read_reftable_generation()? {
+            let references = self.reftable_references(generation)?;
+            let mut result = ReferenceMap::new();
+            for (name, value) in references.iter() {
+                // Match the file-backed reader, which only walks "HEAD" and "refs/".
+                // Other root refs like "ORIG_HEAD" remain visible to lookup_reference().
+                if name != "HEAD" && !name.starts_with("refs/") {
+                    continue;
+                }
+                if matcher.matches_file(RepoPath::from_str(name)?)? {
+                    result.insert(name.clone(), value.clone());
+                }
+            }
+            return Ok(result);
+        }
+
         // The order matters. Loose entries can override packed entries. So read loose last.
         let mut result = ReferenceMap::default();
         let insert = &mut |k, v| {
             result.insert(k, v);
         };
         self.populate_packed_references(matcher, insert)?;
-        self.populate_loose_directory_references(matcher, self.git_common_dir(), "refs", insert)?;
-        if self.is_linked_worktree() {
-            // Per-worktree refs (refs/bisect, refs/worktree, refs/rewritten) live in the
-            // worktree's own git dir. Git never writes shared refs there.
-            self.populate_loose_directory_references(matcher, self.git_dir(), "refs", insert)?;
+        self.populate_loose_directory_references(matcher, "refs", insert)?;
+        for prefix in ["refs/bisect", "refs/rewritten", "refs/worktree"] {
+            self.populate_loose_directory_references(matcher, prefix, insert)?;
         }
         self.populate_loose_file_reference(matcher, Cow::Borrowed("HEAD"), insert)?;
         Ok(result)
-    }
-
-    /// The directory a loose reference lives in. `HEAD` and git's per-worktree
-    /// namespaces are in `git_dir`; everything else is shared and lives in
-    /// `git_common_dir`. Mirrors git's `is_per_worktree_ref`.
-    fn loose_reference_base_dir(&self, name: &str) -> &Path {
-        let is_per_worktree = !name.starts_with("refs/")
-            || name.starts_with("refs/bisect/")
-            || name.starts_with("refs/worktree/")
-            || name.starts_with("refs/rewritten/");
-        if is_per_worktree {
-            self.git_dir()
-        } else {
-            self.git_common_dir()
-        }
     }
 
     /// Update a git reference. If `value` is `None` it means to delete the reference.
@@ -274,27 +251,126 @@ fn is_refname_component_valid(name: &str) -> bool {
 
 // Implementation details used by list_references().
 impl BareGit {
+    /// Whether this repo uses reftable, and if so, a value that changes whenever any
+    /// reference might have changed. Used as the reference cache key.
+    fn read_reftable_generation(&self) -> Result<Option<Vec<u8>>> {
+        let mut generation = Vec::new();
+        // The GIT_COMMON_DIR stack decides the ref storage format for the whole repo.
+        if !append_reftable_generation(self.common_dir(), &mut generation)? {
+            return Ok(None);
+        }
+        if self.git_dir() != self.common_dir() {
+            // A linked worktree's GIT_DIR has its own stack holding per-worktree refs like HEAD.
+            append_reftable_generation(self.git_dir(), &mut generation)?;
+        }
+        Ok(Some(generation))
+    }
+
+    /// References of a reftable repo, cached against `generation`.
+    ///
+    /// `generation` must be read *before* asking Git for the references. A concurrent ref
+    /// update then bumps the generation past the cached one, so the next call re-reads
+    /// instead of returning a stale snapshot.
+    fn reftable_references(&self, generation: Vec<u8>) -> Result<Arc<ReferenceMap>> {
+        {
+            let cached = self
+                .reftable_ref_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+            {
+                return Ok(Arc::clone(&cached.references));
+            }
+        }
+
+        let references = Arc::new(self.read_reftable_references_from_git()?);
+        let mut cached = self
+            .reftable_ref_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *cached = Some(ReftableRefCache {
+            generation,
+            references: Arc::clone(&references),
+        });
+        Ok(references)
+    }
+
+    fn read_reftable_references_from_git(&self) -> Result<ReferenceMap> {
+        let output = self
+            .call(
+                "for-each-ref",
+                &[
+                    "--include-root-refs",
+                    "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(symref)",
+                ],
+            )
+            .context("reading reftable references with Git")?;
+        let mut references = ReferenceMap::new();
+
+        for line in output.stdout.split(|b| *b == b'\n') {
+            // Ignore non-utf8 names, like populate_loose_directory_references().
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split('\0');
+            let (Some(name), Some(object), Some(peeled), Some(symref), None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                bail!("invalid Git reference output: {line:?}");
+            };
+
+            let value =
+                if !symref.is_empty() {
+                    ReferenceValue::Sym(symref.to_owned())
+                } else {
+                    let object = if peeled.is_empty() { object } else { peeled };
+                    ReferenceValue::Id(HgId::from_hex(object.as_bytes()).with_context(|| {
+                        format!("decoding object ID for Git reference {name:?}")
+                    })?)
+                };
+            references.insert(name.to_owned(), value);
+        }
+
+        if !references.contains_key("HEAD") {
+            let mut cmd = self.git_cmd("symbolic-ref", &["--quiet", "HEAD"]);
+            let output = cmd.output()?;
+            if output.status.success() {
+                let target = String::from_utf8(output.stdout)
+                    .context("decoding symbolic HEAD")?
+                    .trim_end()
+                    .to_owned();
+                references.insert("HEAD".to_owned(), ReferenceValue::Sym(target));
+            } else if output.status.code() != Some(1) {
+                cmd.report_failure_with_output(&output)?;
+            }
+        }
+
+        Ok(references)
+    }
+
     fn populate_loose_file_reference(
         &self,
         matcher: &dyn Matcher,
         name: Cow<str>,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
-        let base_dir = self.loose_reference_base_dir(name.as_ref());
-        self.populate_loose_file_reference_in(matcher, base_dir, name, insert)
-    }
-
-    fn populate_loose_file_reference_in(
-        &self,
-        matcher: &dyn Matcher,
-        base_dir: &Path,
-        name: Cow<str>,
-        insert: &mut dyn FnMut(String, ReferenceValue),
-    ) -> Result<()> {
         if !matcher.matches_file(RepoPath::from_str(name.as_ref())?)? {
             return Ok(());
         }
-        let path = base_dir.join(name.as_ref());
+        let dir = if !name.starts_with("refs/") || is_per_worktree_ref(&name) {
+            self.git_dir()
+        } else {
+            self.common_dir()
+        };
+        let path = dir.join(name.as_ref());
         let content = return_ok_if_not_found!(fs::read_to_string(path))?;
         let value = ReferenceValue::from_content(&content)
             .with_context(|| format!("Resolving loose reference {name:?}"))?;
@@ -305,13 +381,17 @@ impl BareGit {
     fn populate_loose_directory_references(
         &self,
         matcher: &dyn Matcher,
-        base_dir: &Path,
         prefix: &str,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
         if let DirectoryMatch::Nothing = matcher.matches_directory(RepoPath::from_str(prefix)?)? {
             return Ok(());
         }
+        let base_dir = if is_per_worktree_ref(prefix) {
+            self.git_dir()
+        } else {
+            self.common_dir()
+        };
         let dir = return_ok_if_not_found!(fs::read_dir(base_dir.join(prefix)))?;
         for entry in dir {
             let entry = entry?;
@@ -321,11 +401,14 @@ impl BareGit {
                 _ => continue,
             };
             let name = format!("{prefix}/{file_name}");
+            if prefix == "refs" && is_per_worktree_ref(&name) {
+                continue;
+            }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                self.populate_loose_directory_references(matcher, base_dir, &name, insert)?;
+                self.populate_loose_directory_references(matcher, &name, insert)?;
             } else {
-                self.populate_loose_file_reference_in(matcher, base_dir, Cow::Owned(name), insert)?;
+                self.populate_loose_file_reference(matcher, Cow::Owned(name), insert)?;
             }
         }
 
@@ -337,9 +420,8 @@ impl BareGit {
         matcher: &dyn Matcher,
         insert: &mut dyn FnMut(String, ReferenceValue),
     ) -> Result<()> {
-        let content = return_ok_if_not_found!(fs::read_to_string(
-            self.git_common_dir().join("packed-refs")
-        ))?;
+        let content =
+            return_ok_if_not_found!(fs::read_to_string(self.common_dir().join("packed-refs")))?;
 
         // To support "peeled" refs.
         let mut last_inserted_name: Option<&str> = None;
@@ -375,6 +457,29 @@ impl BareGit {
 
         Ok(())
     }
+}
+
+fn is_per_worktree_ref(name: &str) -> bool {
+    ["refs/bisect", "refs/rewritten", "refs/worktree"]
+        .iter()
+        .any(|prefix| {
+            name == *prefix
+                || name
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+}
+
+fn append_reftable_generation(dir: &Path, generation: &mut Vec<u8>) -> Result<bool> {
+    let mut file = match fs::File::open(dir.join("reftable/tables.list")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    file.read_to_end(generation)?;
+    // NUL cannot occur in a table filename, so it separates stacked manifests.
+    generation.push(0);
+    Ok(true)
 }
 
 impl ReferenceValue {
@@ -557,6 +662,59 @@ mod tests {
     }
 
     #[test]
+    fn test_linked_worktree_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let common_dir = dir.path().join("common");
+        let git_dir = common_dir.join("worktrees/w1");
+        fs::create_dir_all(common_dir.join("refs/heads")).unwrap();
+        fs::create_dir_all(common_dir.join("refs/bisect")).unwrap();
+        fs::create_dir_all(git_dir.join("refs/bisect")).unwrap();
+        fs::write(git_dir.join("commondir"), "../..").unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        fs::write(
+            common_dir.join("refs/heads/main"),
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        fs::write(
+            common_dir.join("refs/bisect/main-worktree"),
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        fs::write(
+            git_dir.join("refs/bisect/current-worktree"),
+            "3333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        fs::write(
+            common_dir.join("packed-refs"),
+            "4444444444444444444444444444444444444444 refs/remotes/origin/main\n",
+        )
+        .unwrap();
+
+        let config: BTreeMap<&str, &str> = BTreeMap::new();
+        let git = BareGit::from_git_dir_and_config(git_dir, &config);
+
+        assert_eq!(
+            git.debug_list_references(None),
+            [
+                "HEAD => refs/heads/main",
+                "refs/bisect/current-worktree 3333333333333333333333333333333333333333",
+                "refs/heads/main 1111111111111111111111111111111111111111",
+                "refs/remotes/origin/main 4444444444444444444444444444444444444444",
+            ]
+        );
+        assert_eq!(
+            git.debug_lookup_reference("refs/heads/main"),
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            git.debug_lookup_reference("refs/remotes/origin/main"),
+            "4444444444444444444444444444444444444444"
+        );
+    }
+
+    #[test]
     fn test_update_references() {
         let (_dir, git) = match setup_real_git() {
             Ok(v) => v,
@@ -589,8 +747,53 @@ mod tests {
         assert_eq!(looked_up, Some(id));
     }
 
+    #[test]
+    fn test_reftable_references() {
+        let (_dir, git) = match setup_real_git_with_args(&["-q", "--ref-format=reftable"]) {
+            Ok(v) => v,
+            // Older Git versions do not support reftable. Skip the test.
+            Err(_) => return,
+        };
+
+        assert_eq!(
+            git.debug_lookup_reference("HEAD"),
+            "refs/heads/main => None"
+        );
+
+        let name = "refs/foo";
+        let id = GIT_EMPTY_TREE_ID;
+        git.update_reference(name, Some(id), Some(None)).unwrap();
+        assert_eq!(git.lookup_reference_follow_links(name).unwrap(), Some(id));
+        assert_eq!(
+            git.debug_list_references(None),
+            [
+                "HEAD => refs/heads/main",
+                "refs/foo 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ]
+        );
+
+        // Root refs can be looked up, but are not listed.
+        git.update_reference("ORIG_HEAD", Some(id), None).unwrap();
+        assert_eq!(git.debug_lookup_reference("ORIG_HEAD"), id.to_hex());
+        assert_eq!(
+            git.debug_list_references(None),
+            [
+                "HEAD => refs/heads/main",
+                "refs/foo 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ]
+        );
+
+        // Bypass update_reference() to verify that tables.list invalidates the cache.
+        git.call("update-ref", &["-d", name]).unwrap();
+        assert_eq!(git.lookup_reference_follow_links(name).unwrap(), None);
+    }
+
     /// Setup a real git repo by running the command-line `git`.
     fn setup_real_git() -> Result<(TempDir, BareGit)> {
+        setup_real_git_with_args(&["-q"])
+    }
+
+    fn setup_real_git_with_args(init_args: &[&str]) -> Result<(TempDir, BareGit)> {
         let dir = tempfile::tempdir().unwrap();
         let mut config: BTreeMap<String, String> = BTreeMap::new();
         if let Ok(git) = std::env::var("GIT") {
@@ -599,7 +802,7 @@ mod tests {
         let mut git = BareGit::from_git_dir_and_config(dir.path().to_owned(), &config);
         git.extra_git_configs
             .push("init.defaultBranch=main".to_string());
-        git.call("init", &["-q"])?;
+        git.call("init", init_args)?;
         Ok((dir, git))
     }
 

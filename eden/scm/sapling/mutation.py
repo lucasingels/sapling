@@ -57,6 +57,17 @@ def enabled(repo):
     return repo.ui.configbool("mutation", "enabled")
 
 
+def allow_divergence(ui):
+    """Whether operations may deliberately create divergent (obsolete) commits.
+
+    ``experimental.evolution.allowdivergence`` is the pre-mutation name, still
+    honored for callers that set it by hand.
+    """
+    return ui.configbool("mutation", "allow-divergence") or ui.configbool(
+        "experimental", "evolution.allowdivergence"
+    )
+
+
 def makemutationstore(repo):
     return mutationstore.mutationstore(repo.svfs.join("mutation"))
 
@@ -271,6 +282,10 @@ class obsoletecache:
         """Returns true if the node is obsolete in the repository."""
         if node is None:
             return False
+        if self.complete[None]:
+            # The full set covers every non-public node in the repo, so
+            # membership alone answers the question.
+            return node in self.obsolete[None]
         if node not in repo:
             return False
         ispublic = getispublicfunc(repo)
@@ -279,7 +294,7 @@ class obsoletecache:
         obsolete = self.obsolete[None]
         if node in obsolete:
             return True
-        if self.complete[None] or node in self.notobsolete[None]:
+        if node in self.notobsolete[None]:
             return False
         clhasnode = getisvisiblefunc(repo)
 

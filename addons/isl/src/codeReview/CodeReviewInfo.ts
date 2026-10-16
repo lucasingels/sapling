@@ -6,9 +6,12 @@
  */
 
 import type {
+  CommitInfo,
   DiffId,
   DiffSignalSummary,
+  DiffSummariesResult,
   DiffSummary,
+  DiffSummaryFailure,
   Hash,
   PageVisibility,
   Result,
@@ -19,7 +22,7 @@ import type {UICodeReviewProvider} from './UICodeReviewProvider';
 import {atom} from 'jotai';
 import {clearTrackedCache} from 'shared/LRU';
 import {debounce} from 'shared/debounce';
-import {firstLine, nullthrows} from 'shared/utils';
+import {firstLine} from 'shared/utils';
 import serverAPI from '../ClientToServerAPI';
 import {commitMessageTemplate} from '../CommitInfoView/CommitInfoState';
 import {
@@ -43,7 +46,7 @@ import {messageSyncingEnabledState} from '../messageSyncing';
 import platform from '../platform';
 import {browserPageVisibility, combinePageVisibility} from '../platformVisibility';
 import {dagWithPreviews} from '../previews';
-import {commitByHash, repositoryInfo} from '../serverAPIState';
+import {commitByHash, latestDag, repositoryInfo} from '../serverAPIState';
 import {registerCleanup, registerDisposable} from '../utils';
 import {GerritUICodeReviewProvider} from './GerritUICodeReviewProvider';
 import {GithubUICodeReviewProvider} from './github/github';
@@ -76,20 +79,55 @@ function repoInfoToCodeReviewProvider(repoInfo?: ValidatedRepoInfo): UICodeRevie
 }
 
 export const diffSummary = atomFamilyWeak((diffId: DiffId | undefined) =>
-  atom<Result<DiffSummary | null | undefined>>(get => {
+  atom<Result<DiffSummary | undefined>>(get => {
     if (diffId == null) {
       return {value: undefined};
     }
-    const all = get(allDiffSummaries);
-    if (all.error) {
-      return {error: all.error};
-    }
-    if (all.value == null) {
-      return {value: undefined}; // still loading
-    }
-    return {value: all.value.get(diffId) ?? null}; // null = loaded but not found
+    return summaryOrFetchError(get(allDiffSummaries), diffId);
   }),
 );
+
+// A push merges into the existing map, so most diffs keep their summary object. Handing those the
+// same result object lets jotai stop there, instead of re-rendering every badge and re-asking for
+// every diff's signal count on each push.
+const NO_SUMMARY: Result<DiffSummary | undefined> = {value: undefined};
+const summaryResults = new WeakMap<DiffSummary, Result<DiffSummary | undefined>>();
+const errorResults = new WeakMap<Error, Result<DiffSummary | undefined>>();
+
+/** A diff's last known summary, or the fetch error if there is none to show. */
+function summaryOrFetchError(
+  all: DiffSummariesState,
+  diffId: DiffId,
+): Result<DiffSummary | undefined> {
+  const summary = all.value?.get(diffId);
+  const error = diffFetchError(all, diffId);
+  if (summary == null && error != null) {
+    return memoizedResult(errorResults, error, () => ({error}));
+  }
+  if (summary == null) {
+    return NO_SUMMARY;
+  }
+  return memoizedResult(summaryResults, summary, () => ({value: summary}));
+}
+
+function memoizedResult<K extends object>(
+  cache: WeakMap<K, Result<DiffSummary | undefined>>,
+  key: K,
+  make: () => Result<DiffSummary | undefined>,
+): Result<DiffSummary | undefined> {
+  const cached = cache.get(key);
+  if (cached != null) {
+    return cached;
+  }
+  const result = make();
+  cache.set(key, result);
+  return result;
+}
+
+/** The error that speaks for one diff: its own if failures are tracked per diff, else the fetch's. */
+export function diffFetchError(all: DiffSummariesState, diffId: DiffId): Error | undefined {
+  return all.failedDiffs != null ? all.failedDiffs.get(diffId) : all.error;
+}
 
 /**
  * Whether a DiffSignalSummary represents actionable (failed or warning) signals.
@@ -121,22 +159,77 @@ export function hasDiffActionableSignals(diffId: DiffId): boolean {
 export const branchingDiffInfos = atomFamilyWeak((branchName: string) =>
   atom<Result<DiffSummary | undefined>>(get => {
     const all = get(allDiffSummaries);
-    if (all == null) {
-      return {value: undefined};
-    }
-    if (all.error) {
-      return {error: all.error};
-    }
-    const idMap = get(diffIdsByBranchName);
-    const idForBranchName = idMap.get(branchName);
+    const idForBranchName = get(diffIdsByBranchName).get(branchName);
     if (idForBranchName) {
-      return {value: all.value?.get(idForBranchName)};
+      return summaryOrFetchError(all, idForBranchName);
+    }
+    if (all.error != null) {
+      return {error: all.error};
     }
     return {value: undefined};
   }),
 );
 
-export const allDiffSummaries = atom<Result<Map<DiffId, DiffSummary> | null>>({value: null});
+/**
+ * Unlike a `Result`, holds summaries and an error at once. A fetch can land in parts, so an error
+ * speaks for the part that failed and does not discard summaries already shown.
+ */
+export type DiffSummariesState = {
+  value: Map<DiffId, DiffSummary> | null;
+  /** For the top-level banner: every distinct failure still outstanding, combined. */
+  error?: Error;
+  /** Each failing diff with its own error. Without it, `error` speaks for every diff. */
+  failedDiffs?: ReadonlyMap<DiffId, Error>;
+};
+
+/**
+ * Merges summaries into what is known. A provider that tracks failures per diff sends its whole
+ * current set with every result, which replaces what was known; ordering overlapping fetches is its
+ * job, since only it knows which fetch is newest. A result without `failures` gets the handling from
+ * before batching: an error replaces every summary, and the next summaries replace the error.
+ */
+export function applyDiffSummariesResult(
+  existing: DiffSummariesState,
+  result: DiffSummariesResult,
+): DiffSummariesState {
+  if (result.failures == null) {
+    if (result.error) {
+      return {value: null, error: result.error};
+    }
+    if (existing.error != null || existing.value == null) {
+      return {value: result.value};
+    }
+    return {value: new Map([...existing.value, ...result.value])};
+  }
+  const value = result.error
+    ? existing.value
+    : new Map([...(existing.value ?? []), ...result.value]);
+  if (result.failures.length === 0) {
+    return {value};
+  }
+  const failedDiffs = new Map(
+    result.failures.flatMap(({error, diffIds}) => diffIds.map(diffId => [diffId, error] as const)),
+  );
+  const combined = combineFetchErrors(result.failures);
+  // Every result arrives with new `Error` objects, and the banner logs each one it is handed.
+  const error = existing.error?.message === combined.message ? existing.error : combined;
+  return {value, error, failedDiffs};
+}
+
+/**
+ * One error for the banner. A single distinct failure is shown as is; otherwise every distinct
+ * message goes into one, since the banner matches on the message to pick what to show. Sorted, so
+ * the same failures always produce the same message.
+ */
+function combineFetchErrors(failures: Array<DiffSummaryFailure>): Error {
+  const byMessage = new Map(failures.map(({error}) => [error.message, error]));
+  if (byMessage.size === 1) {
+    return [...byMessage.values()][0];
+  }
+  return new Error(`Failed to fetch diff summaries: ${[...byMessage.keys()].sort().join('; ')}`);
+}
+
+export const allDiffSummaries = atom<DiffSummariesState>({value: null});
 export const diffIdsByBranchName = atom<Map<string, DiffId>>(new Map());
 
 registerDisposable(
@@ -156,26 +249,7 @@ registerDisposable(
       return map;
     });
 
-    writeAtom(allDiffSummaries, existing => {
-      if (existing.error) {
-        // TODO: if we only fetch one diff, but had an error on the overall fetch... should we still somehow show that error...?
-        // Right now, this will reset all other diffs to "loading" instead of error
-        // Probably, if all diffs fail to fetch, so will individual diffs.
-        return event.summaries;
-      }
-
-      if (event.summaries.error || existing.value == null) {
-        return event.summaries;
-      }
-
-      // merge old values with newly fetched ones
-      return {
-        value: new Map([
-          ...nullthrows(existing.value).entries(),
-          ...event.summaries.value.entries(),
-        ]),
-      };
-    });
+    writeAtom(allDiffSummaries, existing => applyDiffSummariesResult(existing, event.summaries));
   }),
   import.meta.hot,
 );
@@ -222,43 +296,53 @@ export const latestCommitMessage = atomFamilyWeak((hash: Hash | 'head') =>
       }
       return ['', ''];
     }
-    const commit = get(commitByHash(hash));
-    const preview = get(dagWithPreviews).get(hash);
-
-    if (
-      preview != null &&
-      (preview.title !== commit?.title || preview.description !== commit?.description)
-    ) {
-      return [preview.title, preview.description];
-    }
-
-    if (!commit) {
-      return ['', ''];
-    }
-
-    const syncEnabled = get(messageSyncingEnabledState);
-
-    let remoteTitle = commit.title;
-    let remoteDescription = commit.description;
-    if (syncEnabled && commit.diffId) {
-      // use the diff's commit message instead of the local one, if available
-      const summary = get(diffSummary(commit.diffId));
-      if (summary?.value) {
-        remoteTitle = summary.value.title;
-        remoteDescription = summary.value.commitMessage;
-      }
-    }
-
-    return [remoteTitle, remoteDescription];
+    return latestMessageFor(get(commitByHash(hash)), get(dagWithPreviews).get(hash), diffId =>
+      get(messageSyncingEnabledState) ? get(diffSummary(diffId)).value : undefined,
+    );
   }),
 );
 
-export const latestCommitMessageTitle = atomFamilyWeak((hashOrHead: Hash | 'head') =>
-  atom(get => {
-    const [title] = get(latestCommitMessage(hashOrHead));
-    return title;
-  }),
-);
+/** `latestCommitMessage` for a commit, from the local commit, its preview, and its diff. */
+function latestMessageFor(
+  commit: CommitInfo | undefined,
+  preview: CommitInfo | undefined,
+  syncedSummary: (diffId: DiffId) => DiffSummary | undefined,
+): [title: string, description: string] {
+  if (
+    preview != null &&
+    (preview.title !== commit?.title || preview.description !== commit?.description)
+  ) {
+    return [preview.title, preview.description];
+  }
+  if (!commit) {
+    return ['', ''];
+  }
+  // use the diff's commit message instead of the local one, if available
+  const summary = commit.diffId ? syncedSummary(commit.diffId) : undefined;
+  return summary ? [summary.title, summary.commitMessage] : [commit.title, commit.description];
+}
+
+/**
+ * Every commit's title from `latestCommitMessage`, computed together for the smartlog rows. One
+ * derived atom per row would make each write to the dag walk thousands of dependents.
+ */
+export const latestCommitTitles = atom(get => {
+  const previews = get(dagWithPreviews);
+  const latest = get(latestDag);
+  const syncedSummary = get(messageSyncingEnabledState)
+    ? (diffId: DiffId) => get(allDiffSummaries).value?.get(diffId)
+    : () => undefined;
+  const titles = new Map<Hash, string>();
+  for (const preview of previews.values()) {
+    titles.set(preview.hash, latestMessageFor(latest.get(preview.hash), preview, syncedSummary)[0]);
+  }
+  for (const commit of latest.values()) {
+    if (!titles.has(commit.hash)) {
+      titles.set(commit.hash, latestMessageFor(commit, undefined, syncedSummary)[0]);
+    }
+  }
+  return titles;
+});
 
 export const latestCommitMessageFields = atomFamilyWeak((hashOrHead: Hash | 'head') =>
   atom(get => {
@@ -320,6 +404,10 @@ const handleVisibilityChange = () => {
   writeAtom(pageVisibility, oldValue => {
     if (oldValue !== newValue && newValue === 'hidden') {
       clearTrackedCache();
+    }
+    if (oldValue !== newValue && newValue === 'focused') {
+      serverAPI.postMessage({type: 'fetchDiffSummaries', force: true});
+      tracker.track('DiffFetchSource', {extras: {source: 'webview_focus'}});
     }
     return newValue;
   });

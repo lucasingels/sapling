@@ -36,7 +36,6 @@ use manifest::ManifestParentReplacement;
 use manifest::Span;
 use manifest::TreeInfo;
 use manifest::TreeInfoSubentries;
-use manifest::derive_manifest_from_predecessor;
 use manifest::derive_manifest_with_known_entries;
 use mercurial_types::HgAugmentedManifestEntry;
 use mercurial_types::HgAugmentedManifestEnvelope;
@@ -83,7 +82,6 @@ use restricted_paths_common::RestrictedPathsConfigBased;
 use restricted_paths_common::maybe_propagate_manifest_id_store_write_error;
 use tracing::error;
 
-use crate::acl_overlay_manifest::AclOverlayHgManifestId;
 use crate::derive_hg_manifest::ParentIndex;
 use crate::indexed_augmented_manifest::IndexedAugmentedDirectory;
 use crate::indexed_augmented_manifest::IndexedAugmentedEntry;
@@ -607,16 +605,11 @@ async fn get_metadata<'a>(
 }
 
 /// Normalize a derived ACL root into an optional overlay.
-/// Returns `None` if the JK is disabled or the ACL manifest is the canonical
-/// empty one (no .slacl files), `Some(id)` otherwise.
+/// Returns `None` if the ACL manifest is the canonical empty one (no .slacl
+/// files), `Some(id)` otherwise.
 pub fn normalize_acl_root(
     root_acl_manifest_id: &acl_manifest::RootAclManifestId,
 ) -> Result<Option<AclManifestId>> {
-    let add_acl_manifest_pointer =
-        justknobs::eval("scm/mononoke:add_acl_manifest_pointer", None, None);
-    if !add_acl_manifest_pointer {
-        return Ok(None);
-    }
     let id = *root_acl_manifest_id.inner_id();
     if id == AclManifest::empty_id() {
         Ok(None)
@@ -645,7 +638,7 @@ where
             blobstore,
             paths
                 .iter()
-                .filter(|&(_, lookup_path)| (!lookup_path.is_root()))
+                .filter(|&(_, lookup_path)| !lookup_path.is_root())
                 .map(|(_, lookup_path)| manifest::PathOrPrefix::Path(lookup_path.clone())),
         )
         .try_filter_map(|(path, entry)| async move {
@@ -1213,7 +1206,7 @@ async fn index_augmented_subtree_replacements<Store: KeyedBlobstore>(
     Ok(indexed_replacements)
 }
 
-fn validate_augmented_manifest_element(key: &[u8]) -> Result<()> {
+pub(crate) fn validate_augmented_manifest_element(key: &[u8]) -> Result<()> {
     if key.contains(&b'\n') || key.contains(&b'\x01') {
         bail!(
             "Cannot derive Hg augmented manifest for a path element containing newline ('\\n') or the '\\x01' control code"
@@ -1239,10 +1232,6 @@ fn collect_augmented_subentries(
         }
     }
     Ok(direct)
-}
-
-fn root_envelope_is_content_derived(envelope: &HgAugmentedManifestEnvelope) -> bool {
-    envelope.augmented_manifest.hg_node_id == envelope.augmented_manifest.computed_node_id
 }
 
 /// Given the fully-merged subentries for one tree node, attempt parent reuse
@@ -1276,8 +1265,8 @@ async fn finalize_envelope(
 
     // Mirror `create_hg_manifest` parent reuse: if merged contents match an
     // hg-relevant parent (and the parent's ACL pointer agrees), reuse that
-    // parent's envelope. At the root, reuse is only valid when the returned
-    // envelope is itself content-derived.
+    // parent's envelope. A reused root keeps a client-supplied `hg_node_id`
+    // because Hg reuses that root id too.
     let computed_node_id = if parents.len() > 1 {
         let ParentEnvelopeReuse {
             reusable_parent,
@@ -1294,24 +1283,21 @@ async fn finalize_envelope(
         .await?;
 
         if let Some(reused) = reusable_parent {
-            let root_reuse_allowed = !is_root || root_envelope_is_content_derived(&reused.envelope);
-            if root_reuse_allowed {
-                return Ok((
-                    (),
-                    IndexedAugmentedDirectory {
-                        node: HgAugmentedDirectoryNode {
-                            treenode: reused.id.into_nodehash(),
-                            augmented_manifest_id: reused.envelope.augmented_manifest_id,
-                            augmented_manifest_size: reused.envelope.augmented_manifest_size,
-                            acl_manifest_directory_id: reused
-                                .envelope
-                                .augmented_manifest
-                                .acl_manifest_directory_id,
-                        },
-                        index: None,
+            return Ok((
+                (),
+                IndexedAugmentedDirectory {
+                    node: HgAugmentedDirectoryNode {
+                        treenode: reused.id.into_nodehash(),
+                        augmented_manifest_id: reused.envelope.augmented_manifest_id,
+                        augmented_manifest_size: reused.envelope.augmented_manifest_size,
+                        acl_manifest_directory_id: reused
+                            .envelope
+                            .augmented_manifest
+                            .acl_manifest_directory_id,
                     },
-                ));
-            }
+                    index: None,
+                },
+            ));
         }
 
         computed_node_id
@@ -1489,7 +1475,7 @@ where
                 .augmented_manifest
                 .acl_manifest_directory_id
                 == acl_root_overlay;
-            if root_envelope_is_content_derived(&candidate_envelope) && root_acl_pointer_matches {
+            if root_acl_pointer_matches {
                 Ok(root_dir)
             } else {
                 let restricted_paths_enabled = justknobs::eval(
@@ -1915,108 +1901,6 @@ pub async fn try_reuse_parent_envelope(
     })
 }
 
-pub async fn derive_from_full_hg_manifest(
-    ctx: CoreContext,
-    blobstore: Arc<dyn KeyedBlobstore>,
-    hg_manifest_id: HgManifestId,
-    acl_root_overlay: Option<AclManifestId>,
-) -> Result<HgAugmentedManifestId> {
-    let predecessor = AclOverlayHgManifestId {
-        hg_manifest_id,
-        acl_manifest_id: acl_root_overlay,
-    };
-    let root_entry = derive_manifest_from_predecessor(
-        ctx.clone(),
-        blobstore.clone(),
-        predecessor,
-        {
-            cloned!(ctx, blobstore);
-            move |tree_info| {
-                cloned!(ctx, blobstore);
-                async move {
-                    let acl_manifest_directory_id = tree_info.predecessor.acl_manifest_id;
-                    let hg_manifest = tree_info
-                        .predecessor
-                        .hg_manifest_id
-                        .load(&ctx, &blobstore)
-                        .await?;
-                    let entries = tree_info.subentries.into_iter().map(|(elem, ((), entry))| {
-                        let entry = match entry {
-                            Entry::Tree(tree) => HgAugmentedManifestEntry::DirectoryNode(tree),
-                            Entry::Leaf(leaf) => HgAugmentedManifestEntry::FileNode(leaf),
-                        };
-                        (elem, entry)
-                    });
-                    let subentries =
-                        ShardedMapV2Node::from_entries(&ctx, &blobstore, entries).await?;
-                    let augmented_manifest = ShardedHgAugmentedManifest {
-                        hg_node_id: tree_info.predecessor.hg_manifest_id.into_nodehash(),
-                        p1: hg_manifest.p1(),
-                        p2: hg_manifest.p2(),
-                        computed_node_id: hg_manifest.computed_node_id(),
-                        subentries,
-                        acl_manifest_directory_id,
-                    };
-
-                    assert_root_acl_pointer_invariant(
-                        &augmented_manifest.acl_manifest_directory_id,
-                    )?;
-
-                    let (augmented_manifest_id, augmented_manifest_size) = augmented_manifest
-                        .clone()
-                        .compute_content_addressed_digest(&ctx, &blobstore)
-                        .await?;
-                    let envelope = HgAugmentedManifestEnvelope {
-                        augmented_manifest_id,
-                        augmented_manifest_size,
-                        augmented_manifest,
-                    };
-                    envelope.store(&ctx, &blobstore).await?;
-                    let entry = HgAugmentedDirectoryNode {
-                        treenode: tree_info.predecessor.hg_manifest_id.into_nodehash(),
-                        augmented_manifest_id,
-                        augmented_manifest_size,
-                        acl_manifest_directory_id,
-                    };
-                    Ok(((), entry))
-                }
-            }
-        },
-        {
-            cloned!(ctx, blobstore);
-            move |leaf_info| {
-                cloned!(ctx, blobstore);
-                async move {
-                    let (file_type, filenode_id) = leaf_info.predecessor;
-                    let filenode = filenode_id.load(&ctx, &blobstore).await?;
-                    let metadata = filestore::get_metadata(
-                        &blobstore,
-                        &ctx,
-                        &FetchKey::Canonical(filenode.content_id()),
-                    )
-                    .await?
-                    .ok_or_else(|| anyhow!("Missing metadata for {filenode_id}"))?;
-                    let hg_augmented_file_leaf_node = HgAugmentedFileLeafNode {
-                        file_type,
-                        filenode: filenode_id.into_nodehash(),
-                        total_size: metadata.total_size,
-                        content_blake3: metadata.seeded_blake3,
-                        content_sha1: metadata.sha1,
-                        file_header_metadata: if filenode.metadata().is_empty() {
-                            None
-                        } else {
-                            Some(filenode.metadata().clone())
-                        },
-                    };
-                    Ok(((), hg_augmented_file_leaf_node))
-                }
-            }
-        },
-    )
-    .await?;
-    Ok(HgAugmentedManifestId::new(root_entry.treenode))
-}
-
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -2232,7 +2116,7 @@ pub(crate) async fn pre_walk_acl_tree(
 /// Assert that the root ACL pointer invariant holds: the root pointer must
 /// never be `Some(canonical_empty_acl_manifest_id)`. Valid states are `None`
 /// (no restrictions) or `Some(non_empty_id)` (root is a waypoint or restriction root).
-fn assert_root_acl_pointer_invariant(pointer: &Option<AclManifestId>) -> Result<()> {
+pub(crate) fn assert_root_acl_pointer_invariant(pointer: &Option<AclManifestId>) -> Result<()> {
     if let Some(id) = pointer {
         anyhow::ensure!(
             *id != AclManifest::empty_id(),

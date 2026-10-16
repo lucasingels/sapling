@@ -11,7 +11,7 @@ import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
 
 import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import type {DagCommitInfo} from './dag/dag';
-import type {CommitInfo, SuccessorInfo, WorktreeEntry} from './types';
+import type {CommitInfo, MergeConflicts, SuccessorInfo, WorktreeEntry} from './types';
 import {succeedableRevset, WarningCheckResult} from './types';
 
 import {Button} from 'isl-components/Button';
@@ -19,7 +19,7 @@ import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
 import {Tag} from 'isl-components/Tag';
 import {Tooltip} from 'isl-components/Tooltip';
-import {atom, useAtomValue, useSetAtom} from 'jotai';
+import {useAtomValue, useSetAtom} from 'jotai';
 import React, {memo, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
@@ -28,6 +28,7 @@ import {useAutofocusRef} from 'shared/hooks';
 import {basename, guessPathSep, notEmpty, nullthrows} from 'shared/utils';
 import {AllBookmarksTruncated, Bookmark, Bookmarks, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
+import {worktreeMutationsSupported} from './CheckedOutElsewhere';
 import css from './Commit.module.css';
 import {cloudSyncStateAtom} from './CommitCloud';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
@@ -55,7 +56,7 @@ import {
   branchingDiffInfos,
   codeReviewProvider,
   diffSummary,
-  latestCommitMessageTitle,
+  latestCommitTitles,
 } from './codeReview/CodeReviewInfo';
 import {DiffBadge, DiffFollower, DiffInfo} from './codeReview/DiffBadge';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
@@ -67,10 +68,11 @@ import {t, T} from './i18n';
 import {IconStack} from './icons/IconStack';
 import {IrrelevantCwdIcon} from './icons/IrrelevantCwdIcon';
 import {
-  atomFamilyWeak,
   configBackedAtom,
   localStorageBackedAtom,
   readAtom,
+  useAtomGet,
+  useAtomSelect,
   writeAtom,
 } from './jotaiUtils';
 import {CONFLICT_SIDE_LABELS} from './mergeConflicts/consts';
@@ -82,9 +84,9 @@ import {RebaseOperation} from './operations/RebaseOperation';
 import {RemoveWorktreeOperation} from './operations/RemoveWorktreeOperation';
 import {RenameWorktreeOperation} from './operations/RenameWorktreeOperation';
 import {
-  inlineProgressByHash,
   operationBeingPreviewed,
   runOperation,
+  useInlineProgress,
   useRunOperation,
   useRunPreviewedOperation,
 } from './operationsState';
@@ -108,7 +110,7 @@ import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {copyAndShowToast} from './toast';
-import {showModal} from './useModal';
+import {showConfirmation, showModal} from './useModal';
 import {short} from './utils';
 
 export const rebaseOffWarmWarningEnabled = localStorageBackedAtom<boolean>(
@@ -153,19 +155,16 @@ function previewPreventsActions(preview?: CommitPreview): boolean {
   return false;
 }
 
-const commitLabelForCommit = atomFamilyWeak((hash: string) =>
-  atom(get => {
-    const conflicts = get(mergeConflicts);
-    const {localShort, incomingShort} = CONFLICT_SIDE_LABELS;
-    const hashes = conflicts?.hashes;
-    if (hash === hashes?.other) {
-      return incomingShort;
-    } else if (hash === hashes?.local) {
-      return localShort;
-    }
-    return null;
-  }),
-);
+function commitLabelForCommit(conflicts: MergeConflicts | undefined, hash: string): string | null {
+  const {localShort, incomingShort} = CONFLICT_SIDE_LABELS;
+  const hashes = conflicts?.hashes;
+  if (hash === hashes?.other) {
+    return incomingShort;
+  } else if (hash === hashes?.local) {
+    return localShort;
+  }
+  return null;
+}
 
 export const Commit = memo(
   ({
@@ -187,7 +186,7 @@ export const Commit = memo(
     const runOperation = useRunOperation();
     const setEditStackIntentionHashes = useSetAtom(editingStackIntentionHashes);
 
-    const inlineProgress = useAtomValue(inlineProgressByHash(commit.hash));
+    const inlineProgress = useInlineProgress(commit.hash);
 
     const {isSelected, onDoubleClickToShowDrawer} = useCommitCallbacks(commit);
     const actionsPrevented = previewPreventsActions(previewType);
@@ -198,9 +197,13 @@ export const Commit = memo(
 
     const treeWidth = useAtomValue(commitTreeWidth);
 
-    const title = useAtomValue(latestCommitMessageTitle(commit.hash));
+    const title = useAtomGet(latestCommitTitles, commit.hash) ?? '';
 
-    const commitLabel = useAtomValue(commitLabelForCommit(commit.hash));
+    const commitLabel = useAtomSelect(
+      mergeConflicts,
+      conflicts => commitLabelForCommit(conflicts, commit.hash),
+      [commit.hash],
+    );
 
     const clipboardCopy = (text: string, url?: string) =>
       copyAndShowToast(text, url == null ? undefined : clipboardLinkHtml(text, url));
@@ -315,12 +318,7 @@ export const Commit = memo(
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
-          onClick: () =>
-            showComparison(
-              commit.isDot && !hasUncommittedChanges
-                ? {type: ComparisonType.HeadChanges}
-                : {type: ComparisonType.Committed, hash: commit.hash},
-            ),
+          onClick: () => showComparison({type: ComparisonType.Committed, hash: commit.hash}),
           loggingLabel: 'View Changes in Commit',
         });
 
@@ -855,8 +853,10 @@ function CommitLabel({children}: {children?: ReactNode}) {
 /**
  * A label naming a sibling worktree currently checked out (`.`) at this commit,
  * followed by buttons to open, rename, and (for linked worktrees) remove it.
+ * Rename and remove are only shown where the server reports worktree mutations are supported.
  */
 export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
+  const canMutate = useAtomValue(worktreeMutationsSupported);
   const name =
     wt.label != null && wt.label !== '' ? wt.label : basename(wt.path, guessPathSep(wt.path));
   const hoverTitle = t('Checked out in worktree $name', {replace: {$name: name}});
@@ -873,8 +873,8 @@ export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
         </Tag>
       </Tooltip>
       <OpenWorktreeButton wt={wt} name={name} />
-      <RenameWorktreeButton wt={wt} name={name} />
-      {wt.role === 'main' ? null : <RemoveWorktreeButton wt={wt} name={name} />}
+      {canMutate && <RenameWorktreeButton wt={wt} name={name} />}
+      {canMutate && wt.role !== 'main' && <RemoveWorktreeButton wt={wt} name={name} />}
     </span>
   );
 }
@@ -1167,8 +1167,9 @@ async function maybeWarnAboutOldDestination(dest: CommitInfo): Promise<WarningCh
     return WarningCheckResult.PASS;
   }
 
-  const confirmed = await platform.confirm(
-    t(
+  const confirmed = await showConfirmation({
+    title: t('Go to Older Commit?'),
+    message: t(
       Internal.warnAboutOldGotoReason ??
         'The destination commit is $age older than the current commit. ' +
           "Going here may be slow. It's often faster to rebase the commit to a newer base before going. " +
@@ -1179,7 +1180,8 @@ async function maybeWarnAboutOldDestination(dest: CommitInfo): Promise<WarningCh
         },
       },
     ),
-  );
+    confirmLabel: t('Goto Anyway'),
+  });
   return confirmed ? WarningCheckResult.BYPASS : WarningCheckResult.FAIL;
 }
 

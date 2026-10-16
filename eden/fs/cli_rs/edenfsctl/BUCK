@@ -5,23 +5,22 @@ oncall("scm_client_infra")
 rust_binary(
     name = "edenfsctl",
     srcs = glob(["src/**/*.rs"]),
-    test_deps = [
-        "fbsource//third-party/rust:tempfile",
-    ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:fail",
+        "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:tracing-subscriber",
         "//common/rust/shed/fbinit:fbinit",
-        "//eden/fs/cli_rs/edenfs-client:edenfs-client",
         "//eden/fs/cli_rs/edenfs-commands:edenfs-commands",
-        "//eden/fs/cli_rs/edenfs-config:edenfs-config",
         "//eden/fs/rust/facebook/edenfs-telemetry:edenfs-telemetry",
         "//eden/scm/lib/util/testutil:testutil",
     ] + select({
         "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "//eden/scm/lib/http-client:http-client",
+        ],
         "ovr_config//os:windows": [
             "//eden/fs/cli_rs/edenfs-utils:edenfs-utils",
         ],

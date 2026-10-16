@@ -12,6 +12,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::anyhow;
+use counting_blob::BlobstoreCounters;
+use counting_blob::CountingBlobstore;
 use fbinit::FacebookInit;
 use fixtures::ManyFilesDirs;
 use fixtures::TestRepoFixture;
@@ -21,12 +23,16 @@ use justknobs::test_helpers::KnobVal;
 use justknobs::test_helpers::with_just_knobs_async;
 use maplit::btreeset;
 use maplit::hashmap;
+use memblob::Memblob;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::FileType;
 use mononoke_types::GitLfs;
 use mononoke_types::path::MPath;
+use mutable_renames::MutableRenameEntry;
 use pretty_assertions::assert_eq;
+use test_repo_factory::TestRepoFactory;
 use tests_utils::CreateCommitContext;
 use xdiff::CopyInfo;
 
@@ -38,6 +44,7 @@ use crate::CoreContext;
 use crate::HgChangesetId;
 use crate::Mononoke;
 use crate::RepoContext;
+use crate::RestrictedPathsPolicy;
 use crate::repo::MononokeRepo;
 use crate::repo::Repo;
 
@@ -75,6 +82,7 @@ async fn test_diff_with_moves(fb: FacebookInit) -> Result<(), Error> {
             false, /* include_subtree_copies */
             None,  /* path_restrictions */
             btreeset! {ChangesetDiffItem::FILES},
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -133,6 +141,7 @@ async fn test_diff_with_multiple_copies(fb: FacebookInit) -> Result<(), Error> {
             false, /* include_subtree_copies */
             None,  /* path_restrictions */
             btreeset! {ChangesetDiffItem::FILES},
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -210,6 +219,7 @@ async fn test_diff_with_multiple_moves(fb: FacebookInit) -> Result<(), Error> {
             false, /* include_subtree_copies */
             None,  /* path_restrictions */
             btreeset! {ChangesetDiffItem::FILES},
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -300,6 +310,7 @@ async fn test_diff_with_dirs(fb: FacebookInit) -> Result<(), Error> {
             false,
             None,
             btreeset! {ChangesetDiffItem::TREES},
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     diff.sort_by(|a, b| a.path().cmp(b.path()));
@@ -346,6 +357,7 @@ async fn test_diff_with_dirs(fb: FacebookInit) -> Result<(), Error> {
             false,
             None,
             btreeset! {ChangesetDiffItem::TREES},
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     diff.sort_by(|a, b| a.path().cmp(b.path()));
@@ -457,6 +469,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -472,6 +485,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[..8]);
@@ -486,6 +500,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
                 after: Some(file_list[7].try_into()?),
             },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[8..16]);
@@ -500,6 +515,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
                 after: Some(file_list[15].try_into()?),
             },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[16..]);
@@ -541,6 +557,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -560,6 +577,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES, ChangesetDiffItem::TREES},
             ChangesetFileOrdering::Ordered { after: None },
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -580,6 +598,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::TREES},
             ChangesetFileOrdering::Ordered { after: None },
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -604,6 +623,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             Some(3),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -621,6 +641,7 @@ async fn test_ordered_diff(fb: FacebookInit) -> Result<(), Error> {
                 after: Some(filtered_changed_files_list[2].try_into()?),
             },
             Some(3),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -667,6 +688,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             None, /* limit */
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list);
@@ -678,6 +700,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[..8]);
@@ -690,6 +713,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
                 after: Some(file_list[7].try_into()?),
             },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[8..16]);
@@ -702,6 +726,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
                 after: Some(file_list[15].try_into()?),
             },
             Some(8),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&diff, &file_list[16..]);
@@ -718,6 +743,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             Some(3),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -730,6 +756,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES, ChangesetDiffItem::TREES},
             ChangesetFileOrdering::Ordered { after: None },
             None, /* limit */
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -746,6 +773,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::TREES},
             ChangesetFileOrdering::Ordered { after: None },
             None, /* limit */
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -773,6 +801,7 @@ async fn test_ordered_root_diff(fb: FacebookInit) -> Result<(), Error> {
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
 
@@ -858,6 +887,7 @@ async fn lfs_change_paths(
             None,
             None,
             usize::MAX,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?
         .into_iter()
@@ -1200,6 +1230,7 @@ async fn diff_files_only(
             btreeset! {ChangesetDiffItem::FILES},
             ordering,
             None,
+            &RestrictedPathsPolicy::Strict,
         )
         .await?)
 }
@@ -1532,6 +1563,7 @@ async fn test_diff_ordered_renormalize_pagination_uses_supplement_cursor(
             btreeset! {ChangesetDiffItem::FILES},
             ChangesetFileOrdering::Ordered { after: None },
             Some(2),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&page1, &["a", "b"]);
@@ -1552,6 +1584,7 @@ async fn test_diff_ordered_renormalize_pagination_uses_supplement_cursor(
                 after: Some(page1_last),
             },
             Some(2),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&page2, &["c", "d"]);
@@ -1572,23 +1605,13 @@ async fn test_diff_ordered_renormalize_pagination_uses_supplement_cursor(
                 after: Some(page2_last),
             },
             Some(2),
+            &RestrictedPathsPolicy::Strict,
         )
         .await?;
     check_diff_paths(&page3, &["e"]);
 
     Ok(())
 }
-
-// ---- commit_compare is backend-agnostic: fsnodes vs content_manifests ----
-//
-// `commit_compare` (via `ChangesetContext::diff`) resolves each side through
-// `root_content_manifest_id()`, which picks content_manifests or fsnodes based
-// on the `derived_data_use_content_manifests` JustKnob. These tests derive both
-// and assert the diff is identical whichever backend is used -- the property the
-// fsnode -> content_manifest migration relies on. Because fsnodes use a flat
-// trie map while content_manifests use a sharded, id-pruned one, this also
-// exercises the sharding-aware diff against a non-sharded reference through the
-// public API, rather than testing the internal fast/slow paths directly.
 
 /// Tiny deterministic xorshift RNG so any failure is reproducible by seed.
 struct DiffTestRng(u64);
@@ -1730,111 +1753,385 @@ fn diff_test_key<R: MononokeRepo>(diff: &ChangesetPathDiffContext<R>) -> String 
     )
 }
 
-/// Run `commit_compare` (`ChangesetContext::diff`) between `parent` and `child`
-/// forced onto a specific manifest backend, returning stable keys for the diff.
-/// The contexts are built *inside* the knob scope because the backend choice is
-/// memoized on first access to `root_content_manifest_id()`.
-async fn diff_test_run_backend(
+async fn diff_test_run(
     ctx: &CoreContext,
     repo: Arc<Repo>,
     parent: ChangesetId,
     child: ChangesetId,
     ordering: ChangesetFileOrdering,
-    use_content_manifests: bool,
 ) -> Result<Vec<String>, Error> {
-    let ctx = ctx.clone();
-    with_just_knobs_async(
-        JustKnobsInMemory::new(hashmap! {
-            "scm/mononoke:derived_data_use_content_manifests".to_string() =>
-                KnobVal::Bool(use_content_manifests),
-        }),
-        async move {
-            let repo_ctx = RepoContext::new_test(ctx, repo).await?;
-            let child_ctx = repo_ctx
-                .changeset(child)
-                .await?
-                .ok_or_else(|| anyhow!("child changeset not found"))?;
-            let parent_ctx = repo_ctx
-                .changeset(parent)
-                .await?
-                .ok_or_else(|| anyhow!("parent changeset not found"))?;
-            let diff = child_ctx
-                .diff(
-                    &parent_ctx,
-                    true, /* include_copies_renames */
-                    true, /* include_subtree_copies */
-                    None, /* path_restrictions */
-                    btreeset! { ChangesetDiffItem::TREES, ChangesetDiffItem::FILES },
-                    ordering,
-                    None, /* limit */
-                )
-                .await?;
-            anyhow::Ok(diff.iter().map(diff_test_key).collect::<Vec<_>>())
-        }
-        .boxed(),
-    )
-    .await
+    let repo_ctx = RepoContext::new_test(ctx.clone(), repo).await?;
+    let child_ctx = repo_ctx
+        .changeset(child)
+        .await?
+        .ok_or_else(|| anyhow!("child changeset not found"))?;
+    let parent_ctx = repo_ctx
+        .changeset(parent)
+        .await?
+        .ok_or_else(|| anyhow!("parent changeset not found"))?;
+    let diff = child_ctx
+        .diff(
+            &parent_ctx,
+            true, /* include_copies_renames */
+            true, /* include_subtree_copies */
+            None, /* path_restrictions */
+            btreeset! { ChangesetDiffItem::TREES, ChangesetDiffItem::FILES },
+            ordering,
+            None, /* limit */
+            &RestrictedPathsPolicy::Strict,
+        )
+        .await?;
+    Ok(diff.iter().map(diff_test_key).collect())
 }
 
 #[mononoke::fbinit_test]
-async fn test_diff_matches_across_manifest_backends(fb: FacebookInit) -> Result<(), Error> {
+async fn test_content_manifest_diff_matches_across_orderings(
+    fb: FacebookInit,
+) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
 
     for seed in 0..25u64 {
-        let repo: Repo = test_repo_factory::build_empty(fb).await?;
+        let repo: Repo = TestRepoFactory::new(fb)?
+            .with_config_override(|config| {
+                for types in config.derived_data_config.available_configs.values_mut() {
+                    types.types.remove(&DerivableType::Fsnodes);
+                }
+            })
+            .build()
+            .await?;
         let (parent, child) = diff_test_build_scenario(&ctx, &repo, seed).await?;
         let repo = Arc::new(repo);
-
-        // Unordered: same set of entries regardless of backend.
-        let mut fsnode = diff_test_run_backend(
+        let mut unordered = diff_test_run(
             &ctx,
             repo.clone(),
             parent,
             child,
             ChangesetFileOrdering::Unordered,
-            false,
         )
         .await?;
-        let mut content = diff_test_run_backend(
+        let mut ordered = diff_test_run(
             &ctx,
-            repo.clone(),
-            parent,
-            child,
-            ChangesetFileOrdering::Unordered,
-            true,
-        )
-        .await?;
-        fsnode.sort();
-        content.sort();
-        assert_eq!(
-            content, fsnode,
-            "seed {seed}: content_manifest commit_compare != fsnode commit_compare (unordered)"
-        );
-
-        // Ordered: identical entries *and* identical order.
-        let fsnode_ordered = diff_test_run_backend(
-            &ctx,
-            repo.clone(),
+            repo,
             parent,
             child,
             ChangesetFileOrdering::Ordered { after: None },
-            false,
         )
         .await?;
-        let content_ordered = diff_test_run_backend(
-            &ctx,
-            repo.clone(),
-            parent,
-            child,
-            ChangesetFileOrdering::Ordered { after: None },
-            true,
-        )
-        .await?;
+        unordered.sort();
+        ordered.sort();
         assert_eq!(
-            content_ordered, fsnode_ordered,
-            "seed {seed}: content_manifest commit_compare != fsnode commit_compare (ordered)"
+            ordered, unordered,
+            "seed {seed}: ordered and unordered diffs disagree"
         );
     }
+
+    Ok(())
+}
+
+/// The parts of a diff entry that copy detection can affect.
+fn copy_diff_summary<R: MononokeRepo>(
+    diff: &ChangesetPathDiffContext<R>,
+) -> (String, CopyInfo, Option<String>, Option<String>) {
+    (
+        diff.path().to_string(),
+        diff.copy_info(),
+        diff.get_new_content().map(|c| c.path().to_string()),
+        diff.get_old_content().map(|c| c.path().to_string()),
+    )
+}
+
+async fn copy_aware_diff(
+    changeset: &ChangesetContext<Repo>,
+    parent: &ChangesetContext<Repo>,
+    path_restrictions: Option<Vec<MPath>>,
+    ordering: ChangesetFileOrdering,
+    limit: Option<usize>,
+) -> Result<Vec<ChangesetPathDiffContext<Repo>>, Error> {
+    Ok(changeset
+        .diff(
+            parent,
+            true, /* include_copies_renames */
+            true, /* include_subtree_copies */
+            path_restrictions,
+            btreeset! {ChangesetDiffItem::FILES},
+            ordering,
+            limit,
+            &RestrictedPathsPolicy::Strict,
+        )
+        .await?)
+}
+
+async fn add_mutable_rename(
+    repo_ctx: &RepoContext<Repo>,
+    src: (ChangesetId, &str),
+    dst: (ChangesetId, &str),
+) -> Result<(), Error> {
+    let src_path = MPath::try_from(src.1)?;
+    let src_unode = changeset_ctx(repo_ctx, src.0, "rename source")
+        .await?
+        .path_with_history(src_path.clone())
+        .await?
+        .unode_id()
+        .await?
+        .context("rename source has no unode")?;
+    let rename_entry =
+        MutableRenameEntry::new(dst.0, MPath::try_from(dst.1)?, src.0, src_path, src_unode)?;
+    repo_ctx
+        .mutable_renames()
+        .add_or_overwrite_renames(repo_ctx.ctx(), repo_ctx.commit_graph(), vec![rename_entry])
+        .await?;
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_restricted_copy_aware_diff_matches_filtered_full_diff(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("a/x", "x")
+        .add_file("c/y", "y")
+        .add_file("e/z", "z")
+        .add_file("g/old", "old")
+        .add_file("h/w", "w")
+        .add_file("k/v", "v")
+        .add_file("m/s", "s")
+        .add_file("n/t1", "t1")
+        .add_file("p/q", "q")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        // Move.
+        .add_file_with_copy_info("b/x", "x", (parent, "a/x"))
+        .delete_file("a/x")
+        // Copy.
+        .add_file_with_copy_info("d/y", "y", (parent, "c/y"))
+        // One source moved to two destinations: the first is a move, the
+        // second a copy.
+        .add_file_with_copy_info("f/z1", "z", (parent, "e/z"))
+        .add_file_with_copy_info("f/z2", "z", (parent, "e/z"))
+        .delete_file("e/z")
+        // Move onto a path that existed in the parent: shown as a change,
+        // and the source as removed.
+        .add_file_with_copy_info("k/v", "w", (parent, "h/w"))
+        .delete_file("h/w")
+        // Move whose first destination existed in the parent: the second
+        // destination becomes the move.
+        .add_file_with_copy_info("n/t1", "s", (parent, "m/s"))
+        .add_file_with_copy_info("n/t2", "s", (parent, "m/s"))
+        .delete_file("m/s")
+        // Plain add and delete, turned into a move by a mutable rename.
+        .add_file("g/new", "old")
+        .delete_file("g/old")
+        // Unrelated change.
+        .add_file("p/q", "q2")
+        .commit()
+        .await?;
+
+    let repo_ctx = repo_ctx_for_test(&ctx, repo).await?;
+    add_mutable_rename(&repo_ctx, (parent, "g/old"), (child, "g/new")).await?;
+    let mut child_ctx = changeset_ctx(&repo_ctx, child, "child").await?;
+    child_ctx
+        .add_mutable_renames(vec![MPath::try_from("g/new")?].into_iter())
+        .await?;
+    let parent_ctx = changeset_ctx(&repo_ctx, parent, "parent").await?;
+
+    let s = |p: &str| Some(p.to_string());
+    let mut full: Vec<_> = copy_aware_diff(
+        &child_ctx,
+        &parent_ctx,
+        None,
+        ChangesetFileOrdering::Unordered,
+        None,
+    )
+    .await?
+    .iter()
+    .map(copy_diff_summary)
+    .collect();
+    full.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        full,
+        vec![
+            ("b/x".to_string(), CopyInfo::Move, s("b/x"), s("a/x")),
+            ("d/y".to_string(), CopyInfo::Copy, s("d/y"), s("c/y")),
+            ("f/z1".to_string(), CopyInfo::Move, s("f/z1"), s("e/z")),
+            ("f/z2".to_string(), CopyInfo::Copy, s("f/z2"), s("e/z")),
+            ("g/new".to_string(), CopyInfo::Move, s("g/new"), s("g/old")),
+            ("h/w".to_string(), CopyInfo::None, None, s("h/w")),
+            ("k/v".to_string(), CopyInfo::None, s("k/v"), s("k/v")),
+            ("n/t1".to_string(), CopyInfo::None, s("n/t1"), s("n/t1")),
+            ("n/t2".to_string(), CopyInfo::Move, s("n/t2"), s("m/s")),
+            ("p/q".to_string(), CopyInfo::None, s("p/q"), s("p/q")),
+        ],
+        "unrestricted diff of the fixture"
+    );
+
+    let restriction_sets: &[&[&str]] = &[
+        // Old file paths.
+        &["a/x"],
+        &["c/y"],
+        &["e/z"],
+        &["g/old"],
+        &["h/w"],
+        &["m/s"],
+        // New file paths.
+        &["b/x"],
+        &["d/y"],
+        &["f/z1"],
+        &["f/z2"],
+        &["g/new"],
+        &["k/v"],
+        &["n/t1"],
+        &["n/t2"],
+        &["p/q"],
+        // A directory containing only a source.
+        &["a"],
+        // Directories containing destinations.
+        &["b"],
+        &["f"],
+        &["g"],
+        &["n"],
+        // Several restrictions at once.
+        &["a/x", "f/z2"],
+        &["b", "e/z", "n/t2"],
+        // Unrelated path.
+        &["zzz"],
+    ];
+
+    for (label, ordering) in [
+        ("unordered", ChangesetFileOrdering::Unordered),
+        ("ordered", ChangesetFileOrdering::Ordered { after: None }),
+    ] {
+        let full = copy_aware_diff(&child_ctx, &parent_ctx, None, ordering.clone(), None).await?;
+        for restriction_set in restriction_sets {
+            let restrictions = restriction_set
+                .iter()
+                .map(|p| MPath::try_from(*p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut expected: Vec<_> = full
+                .iter()
+                .filter(|diff| restrictions.iter().any(|r| diff.path().is_related_to(r)))
+                .map(copy_diff_summary)
+                .collect();
+            let mut actual: Vec<_> = copy_aware_diff(
+                &child_ctx,
+                &parent_ctx,
+                Some(restrictions),
+                ordering.clone(),
+                None,
+            )
+            .await?
+            .iter()
+            .map(copy_diff_summary)
+            .collect();
+            if label == "unordered" {
+                expected.sort_by(|a, b| a.0.cmp(&b.0));
+                actual.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            assert_eq!(
+                actual, expected,
+                "{label} diff restricted to {restriction_set:?} differs from the filtered full diff"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Blobstore gets that copy detection adds to an ordered diff restricted to
+/// the old path of one moved file, in a commit with `moves` moves.
+///
+/// Measured as gets with copies on minus gets with copies off, so the pruned
+/// manifest diff (whose cost depends on the size of the root directory) is
+/// not counted.
+async fn restricted_diff_copy_detection_gets(fb: FacebookInit, moves: usize) -> Result<u64, Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let counters = Arc::new(BlobstoreCounters::new());
+    let repo: Repo = TestRepoFactory::new(fb)?
+        .with_blobstore(Arc::new(CountingBlobstore::new(
+            Memblob::default(),
+            counters.clone(),
+        )))
+        .build()
+        .await?;
+
+    // Each move gets its own directory. A small directory's entries are
+    // stored inline in its manifest blob, so moves within one directory
+    // would load the same blob however many there are.
+    let parent = (0..moves)
+        .fold(CreateCommitContext::new_root(&ctx, &repo), |c, i| {
+            c.add_file(format!("src_{i}/f").as_str(), format!("{i}"))
+        })
+        .commit()
+        .await?;
+    let child = (0..moves)
+        .fold(
+            CreateCommitContext::new(&ctx, &repo, vec![parent]),
+            |c, i| {
+                let src = format!("src_{i}/f");
+                c.add_file_with_copy_info(
+                    format!("dst_{i}/f").as_str(),
+                    format!("{i}"),
+                    (parent, src.as_str()),
+                )
+                .delete_file(src.as_str())
+            },
+        )
+        .commit()
+        .await?;
+
+    let repo_ctx = repo_ctx_for_test(&ctx, repo).await?;
+    let restrictions = vec![MPath::try_from("src_0/f")?];
+    let ordering = ChangesetFileOrdering::Ordered { after: None };
+
+    // Derive everything the diff needs, so that derivation is not counted.
+    copy_aware_diff(
+        &changeset_ctx(&repo_ctx, child, "child").await?,
+        &changeset_ctx(&repo_ctx, parent, "parent").await?,
+        Some(restrictions.clone()),
+        ordering.clone(),
+        Some(1000),
+    )
+    .await?;
+
+    let mut gets = Vec::new();
+    for include_copies_renames in [false, true] {
+        let child_ctx = changeset_ctx(&repo_ctx, child, "child").await?;
+        let parent_ctx = changeset_ctx(&repo_ctx, parent, "parent").await?;
+        counters.reset();
+        child_ctx
+            .diff(
+                &parent_ctx,
+                include_copies_renames,
+                true, /* include_subtree_copies */
+                Some(restrictions.clone()),
+                btreeset! {ChangesetDiffItem::FILES},
+                ordering.clone(),
+                Some(1000),
+                &RestrictedPathsPolicy::Strict,
+            )
+            .await?;
+        gets.push(counters.snapshot().gets);
+    }
+    let [without_copies, with_copies] = gets[..] else {
+        unreachable!("measured with and without copies");
+    };
+    Ok(with_copies - without_copies)
+}
+
+#[mononoke::fbinit_test]
+async fn test_restricted_diff_copy_detection_cost(fb: FacebookInit) -> Result<(), Error> {
+    let small = restricted_diff_copy_detection_gets(fb, 10).await?;
+    let large = restricted_diff_copy_detection_gets(fb, 200).await?;
+    println!("copy detection gets: 10 moves = {small}, 200 moves = {large}");
+
+    // Copy detection is limited to the requested paths, so moves outside
+    // them add no work.
+    assert_eq!(
+        large, small,
+        "copy detection gets should not depend on unrelated moves: 10 moves = {small}, 200 moves = {large}"
+    );
 
     Ok(())
 }

@@ -87,6 +87,12 @@ void FakePrivHelper::registerMountDelegate(
   }
 }
 
+void FakePrivHelper::unregisterMount(AbsolutePathPiece mountPath) {
+  if (mountDelegates_.erase(mountPath.asString()) == 0) {
+    throwf<std::range_error>("mount {} not defined", mountPath);
+  }
+}
+
 void FakePrivHelper::attachEventBase(folly::EventBase* /* eventBase */) {}
 
 void FakePrivHelper::detachEventBase() {}
@@ -162,6 +168,11 @@ Future<Unit> FakePrivHelper::setFuseReadAhead(
       runtime_error("FakePrivHelper::setFuseReadAhead() not implemented"));
 }
 
+Future<Unit> FakePrivHelper::setNfsFstypeOverride(bool /* enabled */) {
+  return makeFuture<Unit>(
+      runtime_error("FakePrivHelper::setNfsFstypeOverride() not implemented"));
+}
+
 int FakePrivHelper::stop() {
   return 0;
 }
@@ -192,7 +203,8 @@ folly::Future<pid_t> FakePrivHelper::startFam(
     const std::vector<std::string>& /* paths */,
     const std::string& /* tmpOutputPath */,
     const std::string& /* specifiedOutputPath */,
-    const bool /* shouldUpload */) {
+    const bool /* shouldUpload */,
+    folly::File /* outputFile */) {
   return makeFuture<pid_t>(
       runtime_error("FakePrivHelper::startFam() not implemented"));
 }

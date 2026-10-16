@@ -13,6 +13,9 @@ cpp_library(
     srcs = [
         "EdenMain.cpp",
     ],
+    headers = [
+        "EdenMain.h",
+    ],
     deps = [
         "fbsource//third-party/fmt:fmt",
         ":init",
@@ -52,6 +55,7 @@ cpp_library(
         "ovr_config//os:linux": [
             "third-party//systemd:systemd",
             "//eden/fs/store/git:git",
+            "//eden/scm/lib/util/sigbus-memops:sigbus_memops",
         ],
     }),
     exported_deps = [
@@ -79,6 +83,9 @@ cpp_binary(
             "/STACK:2097152",  # This was picked arbitrarily as 2 MB
         ],
     }),
+    modifiers = [
+        "fbcode//eden/scm/lib/backingstore:edenfs-cas[enabled]",
+    ],
     deps = [
         ":main",
         ":server",
@@ -218,6 +225,9 @@ cpp_library(
     srcs = [
         "EdenInit.cpp",
     ],
+    headers = [
+        "EdenInit.h",
+    ],
     deps = [
         "//eden/common/utils:user_info",
         "//eden/fs:config",
@@ -232,6 +242,37 @@ cpp_library(
     ],
     exported_external_deps = [
         "gflags",
+    ],
+)
+
+cpp_library(
+    name = "cgroup_file_cache_reclaimer",
+    srcs = ["CgroupFileCacheReclaimer.cpp"],
+    headers = ["CgroupFileCacheReclaimer.h"],
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "//eden/common/utils:proc_mount_info",
+        "//folly:file",
+        "//folly:file_util",
+    ],
+)
+
+cpp_library(
+    name = "pin_scan_runner",
+    srcs = ["PinScanRunner.cpp"],
+    headers = ["PinScanRunner.h"],
+    deps = [
+        "//eden/common/utils:process",
+        "//folly:exception",
+        "//folly:scope_guard",
+        "//folly:string",
+        "//folly/logging:logging",
+    ],
+    exported_deps = [
+        "//eden/fs/privhelper:pin_scan",
+        "//eden/fs/telemetry:log_info",
+        "//folly:cancellation_token",
+        "//folly:expected",
     ],
 )
 
@@ -312,19 +353,6 @@ cpp_library(
 )
 
 cpp_library(
-    name = "usage_service",
-    srcs = [
-        "UsageService.cpp",
-    ],
-    deps = [
-        "//folly/logging:logging",
-    ],
-    exported_deps = [
-        "//folly/coro/safe:now_task",
-    ],
-)
-
-cpp_library(
     name = "server",
     srcs = [
         "EdenCPUThreadPool.cpp",
@@ -333,12 +361,25 @@ cpp_library(
         "EdenStateDir.cpp",
         "HeartbeatManager.cpp",
         "PeriodicTask.cpp",
+        "RestartArmer.cpp",
         "ThriftPermissionChecker.cpp",
+    ],
+    headers = [
+        "EdenCPUThreadPool.h",
+        "EdenServer.h",
+        "EdenServiceHandler.h",
+        "EdenStateDir.h",
+        "HeartbeatManager.h",
+        "PeriodicTask.h",
+        "RestartArmer.h",
+        "ThriftPermissionChecker.h",
     ],
     deps = [
         "fbsource//third-party/cpptoml:cpptoml",
         "fbsource//third-party/fmt:fmt",
         "fbsource//third-party/re2:re2",
+        ":cgroup_file_cache_reclaimer",
+        ":pin_scan_runner",
         ":startup_logger",
         ":startup_status_subscriber",
         ":thrift-streaming-cpp2-types",
@@ -346,7 +387,6 @@ cpp_library(
         ":thrift_glob_impl",
         ":thrift_startup_status_subscriber",
         ":thrift_util",
-        ":usage_service",
         "//common/fb303/cpp:thread_pool_executor_counters",  # @manual
         "//common/network:hostname",
         "//eden/common/telemetry:log_info",
@@ -371,16 +411,12 @@ cpp_library(
         "//eden/fs/notifications:command_notifier",
         "//eden/fs/notifications:notifier",
         "//eden/fs/notifications:null_notifier",
+        "//eden/fs/privhelper:pin_scan",
         "//eden/fs/privhelper:privhelper",
         "//eden/fs/prjfs:prjfs",
         "//eden/fs/rust/redirect_ffi:redirect-ffi",  # @manual
         "//eden/fs/rust/redirect_ffi:redirect-ffi-cpp-wrapper",
         "//eden/fs/rust/redirect_ffi:redirect-ffi@header",
-        # TODO: The edenfs_smartplatform_service dependency fans out to a ton
-        # of other dependencies, slowing down OSS builds and tests. We ideally
-        # should move it to facebook/main.cpp to avoid the cost in unit tests
-        # and OSS builds and tests.
-        "//eden/fs/service/facebook:edenfs_smartplatform_service",  # @manual
         "//eden/fs/service/facebook:server_observer",  # @manual
         "//eden/fs/store:context",
         "//eden/fs/store:filtered_backing_store",
@@ -408,8 +444,10 @@ cpp_library(
         "//eden/fs/utils:proc_util",
         "//eden/fs/utils:source_location",
         "//fb303:service_data",
+        "//fb303:thread_cached_service_data",
         "//folly:conv",
         "//folly:exception",
+        "//folly:exception_wrapper",
         "//folly:file_util",
         "//folly:indestructible",
         "//folly:random",
@@ -425,9 +463,10 @@ cpp_library(
         "//folly/executors:cpu_thread_pool_executor",
         "//folly/executors/thread_factory:named_thread_factory",
         "//folly/io/async:async_signal_handler",
+        "//folly/io/async:event_base_manager",
         "//folly/json:dynamic",
         "//folly/logging:logging",
-        "//folly/portability:sys_types",
+        "//folly/portability:fcntl",
         "//folly/portability:unistd",
         "//thrift/lib/cpp/concurrency:thread_manager",
         "//thrift/lib/cpp/util:enum_utils",
@@ -438,6 +477,9 @@ cpp_library(
         "//thrift/lib/cpp2/server:round_robin_request_pile",
     ] + select({
         "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "//eden/common/utils/facebook:process_attribution",  # @manual
+        ],
         "ovr_config//os:macos": [
             "//folly:subprocess",
         ],
@@ -478,7 +520,9 @@ cpp_library(
         "//folly/futures:core",
         "//folly/futures:shared_promise",
         "//folly/io/async:async_base",
+        "//folly/io/async:scoped_event_base_thread",
         "//folly/portability:sys_stat",
+        "//folly/portability:sys_types",
         "//folly/synchronization:lifo_sem",
         "//monitoring/obc:obc_lib",
         "//thrift/lib/cpp:event_handler_base",

@@ -74,7 +74,6 @@ from . import (
 )
 from .i18n import _, _n
 from .node import bin, hex, nullhex, nullid
-from .utils import subtreeutil
 
 release = lockmod.release
 urlerr = util.urlerr
@@ -486,11 +485,10 @@ class localrepository:
 
         cachepath = self.localvfs.join("cache")
         self.sharedpath = self.path
-        self.sharedroot = self.root
-        try:
-            sharedpath = self.localvfs.readutf8("sharedpath").rstrip("\n")
-            if "relshared" in self.requirements:
-                sharedpath = self.localvfs.join(sharedpath)
+        self.sharedroot = os.path.realpath(self._rsrepo.shared_root)
+        self.sharedvfs = self.localvfs
+        sharedpath = self._rsrepo.shared_dot_path
+        if sharedpath != self.path:
             sharedvfs = vfsmod.vfs(sharedpath, realpath=True)
             cachepath = sharedvfs.join("cache")
             s = sharedvfs.base
@@ -500,11 +498,6 @@ class localrepository:
                     % (identity.default().dotdir(), s)
                 )
             self.sharedpath = s
-            self.sharedroot = sharedvfs.dirname(s)
-            if os.path.basename(self.sharedroot) == ".git":
-                # dotgit: the shared dot dir is `<root>/.git/sl`, one level deeper
-                # than `<root>/.sl`. Match the Rust side's shared_path.
-                self.sharedroot = os.path.dirname(self.sharedroot)
             self.sharedvfs = sharedvfs
             # Read the requirements of the shared repo to make sure we
             # support them.
@@ -514,10 +507,6 @@ class localrepository:
                 if inst.errno != errno.ENOENT:
                     raise
             self.sharedvfs.audit = self._getvfsward(self.sharedvfs.audit)
-        except IOError as inst:
-            if inst.errno != errno.ENOENT:
-                raise
-            self.sharedvfs = self.localvfs
 
         self.store = store.store(
             self.requirements,
@@ -1338,6 +1327,7 @@ class localrepository:
         return bindings.copytrace.dagcopytrace(
             self.changelog.inner,
             self.manifestlog.datastore,
+            self._rsrepo,
             self.fileslog.filestore,
             self.changelog.dag,
             self.ui._rcfg,
@@ -1628,8 +1618,16 @@ class localrepository:
 
         This can be used for `log` operations.
         """
+        use_tree_manifest = self.ui.configbool(
+            "experimental", "pathhistory-treemanifest"
+        )
         hist = bindings.pathhistory.pathhistory(
-            nodes, paths, self.changelog.inner, self.manifestlog.datastore
+            nodes,
+            paths,
+            self.changelog.inner,
+            self.manifestlog.datastore,
+            self._rsrepo,
+            use_tree_manifest,
         )
         return hist
 
@@ -1639,8 +1637,16 @@ class localrepository:
         path can be either a file or a directory.
         nodes decides the search range (ex. "::." or "_firstancestors(.)")
         """
+        use_tree_manifest = self.ui.configbool(
+            "experimental", "pathhistory-treemanifest"
+        )
         return bindings.pathhistory.lastcreation(
-            nodes, path, self.changelog.inner, self.manifestlog.datastore
+            nodes,
+            path,
+            self.changelog.inner,
+            self.manifestlog.datastore,
+            self._rsrepo,
+            use_tree_manifest,
         )
 
     def publishing(self):
@@ -1781,14 +1787,10 @@ class localrepository:
         if tr is not None:
             return tr.nest(desc)
 
-        if not lockfree:
-            try:
-                self.svfs.stat("journal")
-            except FileNotFoundError:
-                # No existing transaction - this is the normal case.
-                pass
-            else:
-                self.recover()
+        # An existing journal means a previous transaction was interrupted.
+        # Lock-free transactions do not own the journal file.
+        if not lockfree and self.svfs.exists("journal"):
+            self.recover()
 
         idbase = b"%.40f#%f" % (random.random(), time.time())
         ha = hex(hashlib.sha1(idbase).digest())
@@ -1849,6 +1851,13 @@ class localrepository:
             heads = cl._visibleheads.heads
             draftheads = list(repo.dageval(lambda: heads - public()))
             cl._visibleheads.heads = draftheads
+
+            # Write a dirty dirstate as part of the transaction, before the
+            # metalog is written and exported (ex. to git refs), so working
+            # copy clients such as EdenFS or the git index see the parent
+            # change first.
+            if not tr.lockfree and not repo.dirstate.pendingparentchange():
+                repo.dirstate.write(tr)
 
             # Flush changelog before flushing metalog.
             _flushchangelog(repo)
@@ -1919,12 +1928,15 @@ class localrepository:
                 # In __del__, the repo is no longer valid.
                 return
             if success:
-                # this should be explicitly invoked here, because
-                # in-memory changes aren't written out at closing
-                # transaction, if tr.addfilegenerator (via
-                # dirstate.write or so) isn't invoked while
-                # transaction running
-                repo.dirstate.write(None)
+                # Lock-free transactions do not modify dirstate and might not
+                # hold the working copy lock required to write it.
+                if not tr.lockfree:
+                    # this should be explicitly invoked here, because
+                    # in-memory changes aren't written out at closing
+                    # transaction, if tr.addfilegenerator (via
+                    # dirstate.write or so) isn't invoked while
+                    # transaction running
+                    repo.dirstate.write(None)
                 repo._txnreleased = True
             else:
                 # discard all changes (including ones already written
@@ -1933,6 +1945,7 @@ class localrepository:
                     repo.dirstate.restorebackup(None, "journal.dirstate")
 
                 repo.invalidate(clearfilecache=True)
+                repo.invalidatemetalog()
 
         tr = transaction.transaction(
             rp,
@@ -1948,6 +1961,8 @@ class localrepository:
             uiconfig=self.ui.uiconfig(),
             desc=desc,
             lockfree=lockfree,
+            pendingroot=self.root,
+            sharedpendingroot=self.sharedroot,
         )
         tr.changes["nodes"] = []
         tr.changes["obsmarkers"] = set()
@@ -2012,7 +2027,12 @@ class localrepository:
 
                 repo.hook("txnclose", throw=False, txnname=desc, **hookargs)
 
-            reporef()._afterlock(hookfunc)
+            if tr2.lockfree:
+                # There is no lock to defer the hook through. Run it after the
+                # transaction has committed its final metalog root instead.
+                tr2.addpostclose("txnclose-hook", lambda _tr: hookfunc())
+            else:
+                reporef()._afterlock(hookfunc)
 
         tr.addfinalize("txnclose-hook", txnclosehook)
         tr.addpostclose("warms-cache", self._buildcacheupdater(tr))
@@ -2302,6 +2322,10 @@ class localrepository:
     def invalidatemetalog(self):
         """Invalidates the metalog. Discard pending changes."""
         self.svfs.invalidatemetalog()
+        # The bookmark store is changed in place while a transaction runs and
+        # only written to the metalog when it closes, so after a rollback its
+        # metalog cache key still matches and it has to be dropped explicitly.
+        self.__dict__.pop("_bookmarks", None)
 
     def invalidateall(self):
         """Fully invalidates both store and non-store parts, causing the
@@ -2844,11 +2868,6 @@ class localrepository:
             extra = ctx.extra().copy()
             if isgit:
                 git.update_extra_with_git_committer(self.ui, ctx, extra)
-
-            if subtreeutil.extra_contains_shallow_copy(extra):
-                # the file list can be large for a shallow copy, so don't
-                # put it in the files of commit text
-                files = []
 
             n = self.changelog.add(
                 mn,

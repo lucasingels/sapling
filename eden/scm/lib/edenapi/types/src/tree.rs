@@ -313,6 +313,11 @@ impl Arbitrary for TreeEntry {
     }
 }
 
+/// Number of keys in this HTTP request's `TreeRequest`, for both regular and
+/// augmented trees. Sent as an unsigned decimal integer so servers can perform
+/// admission checks before decoding the request body.
+pub const TREE_COUNT_HEADER: &str = "x-sapling-tree-count";
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeRequest {
@@ -424,6 +429,10 @@ pub struct CheckManifestPermissionResponse {
     // responses can expose every request ACL that covers the manifest.
     #[id(3)]
     pub request_acl: Option<String>,
+    /// Repo-configured text to show with the denial. Present only when
+    /// has_access is false and the repo configures one.
+    #[id(4)]
+    pub denial_message: Option<String>,
 }
 
 #[auto_wire]

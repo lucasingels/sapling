@@ -6,6 +6,7 @@
  */
 
 import type {Json} from 'shared/typeUtils';
+import type {MessageBus} from '../MessageBus';
 import type {Platform} from '../platform';
 import type {OneIndexedLineNumber, PlatformName, RepoRelativePath} from '../types';
 
@@ -15,7 +16,7 @@ import {computeInitialParams} from '../urlParams';
 // important: this file should not try to import other code from 'isl',
 // since it will end up getting duplicated when bundling.
 
-export function browserClipboardCopy(text: string, html?: string) {
+export function browserClipboardCopy(text: string, html?: string): Promise<void> {
   if (html) {
     const htmlBlob = new Blob([html], {type: 'text/html'});
     const textBlob = new Blob([text], {type: 'text/plain'});
@@ -23,19 +24,24 @@ export function browserClipboardCopy(text: string, html?: string) {
       'text/html': htmlBlob,
       'text/plain': textBlob,
     });
-    navigator.clipboard.write([clipboardItem]);
+    return navigator.clipboard.write([clipboardItem]);
   } else {
-    navigator.clipboard.writeText(text);
+    return navigator.clipboard.writeText(text);
   }
 }
 
-export const makeBrowserLikePlatformImpl = (platformName: PlatformName): Platform => {
+export const makeBrowserLikePlatformImpl = (
+  platformName: PlatformName,
+  sourceUrl?: URL,
+  messageBus?: MessageBus,
+): Platform => {
   // Extract extra cwds before computeInitialParams clears the URL
-  const extraCwds =
-    typeof window !== 'undefined' && window.location.search
-      ? new URLSearchParams(window.location.search).getAll('extraCwd')
-      : [];
-  const initialUrlParams = computeInitialParams(platformName === 'browser');
+  const search = sourceUrl?.search ?? (typeof window !== 'undefined' ? window.location.search : '');
+  const extraCwds = search.length > 0 ? new URLSearchParams(search).getAll('extraCwd') : [];
+  const initialUrlParams =
+    sourceUrl == null
+      ? computeInitialParams(platformName === 'browser')
+      : new Map(sourceUrl.searchParams.entries());
   return {
     platformName,
     confirm: (message: string, details?: string) => {
@@ -105,22 +111,24 @@ export const makeBrowserLikePlatformImpl = (platformName: PlatformName): Platfor
 
     clipboardCopy: browserClipboardCopy,
 
-    messageBus: new LocalWebSocketEventBus(
-      process.env.NODE_ENV === 'development'
-        ? // in dev mode, Vite hosts our files for hot-reloading.
-          // This means we can't host the ws server on the same port as the page.
-          'localhost:3001'
-        : // in production, we serve both the static files and ws from the same port
-          location.host,
-      WebSocket,
-      {
-        cwd: initialUrlParams.get('cwd'),
-        extraCwds: extraCwds.length > 0 ? extraCwds : undefined,
-        sessionId: initialUrlParams.get('sessionId'),
-        token: initialUrlParams.get('token'),
-        platformName,
-      },
-    ),
+    messageBus:
+      messageBus ??
+      new LocalWebSocketEventBus(
+        process.env.NODE_ENV === 'development'
+          ? // in dev mode, Vite hosts our files for hot-reloading.
+            // This means we can't host the ws server on the same port as the page.
+            'localhost:3001'
+          : // in production, we serve both the static files and ws from the same port
+            location.host,
+        WebSocket,
+        {
+          cwd: initialUrlParams.get('cwd'),
+          extraCwds: extraCwds.length > 0 ? extraCwds : undefined,
+          sessionId: initialUrlParams.get('sessionId'),
+          token: initialUrlParams.get('token'),
+          platformName,
+        },
+      ),
 
     initialUrlParams,
   };

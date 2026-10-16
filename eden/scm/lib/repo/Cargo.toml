@@ -15,10 +15,11 @@ name = "repo"
 [dependencies]
 anyhow = "1.0.104"
 fail = { version = "0.5.1", features = ["failpoints"] }
-fs-err = { version = "3.3.1", features = ["tokio"] }
+fs-err = { version = "3.3.2", features = ["tokio"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 sapling-agentdetect = { version = "0.1.0", path = "../agentdetect" }
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
+sapling-cas-client = { version = "0.1.0", path = "../cas-client" }
 sapling-commits = { version = "0.1.0", path = "../commits" }
 sapling-commits-trait = { version = "0.1.0", path = "../commits/trait" }
 sapling-configloader = { version = "0.1.0", path = "../config/loader" }
@@ -50,7 +51,7 @@ sapling-types = { version = "0.1.0", path = "../types" }
 sapling-util = { version = "0.1.0", path = "../util" }
 sapling-win32-8dot3 = { version = "0.1.0", path = "../util/win32-8dot3" }
 sapling-workingcopy = { version = "0.1.0", path = "../workingcopy", optional = true }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

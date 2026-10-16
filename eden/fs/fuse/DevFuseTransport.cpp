@@ -12,9 +12,15 @@
 #include "eden/common/utils/SystemError.h"
 #include "eden/fs/fuse/FuseChannel.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
+#include <folly/portability/Asm.h>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
+#include <cerrno>
+#include <chrono>
 #include <limits>
 
 namespace facebook::eden {
@@ -32,15 +38,126 @@ ssize_t DevFuseTransport::readInitPacket(int fd, void* buf, size_t size) const {
 }
 
 void DevFuseTransport::processSession(FuseChannel& channel) {
+  processSession(channel, -1, [] {});
+}
+
+void DevFuseTransport::processSession(
+    FuseChannel& channel,
+    int stopFd,
+    folly::FunctionRef<void()> onReady) {
   std::vector<char> buf(channel.getTransportBufferSize());
+  const auto fuseFd = channel.getFuseDeviceFd();
+  auto fcntlRetry = [fuseFd](int command, int flags = 0) {
+    int result;
+    do {
+      result = fcntl(fuseFd, command, flags);
+    } while (result < 0 && errno == EINTR);
+    return result;
+  };
+  int originalFlags = -1;
+  SCOPE_EXIT {
+    if (originalFlags >= 0 && fcntlRetry(F_SETFL, originalFlags) < 0) {
+      XLOGF(
+          ERR,
+          "failed to restore FUSE device flags after companion reader: {}",
+          folly::errnoStr(errno));
+    }
+  };
+  if (stopFd >= 0) {
+    const auto flags = fcntlRetry(F_GETFL);
+    if (flags < 0) {
+      folly::throwSystemError("failed to read FUSE device flags");
+    }
+    // poll readiness can disappear before read(), including when the kernel
+    // removes an interrupted request. The read must not block after a stop.
+    if (fcntlRetry(F_SETFL, flags | O_NONBLOCK) < 0) {
+      folly::throwSystemError(
+          "failed to make companion FUSE reader nonblocking");
+    }
+    originalFlags = flags;
+  }
   // Save this for the sanity check later in the loop to avoid
   // additional syscalls on each loop iteration.
   auto myPid = getpid();
+  const auto busyPoll = channel.getBusyPoll();
+  auto& lastDispatchEndNs = channel.lastDispatchEndNs();
+  const auto nowNs = [] {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  // Poll only while a client is streaming requests: the request just served
+  // has to have arrived within the poll window of the previous reply. A
+  // sporadic request therefore costs a blocking read, not a spin.
+  bool pollNext = false;
+  onReady();
 
   while (!channel.isStopRequested()) {
+    // Under io_uring the companion reader (stopFd >= 0) only sees what the
+    // kernel still sends over /dev/fuse, such as FORGET, so it is not polled.
+    if (pollNext && stopFd < 0) {
+      // A serial client sends its next request microseconds after the
+      // reply; polling for it briefly serves it without the sleep and
+      // cross-CPU wakeup that a blocking read costs.
+      // Each poll() takes the FUSE queue's spinlock, the same lock the
+      // client's enqueue needs, so pause about a microsecond between polls
+      // rather than hammering it.
+      constexpr int kPausesBetweenPolls = 50;
+      const auto deadline = std::chrono::steady_clock::now() + busyPoll;
+      pollfd pfd{fuseFd, POLLIN, 0};
+      while (poll(&pfd, 1, 0) == 0 &&
+             std::chrono::steady_clock::now() < deadline &&
+             !channel.isStopRequested()) {
+        for (int i = 0; i < kPausesBetweenPolls; ++i) {
+          folly::asm_volatile_pause();
+        }
+      }
+    }
+    pollNext = false;
+    if (stopFd >= 0) {
+      pollfd fds[] = {{fuseFd, POLLIN, 0}, {stopFd, POLLIN, 0}};
+      if (poll(fds, 2, -1) < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        folly::throwSystemError("failed to poll companion FUSE reader");
+      }
+      if (channel.isStopRequested()) {
+        break;
+      }
+      if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        throw std::runtime_error("companion FUSE reader wakeup fd failed");
+      }
+      if (fds[1].revents & POLLIN) {
+        uint64_t value;
+        ssize_t result;
+        do {
+          result = read(stopFd, &value, sizeof(value));
+        } while (result < 0 && errno == EINTR);
+        if (result < 0 && errno != EAGAIN) {
+          folly::throwSystemError("failed to drain companion FUSE wakeup fd");
+        }
+        if (result >= 0 && static_cast<size_t>(result) != sizeof(value)) {
+          throw std::runtime_error("short read from companion FUSE wakeup fd");
+        }
+      }
+      if (fds[0].revents & POLLNVAL) {
+        folly::throwSystemErrorExplicit(
+            EBADF, "invalid device fd for companion FUSE reader");
+      }
+      if (!(fds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+        continue;
+      }
+    }
+    // A stop requested while polling above, such as takeover's SIGUSR2, has
+    // already been handled and another wakeup is not guaranteed, so do not
+    // block in read() after it.
+    if (channel.isStopRequested()) {
+      break;
+    }
     // TODO: FUSE_SPLICE_READ allows using splice(2) here if we enable it.
     // We can look at turning this on once the main plumbing is complete.
-    auto res = read(channel.getFuseDeviceFd(), buf.data(), buf.size());
+    auto res = read(fuseFd, buf.data(), buf.size());
     if (res < 0) {
       int error = errno;
       if (channel.isStopRequested()) {
@@ -98,7 +215,16 @@ void DevFuseTransport::processSession(FuseChannel& channel) {
         reinterpret_cast<const uint8_t*>(header + 1),
         argSize - sizeof(fuse_in_header)};
 
-    channel.dispatchRequestFromTransport(*header, arg, myPid);
+    // A successfully dequeued FORGET cannot be retried, even if stop raced
+    // with read(). Dispatch it before leaving the reader.
+    if (busyPoll.count() > 0) {
+      const auto last = lastDispatchEndNs.load(std::memory_order_relaxed);
+      pollNext = last != 0 && nowNs() - last <= busyPoll.count();
+    }
+    channel.dispatchRequestFromTransport(*this, *header, arg, myPid);
+    if (busyPoll.count() > 0) {
+      lastDispatchEndNs.store(nowNs(), std::memory_order_relaxed);
+    }
   }
 }
 

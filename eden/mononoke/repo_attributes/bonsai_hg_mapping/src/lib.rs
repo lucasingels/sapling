@@ -31,7 +31,6 @@ use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
 use rendezvous::RendezVousStats;
-use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sql_construct::SqlConstruct;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
@@ -50,7 +49,7 @@ mod mem_writes_bonsai_hg_mapping;
 use futures::FutureExt;
 
 pub use crate::caching::CachingBonsaiHgMapping;
-pub use crate::errors::ErrorKind;
+pub use crate::errors::BonsaiHgMappingError;
 pub use crate::mem_writes_bonsai_hg_mapping::MemWritesBonsaiHgMapping;
 
 define_stats! {
@@ -465,12 +464,12 @@ impl SqlBonsaiHgMapping {
 
         match by_hg_rows.into_iter().chain(by_bcs_rows).next() {
             Some(entry) if entry == (hg_cs_id, bcs_id) => Ok(()),
-            Some((hg_cs_id, bcs_id)) => Err(ErrorKind::ConflictingEntries(
+            Some((hg_cs_id, bcs_id)) => Err(BonsaiHgMappingError::ConflictingEntries(
                 BonsaiHgMappingEntry { hg_cs_id, bcs_id },
                 entry,
             )
             .into()),
-            None => Err(ErrorKind::RaceConditionWithDelete(entry).into()),
+            None => Err(BonsaiHgMappingError::RaceConditionWithDelete(entry).into()),
         }
     }
 
@@ -630,9 +629,9 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
             };
         };
 
-        let res = timed_res.log_future_stats(ctx.scuba().clone(), "Get BonsaiHgMapping", None);
+        let res = timed_res.1;
 
-        // Log reads to the dedicated table (see `with_scuba`) too, so both
+        // Log reads to the dedicated table (see `with_scuba`), so both
         // sides of the mapping are attributable there.
         let mut scuba = self.scuba.clone();
         scuba.add_metadata(ctx.metadata());

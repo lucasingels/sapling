@@ -5,16 +5,14 @@
  * GNU General Public License version 2.
  */
 
-mod errors;
-
 use anyhow::Error;
+use anyhow::anyhow;
 use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use blobstore::LoadableError;
 use bytes::BytesMut;
 use cas_client::CasClient;
 use context::CoreContext;
-pub use errors::ErrorKind;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
@@ -22,6 +20,7 @@ use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgFileNodeId;
 use mononoke_types::ContentId;
 use mononoke_types::MononokeDigest;
+use redactedblobstore::has_redaction_root_cause;
 use stats::prelude::*;
 
 define_stats! {
@@ -42,6 +41,7 @@ const SMALL_BLOBS_THRESHOLD: u64 = 2_621_440;
 pub enum UploadOutcome {
     Uploaded(u64),
     AlreadyPresent,
+    Redacted,
 }
 
 pub struct ScmCasClient<Client>
@@ -81,7 +81,11 @@ where
     ) -> Result<MononokeDigest, Error> {
         let meta = filestore::get_metadata(blobstore, ctx, &content_id.to_owned().into())
             .await?
-            .ok_or(ErrorKind::ContentMissingInBlobstore(content_id.clone()))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to fetch metadata or blob for the following Mononoke Content Id: {content_id}"
+                )
+            })?;
         Ok(MononokeDigest(meta.seeded_blake3, meta.total_size))
     }
 
@@ -92,9 +96,19 @@ where
         content_id: ContentId,  // for fetching
         digest: MononokeDigest, // for uploading
     ) -> Result<UploadOutcome, Error> {
-        let stream = filestore::fetch(blobstore.clone(), ctx, &content_id.into())
-            .await?
-            .ok_or(ErrorKind::MissingInBlobstore(content_id))?;
+        // Redaction has to be detected here: the CAS client re-wraps upload errors as strings,
+        // so the `RedactionError` root cause is lost once the upload fails.
+        let stream = match filestore::fetch(blobstore.clone(), ctx, &content_id.into()).await {
+            Err(e) if has_redaction_root_cause(&e).is_some() => {
+                return Ok(UploadOutcome::Redacted);
+            }
+            res => res?,
+        }
+        .ok_or_else(|| {
+            anyhow!(
+                "The following Mononoke Content Id is unexpectedly missing in the blobstore: {content_id}"
+            )
+        })?;
         if digest.1 <= MAX_BYTES_FOR_INLINE_UPLOAD {
             let bytes_to_upload = stream.try_collect::<BytesMut>().await?;
             self.client

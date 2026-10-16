@@ -29,7 +29,6 @@ use commit_transformation::create_source_to_target_multi_mover;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
-use fsnodes::RootFsnodeId;
 use futures::StreamExt;
 use futures::TryFutureExt;
 use futures::TryStreamExt;
@@ -70,8 +69,6 @@ use mononoke_types::FileType;
 use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
-use mononoke_types::content_manifest::compat::ContentManifestFile;
-use mononoke_types::content_manifest::compat::ContentManifestId;
 use mononoke_types::path::MPath;
 use repo_authorization::AuthorizationContext;
 use sorted_vector_map::SortedVectorMap;
@@ -414,29 +411,15 @@ pub trait MegarepoOp<R> {
     where
         R: Repo,
     {
-        let root_id: ContentManifestId = if justknobs::eval(
-            "scm/mononoke:derived_data_use_content_manifests",
-            None,
-            Some(repo.repo_identity().name()),
-        ) {
-            repo.repo_derived_data()
-                .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
-                .await
-                .map_err(Error::from)?
-                .into_content_manifest_id()
-                .into()
-        } else {
-            repo.repo_derived_data()
-                .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-                .await
-                .map_err(Error::from)?
-                .into_fsnode_id()
-                .into()
-        };
+        let root_id = repo
+            .repo_derived_data()
+            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+            .await
+            .map_err(Error::from)?
+            .into_content_manifest_id();
 
         let entries = root_id
             .list_leaf_entries(ctx.clone(), repo.repo_blobstore().clone())
-            .map_ok(|(path, file)| (path, ContentManifestFile(file)))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -452,9 +435,9 @@ pub trait MegarepoOp<R> {
 
             file_changes.extend(moved.into_iter().map(|target| {
                 let fc = FileChange::tracked(
-                    file.content_id(),
-                    file.file_type(),
-                    file.size(),
+                    file.content_id,
+                    file.file_type,
+                    file.size,
                     Some((path.clone(), cs_id)),
                     GitLfs::FullContent,
                 );
@@ -1291,6 +1274,15 @@ pub async fn save_sync_target_config_in_changeset(
     Ok(())
 }
 
+/// The override set by a numeric knob, or `None` when the knob is 0 or less.
+fn override_from_knob<T: TryFrom<i64>>(value: i64) -> Option<T> {
+    if value > 0 {
+        T::try_from(value).ok()
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn derive_all_types_locally(
     ctx: &CoreContext,
     repo: &impl Repo,
@@ -1303,9 +1295,10 @@ pub(crate) async fn derive_all_types_locally(
     )
     .max(1) as usize;
 
-    let override_batch_size = Some(
-        justknobs::get("scm/mononoke:megarepo_override_derivation_batch_size", None).max(1) as u64,
-    );
+    let override_batch_size = override_from_knob(justknobs::get(
+        "scm/mononoke:megarepo_override_derivation_batch_size",
+        None,
+    ));
 
     for chunk in csids.chunks(num_heads_to_derive_at_once) {
         retry(
@@ -1356,13 +1349,10 @@ pub(crate) async fn derive_all_types_remotely(
     )
     .max(1) as usize;
 
-    let override_concurrency = Some(
-        justknobs::get(
-            "scm/mononoke:megarepo_override_remote_derivation_concurrency",
-            None,
-        )
-        .max(1) as usize,
-    );
+    let override_concurrency = override_from_knob(justknobs::get(
+        "scm/mononoke:megarepo_override_remote_derivation_concurrency",
+        None,
+    ));
 
     let manager = repo
         .repo_derived_data()
@@ -1432,6 +1422,18 @@ mod test {
     use mononoke_macros::mononoke;
 
     use super::*;
+
+    #[mononoke::test]
+    fn test_override_from_knob() {
+        assert_eq!(override_from_knob::<u64>(0), None, "0 means no override");
+        assert_eq!(
+            override_from_knob::<u64>(-3),
+            None,
+            "negative means no override"
+        );
+        assert_eq!(override_from_knob::<u64>(1), Some(1));
+        assert_eq!(override_from_knob::<usize>(20), Some(20));
+    }
 
     #[mononoke::test]
     fn test_create_relative_symlink() -> Result<(), Error> {

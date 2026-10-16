@@ -12,11 +12,13 @@
 #include <folly/test/TestUtils.h>
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
+#include <chrono>
 #include <optional>
 
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/PathFuncs.h"
+#include "eden/fs/config/MinVersionGate.h"
 #include "eden/fs/config/TomlFileConfigSource.h"
 
 using folly::test::TemporaryDirectory;
@@ -94,6 +96,10 @@ class EdenConfigTest : public ::testing::Test {
     auto userConfigFileData = folly::StringPiece{
         "[core]\n"
         "ignoreFile=\"${HOME}/${USER}/userCustomIgnore\"\n"
+        "enable-cgroup-file-cache-reclaim=true\n"
+        "cgroup-file-cache-target-bytes=\"123456\"\n"
+        "cgroup-file-cache-max-reclaim-bytes=\"654321\"\n"
+        "cgroup-file-cache-reclaim-interval=\"3s\"\n"
         "[mononoke]\n"
         "use-mononoke=\"false\"\n"
         "[daemon]\n"
@@ -169,6 +175,17 @@ TEST_F(EdenConfigTest, defaultTest) {
   EXPECT_EQ(
       edenConfig->daemonEnvironment.getValue(), std::vector<std::string>{});
   EXPECT_EQ(edenConfig->prefetchBlobBatchSize.getValue(), 4096);
+  EXPECT_TRUE(edenConfig->overlayUseWal.getValue());
+  EXPECT_FALSE(edenConfig->enableCgroupFileCacheReclaim.getValue());
+  EXPECT_EQ(
+      10ULL * 1024 * 1024 * 1024,
+      edenConfig->cgroupFileCacheTargetBytes.getValue());
+  EXPECT_EQ(
+      10ULL * 1024 * 1024 * 1024,
+      edenConfig->cgroupFileCacheMaxReclaimBytes.getValue());
+  EXPECT_EQ(
+      std::chrono::seconds{10},
+      edenConfig->cgroupFileCacheReclaimInterval.getValue());
 }
 
 TEST_F(EdenConfigTest, simpleSetGetTest) {
@@ -434,6 +451,12 @@ TEST_F(EdenConfigTest, loadSystemDynamicUserConfigTest) {
       edenConfig->daemonEnvironment.getValue(),
       std::vector<std::string>{"TEST_NAME=test_value"});
   EXPECT_EQ(edenConfig->prefetchBlobBatchSize.getValue(), 123);
+  EXPECT_TRUE(edenConfig->enableCgroupFileCacheReclaim.getValue());
+  EXPECT_EQ(123456, edenConfig->cgroupFileCacheTargetBytes.getValue());
+  EXPECT_EQ(654321, edenConfig->cgroupFileCacheMaxReclaimBytes.getValue());
+  EXPECT_EQ(
+      std::chrono::seconds{3},
+      edenConfig->cgroupFileCacheReclaimInterval.getValue());
 }
 
 TEST_F(EdenConfigTest, nonExistingConfigFiles) {
@@ -538,6 +561,70 @@ TEST_F(EdenConfigTest, variablesExpandInPathOptions) {
   EXPECT_EQ(
       getConfig().userIgnoreFile.getValue(),
       canonicalPath("/var/user/edenTest/myignore"));
+}
+
+TEST_F(EdenConfigTest, minVersionGatedEntries) {
+  auto systemConfigDir = rootTestDir_ + "etc-eden-gated"_pc;
+  ensureDirectoryExists(systemConfigDir);
+  auto dynamicConfigPath = systemConfigDir + "edenfs_dynamic.rc"_pc;
+
+  auto loadMinimumItems = [&](std::string_view contents,
+                              std::optional<EdenVersion> buildVersion) {
+    writeFile(dynamicConfigPath, folly::ByteRange{folly::StringPiece{contents}})
+        .value();
+    EdenConfig edenConfig{
+        getDefaultVariables(),
+        testHomeDir_,
+        systemConfigDir,
+        EdenConfig::SourceVector{std::make_shared<TomlFileConfigSource>(
+            dynamicConfigPath, ConfigSourceType::Dynamic, buildVersion)}};
+    return edenConfig.inMemoryTreeCacheMinimumItems.getValue();
+  };
+
+  constexpr std::string_view kTieredConfig =
+      "[treecache]\n"
+      "minimum-items = \"32\"\n"
+      "\"minimum-items@min-version=20260901\" = \"64\"\n"
+      "\"minimum-items@min-version=20270101-120000\" = \"128\"\n";
+
+  // The highest satisfied gate wins over lower gates and the plain entry.
+  EXPECT_EQ(loadMinimumItems(kTieredConfig, EdenVersion{20260915, 81814}), 64);
+  EXPECT_EQ(
+      loadMinimumItems(kTieredConfig, EdenVersion{20270101, 120000}), 128);
+  // A gate is inclusive.
+  EXPECT_EQ(loadMinimumItems(kTieredConfig, EdenVersion{20260901, 0}), 64);
+  // Nothing satisfied leaves the plain entry.
+  EXPECT_EQ(loadMinimumItems(kTieredConfig, EdenVersion{20250101, 0}), 32);
+  // A dev build is newer than any release.
+  EXPECT_EQ(loadMinimumItems(kTieredConfig, std::nullopt), 128);
+  // An unparsable build version is reported as 0 and satisfies nothing.
+  EXPECT_EQ(loadMinimumItems(kTieredConfig, EdenVersion{}), 32);
+
+  // Without a plain entry an unsatisfied gate falls through to the default.
+  EXPECT_EQ(
+      loadMinimumItems(
+          "[treecache]\n"
+          "\"minimum-items@min-version=20270101\" = \"128\"\n",
+          EdenVersion{20260915, 0}),
+      defaultTreeCacheMinimumItems_);
+
+  // A malformed gate is ignored rather than applied ungated.
+  EXPECT_EQ(
+      loadMinimumItems(
+          "[treecache]\n"
+          "minimum-items = \"32\"\n"
+          "\"minimum-items@min-version=bogus\" = \"999\"\n",
+          std::nullopt),
+      32);
+
+  // A gated key for an unknown setting is skipped like any unknown key.
+  EXPECT_EQ(
+      loadMinimumItems(
+          "[treecache]\n"
+          "\"no-such-setting@min-version=20200101\" = \"1\"\n"
+          "minimum-items = \"32\"\n",
+          std::nullopt),
+      32);
 }
 
 TEST_F(EdenConfigTest, missing_config_files_never_change) {

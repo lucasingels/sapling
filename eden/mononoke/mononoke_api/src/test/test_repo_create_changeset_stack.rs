@@ -1057,3 +1057,61 @@ async fn test_create_changeset_file_type_explicit_override(fb: FacebookInit) -> 
 
     Ok(())
 }
+
+#[mononoke::fbinit_test]
+async fn test_create_commit_stack_noop_check_file_readded_after_dir_replaced(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+    let (test_repo, commits, _) = Linear::get_repo_and_dag(fb).await;
+    let mononoke = Mononoke::new_test(vec![("test".to_string(), test_repo)]).await?;
+    let repo = mononoke
+        .repo(ctx.clone(), "test")
+        .await?
+        .expect("repo exists")
+        .build()
+        .await?;
+
+    // The base commit has the file `d/x`.
+    let base = create_changeset_stack(
+        &repo,
+        vec![btreemap! {
+            MPath::try_from("d/x")? =>
+            CreateChange::Tracked(CreateChangeFile::new_regular("content\n"), None),
+        }],
+        vec![commits["K"]],
+    )
+    .await?
+    .pop()
+    .expect("commit created")
+    .id();
+
+    // C1 replaces directory `d` with a file, implicitly deleting `d/x`.
+    // C2 deletes file `d` and re-adds `d/x` with the same content as the base.
+    let changes_stack = vec![
+        btreemap! {
+            MPath::try_from("d")? =>
+            CreateChange::Tracked(CreateChangeFile::new_regular("file d\n"), None),
+        },
+        btreemap! {
+            MPath::try_from("d")? => CreateChange::Deletion,
+            MPath::try_from("d/x")? =>
+            CreateChange::Tracked(CreateChangeFile::new_regular("content\n"), None),
+        },
+    ];
+
+    // `d/x` in C2 is a real change (C1 implicitly deleted it), so Check mode accepts
+    // the stack and C2 re-adds the file.
+    let created = create_changeset_stack(&repo, changes_stack.clone(), vec![base]).await?;
+    assert_eq!(created.len(), 2);
+    assert!(created[0].path_with_content("d").await?.is_file().await?);
+    assert!(!created[0].path_with_content("d/x").await?.exists().await?);
+    assert!(created[1].path_with_content("d/x").await?.is_file().await?);
+
+    // Fix mode keeps the change as well.
+    let created = create_changeset_stack_fix_request(&repo, changes_stack, vec![base]).await?;
+    assert_eq!(created.len(), 2);
+    assert!(created[1].path_with_content("d/x").await?.is_file().await?);
+
+    Ok(())
+}

@@ -123,7 +123,8 @@ use super::SaplingRemoteApiHandler;
 use super::SaplingRemoteApiMethod;
 use super::handler::SaplingRemoteApiContext;
 use crate::context::ServerContext;
-use crate::errors::ErrorKind;
+use crate::errors::MononokeErrorExt;
+use crate::errors::SaplingRemoteApiServiceError;
 use crate::handlers::git_objects::fetch_git_object;
 use crate::utils::build_counter;
 use crate::utils::cbor_stream_filtered_errors;
@@ -166,7 +167,7 @@ async fn translate_location<R: MononokeRepo>(
         SlapiCommitIdentityScheme::Hg => hg_repo_ctx
             .location_to_hg_changeset_id(location, request.count)
             .await
-            .context(ErrorKind::CommitLocationToHashRequestFailed)?,
+            .context(SaplingRemoteApiServiceError::CommitLocationToHashRequestFailed)?,
         SlapiCommitIdentityScheme::Git => {
             let repo_ctx = hg_repo_ctx.repo_ctx();
             // TODO(mbthomas): This is a working around HgId/HgChangesetId not being "generic".
@@ -180,7 +181,7 @@ async fn translate_location<R: MononokeRepo>(
                     request.count,
                 )
                 .await
-                .context(ErrorKind::CommitLocationToHashRequestFailed)?
+                .context(SaplingRemoteApiServiceError::CommitLocationToHashRequestFailed)?
                 .into_iter()
                 .map(|id| {
                     HgChangesetId::new(HgNodeHash::new(Sha1::from_byte_array(id.into_inner())))
@@ -463,8 +464,8 @@ async fn commit_revlog_data<R: MononokeRepo>(
     let bytes = hg_repo_ctx
         .revlog_commit_data(hg_id.into())
         .await
-        .context(ErrorKind::CommitRevlogDataRequestFailed)?
-        .ok_or(ErrorKind::HgIdNotFound(hg_id))?;
+        .context(SaplingRemoteApiServiceError::CommitRevlogDataRequestFailed)?
+        .ok_or(SaplingRemoteApiServiceError::HgIdNotFound(hg_id))?;
     let answer = CommitRevlogData::new(hg_id, bytes.into());
     Ok(answer)
 }
@@ -536,6 +537,10 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        // Commit-cloud sync uploads drafts here before touching workspace refs.
+        if let Err(err) = repo.repo_ctx().ensure_commit_cloud_writable() {
+            return Err(HttpError::e400(err).into());
+        }
         let changesets = request.changesets;
 
         let ctx = repo.ctx().clone();
@@ -563,7 +568,11 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
 
         let stored = repo
             .store_hg_changesets(changesets_data, mutation_data)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                MononokeError::InvalidRequest(_) => e.into_http_error("invalid changeset upload"),
+                e => HttpError::e500(e),
+            })?;
 
         // Safe to derive now: with bonsai=None, store_hg_changesets already wrote
         // the mapping (via CreateChangeset), so no conflicting hg id is re-derived.
@@ -602,6 +611,10 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        // Commit-cloud sync uploads drafts here before touching workspace refs.
+        if let Err(err) = repo.repo_ctx().ensure_commit_cloud_writable() {
+            return Err(HttpError::e400(err).into());
+        }
         let query = ectx.query();
         let bubble_id = query.bubble_id.map(BubbleId::new);
         let cs = request.changeset;

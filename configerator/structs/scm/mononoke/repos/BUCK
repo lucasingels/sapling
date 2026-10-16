@@ -7,12 +7,9 @@ thrift_library(
     languages = [
         "python",
         "rust",
-        "py-deprecated",
     ],
     py3_namespace = "mononoke.repos",
-    py_base_module = "configerator.mononoke",
     rust_autocargo = {"cargo_toml_dir": "repos"},
-    thrift_py_options = "json",
     thrift_rust_options = [
         "deprecated_default_enum_min_i32",
         "serde",
@@ -20,6 +17,7 @@ thrift_library(
     thrift_srcs = {"repos.thrift": None},
     deps = [
         "//thrift/annotation:rust",
+        "//thrift/annotation:thrift",
     ],
 )
 
@@ -36,5 +34,6 @@ thrift_library(
     deps = [
         ":repos",
         "//thrift/annotation:rust",
+        "//thrift/annotation:thrift",
     ],
 )
