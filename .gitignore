@@ -20,3 +20,6 @@ bin
 
 # Editor tooling
 /tombi.toml
+
+# Agent worktrees; never part of the tree.
+/.claude/worktrees/
