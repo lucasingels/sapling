@@ -44,6 +44,7 @@ from . import (
     tracing,
     ui as uimod,
     util,
+    worktreestale,
 )
 from .i18n import _, _x
 
@@ -1068,6 +1069,7 @@ def _dispatch(req):
             ui.log("command", "%s\n", msg)
             if repo:
                 repo.dirstate.loginfo(ui, "pre")
+                worktreestale.checkstale(ui, repo, cmd)
             strcmdopt = cmdoptions
             d = lambda: util.checksignature(func)(ui, *args, **strcmdopt)
             ret = runcommand(

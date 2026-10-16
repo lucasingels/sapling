@@ -1031,6 +1031,13 @@ def cleanupnodes(repo, replacements, operation, moves=None, metadata=None):
             }
         )
 
+    if any(replacements.values()):
+        from . import worktreestale  # avoid import cycle
+
+        worktreestale.scheduleafterrewrite(
+            repo, [old for old, new in replacements.items() if new]
+        )
+
     return moves
 
 

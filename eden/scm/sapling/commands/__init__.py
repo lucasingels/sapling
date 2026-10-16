@@ -70,6 +70,7 @@ from .. import (
     templater,
     ui as uimod,
     util,
+    worktreestale,
 )
 from ..i18n import _
 from ..node import hex, nullid, short
@@ -6413,6 +6414,27 @@ def update(
             mergemod.try_conclude_merge_state(repo)
 
         return result
+
+
+@command("update-stale", [])
+def updatestale(ui, repo):
+    """move a stale worktree onto the latest versions of its commits
+
+    A checkout of a git worktree group is stale once another checkout rewrites
+    the commit it has checked out, or a commit below it. Commands that would
+    build on, rewrite or publish the stale commits refuse to run there until
+    it is updated (see ``worktree.stale-blocked-commands``).
+
+    This moves the working copy to the latest version of its commit and
+    restacks its own commits onto the latest versions of the ones below,
+    carrying uncommitted changes along.
+
+    Set ``worktree.auto-update-stale=true`` to update a stale checkout
+    automatically whenever a command runs in it.
+
+    Returns 0 on success.
+    """
+    return worktreestale.updatestale(ui, repo)
 
 
 @command(
