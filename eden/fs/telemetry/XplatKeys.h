@@ -64,11 +64,16 @@ inline constexpr std::string_view kRepoSource = "repo_source";
 inline constexpr std::string_view kError = "error";
 inline constexpr std::string_view kInterface = "interface";
 inline constexpr std::string_view kActionType = "action_type";
+inline constexpr std::string_view kLoggedBy = "logged_by";
+inline constexpr std::string_view kAgenticFingerprintId =
+    "agentic_fingerprint_id";
+inline constexpr std::string_view kAgenticFingerprintInvocationId =
+    "agentic_fingerprint_invocation_id";
 
 // --- Fsck ---
 inline constexpr std::string_view kAttemptedRepair = "attempted_repair";
 
-// --- Glob events (StarGlob, SuffixGlob, ExpensiveGlob) ---
+// --- Glob events (StarGlob, ExpensiveGlob) ---
 inline constexpr std::string_view kGlobRequest = "glob_request";
 inline constexpr std::string_view kIsLocal = "is_local";
 
@@ -93,6 +98,7 @@ inline constexpr std::string_view kIsDaemonInRootMountNamespace =
 inline constexpr std::string_view kIsPrivhelperInRootMountNamespace =
     "is_privhelper_in_root_mount_namespace";
 inline constexpr std::string_view kCgroup = "cgroup";
+inline constexpr std::string_view kNumRestarts = "num_restarts";
 
 // --- FinishedCheckout ---
 inline constexpr std::string_view kMode = "mode";
@@ -145,10 +151,6 @@ inline constexpr std::string_view kAtime = "atime";
 inline constexpr std::string_view kCtime = "ctime";
 inline constexpr std::string_view kMtime = "mtime";
 
-// --- InodeLoadingFailed ---
-inline constexpr std::string_view kLoadError = "load_error";
-inline constexpr std::string_view kCausedByX2p = "caused_by_x2p";
-
 // --- WorkingCopyGc ---
 inline constexpr std::string_view kNumInvalidated = "num_invalidated";
 inline constexpr std::string_view kNumDeletedInodes = "num_deleted_inodes";
@@ -181,6 +183,17 @@ inline constexpr std::string_view kReadThreshold = "read_threshold";
 inline constexpr std::string_view kReaddirCount = "readdir_count";
 inline constexpr std::string_view kReaddirThreshold = "readdir_threshold";
 inline constexpr std::string_view kProcessHierarchy = "process_hierarchy";
+
+// --- BigWalk ---
+inline constexpr std::string_view kWalkRoot = "walk_root";
+inline constexpr std::string_view kWalkerDetail = "walker_detail";
+inline constexpr std::string_view kFileLoads = "file_loads";
+inline constexpr std::string_view kFilePreloads = "file_preloads";
+inline constexpr std::string_view kFileReads = "file_reads";
+inline constexpr std::string_view kDirLoads = "dir_loads";
+inline constexpr std::string_view kDirReads = "dir_reads";
+inline constexpr std::string_view kWalkDepth = "walk_depth";
+inline constexpr std::string_view kWalkDuration = "walk_duration";
 
 // --- FetchMiss ---
 inline constexpr std::string_view kMissType = "miss_type";
@@ -225,6 +238,11 @@ inline constexpr std::string_view kStaleCheckoutMountUnmounted =
 
 // --- PrivhelperShutdown (also uses kExitSignal from SilentDaemonExit) ---
 inline constexpr std::string_view kExitCode = "exit_code";
+
+// --- TccDisclaimSkipped ---
+inline constexpr std::string_view kTccDisclaimProcess = "tcc_disclaim_process";
+inline constexpr std::string_view kTccObservedTeam = "tcc_observed_team";
+inline constexpr std::string_view kTccExpectedTeam = "tcc_expected_team";
 
 // --- CheckoutUpdateError (uses kPath and kReason from common fields) ---
 

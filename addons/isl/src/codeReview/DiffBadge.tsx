@@ -15,24 +15,32 @@ import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Component, lazy, Suspense, useRef, useState} from 'react';
+import {Component, lazy, Suspense, useRef} from 'react';
 import {useShowConfirmSubmitStack} from '../ConfirmSubmitStack';
 import {Internal} from '../Internal';
 import {Link} from '../Link';
-import {clipboardCopyText, clipboardCopyUrl} from '../clipboard';
+import {clipboardLinkHtml} from '../clipboard';
 import {useFeatureFlagSync} from '../featureFlags';
 import {T, t} from '../i18n';
 import {CircleExclamationIcon} from '../icons/CircleExclamationIcon';
 import {IconStack} from '../icons/IconStack';
-import {atomFamilyWeak, atomLoadableWithRefresh, configBackedAtom, useAtomGet} from '../jotaiUtils';
+import {
+  atomFamilyWeak,
+  atomLoadableWithRefresh,
+  configBackedAtom,
+  useAtomGet,
+  useAtomSelect,
+} from '../jotaiUtils';
 import {PullRevOperation} from '../operations/PullRevOperation';
 import {useRunOperation} from '../operationsState';
-import platform from '../platform';
 import {inMergeConflicts, repositoryInfo} from '../serverAPIState';
+import {copyAndShowToast} from '../toast';
 import {exactRevset} from '../types';
-import {codeReviewProvider, diffSummary} from './CodeReviewInfo';
+import {showConfirmation} from '../useModal';
+import {allDiffSummaries, codeReviewProvider, diffFetchError, diffSummary} from './CodeReviewInfo';
 import './DiffBadge.css';
 import css from './DiffBadge.module.css';
+import {submitAsDraft} from './DraftCheckbox';
 import {openerUrlForDiffUrl} from './github/GitHubUrlOpener';
 import {SyncStatus, syncStatusAtom} from './syncStatus';
 
@@ -116,6 +124,9 @@ function DiffSpinner({diffId, provider}: {diffId: DiffId; provider: UICodeReview
   );
 }
 
+/** Mirrors the fb-only `RunningAgentAssignment` on `PhabricatorDiffSummary`, which OSS builds cannot import. */
+type RunningAgentAssignmentShape = {actionType?: string; agentName?: string};
+
 function DiffInfoInner({
   diffId,
   commit,
@@ -127,26 +138,29 @@ function DiffInfoInner({
   provider: UICodeReviewProvider;
   hideActions: boolean;
 }) {
-  const diffInfoResult = useAtomValue(diffSummary(diffId));
+  // Select this diff's summary and error separately: both keep their identity across updates that
+  // don't touch them, where a combined `Result` would be new on every fetch.
+  const info = useAtomSelect(allDiffSummaries, all => all.value?.get(diffId), [diffId]);
+  const fetchError = useAtomSelect(allDiffSummaries, all => diffFetchError(all, diffId), [diffId]);
+  const summariesLoaded = useAtomSelect(allDiffSummaries, all => all.value != null, []);
   const syncStatus = useAtomGet(syncStatusAtom, commit.hash);
   const startTestsEnabled = useFeatureFlagSync(Internal.featureFlags?.StartTestsButton);
   const isInMergeConflicts = useAtomValue(inMergeConflicts);
-  if (diffInfoResult.error) {
+  if (info == null && fetchError != null) {
     return (
       <DiffLoadError
         number={provider.formatDiffNumber(diffId)}
         provider={provider}
-        error={diffInfoResult.error}
+        error={fetchError}
       />
     );
   }
-  if (diffInfoResult.value === undefined) {
+  if (info == null) {
+    if (summariesLoaded && provider.system.type === 'gerrit') {
+      return null; // summaries loaded but diffId not found: not yet pushed
+    }
     return <DiffSpinner diffId={diffId} provider={provider} />;
   }
-  if (diffInfoResult.value === null) {
-    return null; // summaries loaded but diffId not found — not yet pushed
-  }
-  const info = diffInfoResult.value;
   const shouldHideActions = hideActions || provider.isDiffClosed(info);
   // deferredTestingInfo is fb-only (phabricator). Use 'in' check to avoid OSS type errors.
   const deferredTestingInfo:
@@ -165,6 +179,11 @@ function DiffInfoInner({
       : undefined;
   // Use version-level isDeferred from deferredTestingInfo for accurate detection
   const isDeferred = deferredTestingInfo?.isDeferred === true || info.signalSummary === 'deferred';
+  // runningAgentAssignment is fb-only (phabricator). Use 'in' check to avoid OSS type errors.
+  const runningAgentAssignment: RunningAgentAssignmentShape | undefined =
+    'runningAgentAssignment' in info
+      ? (info.runningAgentAssignment as RunningAgentAssignmentShape)
+      : undefined;
 
   return (
     <div
@@ -172,6 +191,9 @@ function DiffInfoInner({
       data-testid={`${provider.name}-diff-info`}>
       <DiffSignalSummary commit={commit} diff={info} diffId={diffId} />
       <DiffBadge provider={provider} diff={info} url={info.url} syncStatus={syncStatus} />
+      {runningAgentAssignment != null && Internal.AgentStatusIndicator != null && (
+        <Internal.AgentStatusIndicator assignment={runningAgentAssignment} />
+      )}
       {provider.DiffLandButtonContent && !isInMergeConflicts && (
         <provider.DiffLandButtonContent diff={info} commit={commit} />
       )}
@@ -228,8 +250,12 @@ function DownloadNewVersionButton({
         icon
         onClick={async () => {
           if (bothChanged) {
-            const confirmed = await platform.confirm(tooltip);
-            if (confirmed !== true) {
+            const confirmed = await showConfirmation({
+              title: t('Download New Version?'),
+              message: tooltip,
+              confirmLabel: t('Download'),
+            });
+            if (!confirmed) {
               return;
             }
           }
@@ -255,6 +281,7 @@ function ResubmitSyncButton({
 }) {
   const runOperation = useRunOperation();
   const confirmShouldSubmit = useShowConfirmSubmitStack();
+  const shouldSubmitAsDraft = useAtomValue(submitAsDraft);
 
   return (
     <Tooltip
@@ -276,7 +303,11 @@ function ResubmitSyncButton({
           );
         }}>
         <Icon icon="cloud-upload" slot="start" />
-        {submitButtonVerb(provider)}
+        {shouldSubmitAsDraft ? (
+          <T replace={{$verb: submitButtonVerb(provider)}}>$verb Draft</T>
+        ) : (
+          submitButtonVerb(provider)
+        )}
       </Button>
     </Tooltip>
   );
@@ -291,33 +322,25 @@ function DiffNumber({
   url?: string;
   versionLabel?: string;
 }) {
-  const [showing, setShowing] = useState(false);
   const showDiffNumber = useAtomValue(showDiffNumberConfig);
   if (!children || !showDiffNumber) {
     return null;
   }
 
   return (
-    <Tooltip
-      trigger="manual"
-      shouldShow={showing}
-      title={
-        url == null
-          ? t('Copied $number to the clipboard', {replace: {$number: children}})
-          : t('Copied link to $number to the clipboard', {replace: {$number: children}})
-      }>
-      <span
-        className="diff-number"
-        onClick={e => {
-          url == null ? clipboardCopyText(children) : clipboardCopyUrl(url, children);
-          setShowing(true);
-          setTimeout(() => setShowing(false), 2000);
-          e.stopPropagation();
-        }}>
-        {children}
-        {versionLabel != null && <span className="diff-version-label"> {versionLabel}</span>}
-      </span>
-    </Tooltip>
+    <span
+      className="diff-number"
+      onClick={e => {
+        // Copy the link itself as plain text so it pastes as a URL outside rich-text targets.
+        void copyAndShowToast(
+          url ?? children,
+          url == null ? undefined : clipboardLinkHtml(children, url),
+        );
+        e.stopPropagation();
+      }}>
+      {children}
+      {versionLabel != null && <span className="diff-version-label"> {versionLabel}</span>}
+    </span>
   );
 }
 

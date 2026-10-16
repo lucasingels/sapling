@@ -220,6 +220,14 @@ which is written to a permission-restricted file.
 Detail: we have a second token we use to verify that a server running on a port
 is actually an ISL server, to prevent misleading/phishing "reuses" of a server.
 
+Launch URLs and the CLI's JSON output contain credentials, not diagnostics.
+Embedding hosts must keep them out of logs. Client diagnostics omit parameter
+values, WebSocket events and parsing errors that can expose these credentials.
+Browser launches retain their parameters locally to support reload; embeddings
+retain their launch URL for reload and do not initialize the unused browser
+fallback or copy credentials into localStorage. Only the standalone browser
+removes the initial query string after storing its reload parameters.
+
 ## Embedding
 
 ISL is designed to be embedded in multiple contexts. `sl web` is the default,
@@ -241,12 +249,30 @@ Each platform can implement this to match their UX best.
 The Client's platform is where platform-specific code first runs. Some embeddings
 have their client platform send platform-specific messages to the server platform.
 
-The "default" platform is the BrowserPlatform, used by `sl web`.
+The "default" platform is the browser platform, used by `sl web`.
 
 Custom platforms can be implemented either by:
 
 - including platform code in the build process (the VS Code extension does this)
 - adding a new platform to isl-server for use by `run-proxy`'s `--platform` option (Android Studio does this)
+
+### AgentCloud theme handoff
+
+`agentCloud.html` accepts `theme=light|dark` and an optional `themeColors` query parameter:
+JSON with canonical Astryx `--color-*` keys. The host sends concrete colors for the resolved mode
+and reloads the frame when its mode or palette changes. Missing or invalid modes retain the legacy
+system-theme behavior; missing or invalid colors retain the existing mode-specific palette.
+
+The inline head bootstrap validates the bounded palette with the browser's CSS color parser and
+accepts only hex and numeric `rgb`, `rgba`, `hsl`, `hsla`, `oklch`, `oklab`, `lab`, or `lch` values.
+It sets only allowlisted `--agentcloud-*` properties, the root background, and `color-scheme`.
+The loaded platform reuses that theme result and ignores a stale standalone theme preference.
+Other entry points do not run this bootstrap. Semantic colors without an equivalent Astryx role
+(such as the missing-file hue and error-background wash) keep their existing values. Signal badges
+also retain their existing palette because ISL gives all statuses a single shared foreground token.
+
+The host and Sapling-served guest ship separately: an older guest ignores `themeColors`, and an older
+host receives the guest's existing palette fallback until both sides are updated.
 
 ## Syncing repository state
 

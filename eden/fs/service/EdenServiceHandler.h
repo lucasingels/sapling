@@ -46,7 +46,6 @@ struct EntryAttributes;
 struct EntryAttributeFlags;
 template <typename T>
 class ImmediateFuture;
-class UsageService;
 
 extern const char* const kServiceName;
 
@@ -139,8 +138,7 @@ class EdenServiceHandler
  public:
   explicit EdenServiceHandler(
       std::vector<std::string> originalCommandLine,
-      EdenServer* server,
-      std::unique_ptr<UsageService> usageService);
+      EdenServer* server);
   ~EdenServiceHandler() override;
 
   EdenServiceHandler(EdenServiceHandler const&) = delete;
@@ -341,9 +339,6 @@ class EdenServiceHandler
   folly::SemiFuture<std::unique_ptr<Glob>> semifuture_predictiveGlobFiles(
       std::unique_ptr<GlobParams> params) override;
 
-  folly::coro::now_task<std::unique_ptr<Glob>> co_predictiveGlobFilesImpl(
-      std::unique_ptr<GlobParams> params);
-
   folly::SemiFuture<folly::Unit> semifuture_chown(
       std::unique_ptr<std::string> mountPoint,
       int32_t uid,
@@ -507,6 +502,19 @@ class EdenServiceHandler
   void getStatInfo(
       InternalStats& result,
       std::unique_ptr<GetStatInfoParams> params) override;
+
+  /**
+   * The fb303 counter getters, preceded by a publish of the thread-cached
+   * counters so that a read sees increments made just before it.
+   */
+  void getCounters(std::map<std::string, int64_t>& result) override;
+  void getRegexCounters(
+      std::map<std::string, int64_t>& result,
+      std::unique_ptr<std::string> regex) override;
+  void getSelectedCounters(
+      std::map<std::string, int64_t>& result,
+      std::unique_ptr<std::vector<std::string>> keys) override;
+  int64_t getCounter(std::unique_ptr<std::string> key) override;
 
   void enableTracing() override;
   void disableTracing() override;
@@ -723,8 +731,6 @@ class EdenServiceHandler
   // Recovery installs a new handler. Publishers from the old handler retain
   // this state so they still report the shutdown that terminated their stream.
   std::shared_ptr<std::atomic<bool>> streamJournalChangedShuttingDown_;
-
-  std::unique_ptr<UsageService> usageService_;
 
   std::optional<ActivityBuffer<ThriftRequestTraceEvent>>
       thriftRequestActivityBuffer_;

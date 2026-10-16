@@ -138,7 +138,7 @@ test worktree add - revision flag accepts remote-only commit hashes
   $ sl commit -Aqm "remote-only"
   $ remote_hash=$(sl log -r . -T '{node}')
   $ cd $TESTTMP/remote_client
-  $ sl worktree add $TESTTMP/remote_linked --rev "$remote_hash"
+  $ sl worktree add $TESTTMP/remote_linked --rev "$remote_hash" --config clone.use-skip-commit-resolve=true
   created linked worktree at $TESTTMP/remote_linked
   $ remote_linked_hash=$(cd $TESTTMP/remote_linked && sl log -r . -T '{node}')
   $ test "$remote_linked_hash" = "$remote_hash"
@@ -480,6 +480,13 @@ test worktree add - max-count limit enforced
   [255]
   $ test -d $TESTTMP/limit3
   [1]
+
+test worktree add - max-count-message replaces the default limit message
+
+  $ setconfig 'worktree.max-count-message=too many worktrees; see https://example.com/worktrees'
+  $ sl worktree add $TESTTMP/limit3
+  abort: too many worktrees; see https://example.com/worktrees
+  [255]
 
 test worktree add - a slot reservation counts against max-count
 

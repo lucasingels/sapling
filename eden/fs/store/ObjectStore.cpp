@@ -111,14 +111,15 @@ void ObjectStore::sendFetchHeavyEvent(ProcessId pid, uint64_t fetch_count)
   if (!processInfoCache_ || !edenFsEventsLogger_) {
     return;
   }
-  auto processName = processInfoCache_->getProcessName(pid.get());
-  if (processName) {
-    std::replace(processName->begin(), processName->end(), '\0', ' ');
+  auto processInfo = processInfoCache_->getProcessInfo(pid.get());
+  if (processInfo) {
+    auto& processName = processInfo->name;
+    std::replace(processName.begin(), processName.end(), '\0', ' ');
     XLOGF(
         WARN,
         "Heavy fetches ({}) from process {}(pid={})",
         fetch_count,
-        *processName,
+        processName,
         pid);
     auto repoName = backingStore_->getRepoName();
     std::optional<uint64_t> loadedInodes = [repoName]() {
@@ -130,7 +131,12 @@ void ObjectStore::sendFetchHeavyEvent(ProcessId pid, uint64_t fetch_count)
     }();
 
     edenFsEventsLogger_->logEvent(
-        FetchHeavy{processName.value(), pid, fetch_count, loadedInodes});
+        FetchHeavy{
+            std::move(processName),
+            pid,
+            fetch_count,
+            loadedInodes,
+            std::move(processInfo->attribution)});
   } else {
     XLOGF(WARN, "Heavy fetches ({}) from pid {})", fetch_count, pid);
   }
@@ -279,20 +285,28 @@ folly::coro::now_task<std::shared_ptr<const Tree>> ObjectStore::co_getTree(
   // thread B has completely finished, so thread A will make a duplicate
   // request. If we were to mark here that we got a request on this layer, then
   // we could avoid that case.
-  if (auto maybeTree = treeCache_->get(id)) {
-    stats_->increment(&ObjectStoreStats::getTreeFromMemory);
-    fetchContext->didFetch(
-        ObjectFetchContext::Tree, id, ObjectFetchContext::FromMemoryCache);
-    updateProcessFetch(*fetchContext);
-    stats_->addDuration(
-        &ObjectStoreStats::getTreeMemoryDuration, watch.elapsed());
-    co_return changeCaseSensitivity(std::move(maybeTree), caseSensitive_);
+  const bool bypassCaches = bypassInMemoryTreeCaches(*fetchContext);
+  if (!bypassCaches) {
+    if (auto maybeTree = treeCache_->get(id)) {
+      stats_->increment(&ObjectStoreStats::getTreeFromMemory);
+      fetchContext->didFetch(
+          ObjectFetchContext::Tree, id, ObjectFetchContext::FromMemoryCache);
+      updateProcessFetch(*fetchContext);
+      stats_->addDuration(
+          &ObjectStoreStats::getTreeMemoryDuration, watch.elapsed());
+      co_return changeCaseSensitivity(std::move(maybeTree), caseSensitive_);
+    }
   }
   deprioritizeWhenFetchHeavy(*fetchContext);
   auto result = co_await getTreeImpl(id, fetchContext, watch);
   TaskTraceBlock block2{"ObjectStore::getTree::thenValue"};
+  if (!bypassCaches) {
+    maybeCacheTreeAuxInMemCache(id, result);
+  }
   auto tree = changeCaseSensitivity(std::move(result.tree), caseSensitive_);
-  treeCache_->insert(tree->getObjectId(), tree);
+  if (!bypassCaches) {
+    treeCache_->insert(tree->getObjectId(), tree);
+  }
   fetchContext->didFetch(
       ObjectFetchContext::Tree, id, result.origin, tree->getSizeBytes());
   updateProcessFetch(*fetchContext);
@@ -311,13 +325,23 @@ void ObjectStore::maybeCacheTreeAuxInMemCache(
   }
 }
 
+bool ObjectStore::bypassInMemoryTreeCaches(
+    const ObjectFetchContext& context) const {
+  const auto cause = context.getCause();
+  if (cause != ObjectFetchContext::Cause::Prefetch &&
+      cause != ObjectFetchContext::Cause::Glob) {
+    return false;
+  }
+  return edenConfig_->getEdenConfig()
+      ->treeCacheBypassGlobAndPrefetch.getValue();
+}
+
 folly::coro::now_task<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
     const ObjectId& id,
     const ObjectFetchContextPtr& context,
     folly::stop_watch<std::chrono::milliseconds> watch) const {
   try {
     auto result = co_await backingStore_->co_getTree(id, context);
-    maybeCacheTreeAuxInMemCache(id, result);
     stats_->increment(&ObjectStoreStats::getTreeFromBackingStore);
     stats_->addDuration(
         &ObjectStoreStats::getTreeBackingstoreDuration, watch.elapsed());
@@ -770,24 +794,6 @@ folly::coro::now_task<bool> ObjectStore::co_areBlobsEqual(
             co_return co_await co_getBlobSha1(two, ctx);
           }));
   co_return std::get<0>(results) == std::get<1>(results);
-}
-
-folly::coro::now_task<BackingStore::GetGlobFilesResult>
-ObjectStore::getGlobFiles(
-    const RootId& id,
-    const std::vector<std::string>& globs,
-    const std::vector<std::string>& prefixes,
-    const ObjectFetchContextPtr& context) const {
-  co_return co_await getGlobFilesImpl(id, globs, prefixes, context);
-}
-
-folly::coro::now_task<BackingStore::GetGlobFilesResult>
-ObjectStore::getGlobFilesImpl(
-    const RootId& id,
-    const std::vector<std::string>& globs,
-    const std::vector<std::string>& prefixes,
-    const ObjectFetchContextPtr& /*context*/) const {
-  co_return co_await backingStore_->getGlobFiles(id, globs, prefixes);
 }
 
 ObjectComparison ObjectStore::compareObjectsById(

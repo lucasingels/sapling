@@ -39,6 +39,26 @@ Amend
       6d60953c6009fdd3d6bd870ad37c7f48ea6d1311 amend by test at 1970-01-01T00:00:00 from:
       c5d0fa8770bdde6ef311cc640a78a2f686be28b4
   
+JSON output exposes the existing predecessor lookup without user or time metadata.
+
+  $ sl debugmutation -Tjson -r 6d60953c6009fdd3d6bd870ad37c7f48ea6d1311
+  {"mutations": [{"operation": "amend", "predecessors": ["c5d0fa8770bdde6ef311cc640a78a2f686be28b4"], "split_successors": [], "successor": "6d60953c6009fdd3d6bd870ad37c7f48ea6d1311"}], "target": "6d60953c6009fdd3d6bd870ad37c7f48ea6d1311"}
+
+JSON output accepts exactly one predecessor target.
+
+  $ sl debugmutation -Tjson -r . -r .^
+  abort: -Tjson requires exactly one revision
+  [255]
+  $ sl debugmutation -Tjson --successors
+  abort: -Tjson does not support --successors
+  [255]
+  $ sl debugmutation -Tjson --time-range 0
+  abort: -Tjson does not support --time-range
+  [255]
+  $ sl debugmutation -T '{node}'
+  abort: debugmutation only supports -Tjson
+  [255]
+
   $ sl log -r . -T '{dict(predecessors)|json}\n'
   {"predecessors": ["8b2e1bbf6c0bea98beb5615f7b1c49b8dc38a593"]}
 
@@ -329,6 +349,8 @@ Histedit
   > roll 64a3bc96c043
   > pick b6ea0faadebf
   > EOF
+  folded f05234144e37, 7d383d1b236d, 9c2c451b82d0, 36e4e93ec194, 48b076c1640c -> 1851fa2d6ef0 "c2"
+  folded c3b5428c707b, c4484fcb5ac0, 64a3bc96c043 -> dd5d0e1bc12e "c6"
  (After histedit)
   $ sl log -Gr 'all() + draft()' -T '{desc} {node|short} {phase}'
   @  c9 3c3b86a5a351 draft
@@ -520,6 +542,7 @@ Histedit with exec that amends in between folds
   > fold 0d4155d128bf
   > EOF
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  folded 08d8367dafb9, 15a208dbcdc5, 0d4155d128bf -> a2235e1011a0 "commit 3 amended"
   $ tglog
   @  a2235e1011a0 'commit 3 amended
   │  ***
@@ -572,6 +595,7 @@ Histedit with stop, extra commit, and fold
   $ echo extra >> file2
   $ sl commit -Aqm "extra commit"
   $ sl histedit --continue | fixbundle
+  folded 15a208dbcdc5, 0d4155d128bf -> d313be93f9b7 "extra commit"
   $ tglog
   @  d313be93f9b7 'extra commit
   │  ***
@@ -651,6 +675,11 @@ Drawdag
   
    *  b2faf047aa50279686b1635bfad505cd51300b3c
   
+JSON output includes the primary successor in a split's complete successor set.
+
+  $ sl debugmutation -Tjson -r G
+  {"mutations": [{"operation": "split", "predecessors": ["112478962961147124edd43549aedd1a335e44bf"], "split_successors": ["64a8289d249234b9886244d379f15e6b650b28e3", "7fb047a69f220c21711122dfd94305a9efb60cba", "dd319aacbb516094646b9ee5a24a942e62110121"], "successor": "dd319aacbb516094646b9ee5a24a942e62110121"}], "target": "dd319aacbb516094646b9ee5a24a942e62110121"}
+
 
 Revsets obey visibility rules
 

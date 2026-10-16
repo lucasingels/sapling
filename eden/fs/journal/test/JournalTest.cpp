@@ -764,6 +764,49 @@ TEST_F(JournalTest, compaction) {
   EXPECT_EQ(1, summed->changedFilesInOverlay.size());
 }
 
+TEST_F(JournalTest, compaction_does_not_truncate_the_absorbed_sequence) {
+  journal.recordChanged("file1.txt"_relpath, dtype_t::Regular);
+  journal.recordChanged("file1.txt"_relpath, dtype_t::Regular);
+  ASSERT_EQ(1, journal.getStats()->entryCount);
+  ASSERT_EQ(2, journal.observeLatest()->sequenceID);
+
+  auto summed = journal.accumulateRange(1);
+  ASSERT_TRUE(summed);
+  EXPECT_FALSE(summed->isTruncated);
+  EXPECT_EQ(2, summed->fromSequence);
+  EXPECT_EQ(1, summed->changedFilesInOverlay.size());
+
+  summed = journal.accumulateRange(2);
+  ASSERT_TRUE(summed);
+  EXPECT_FALSE(summed->isTruncated);
+}
+
+TEST_F(JournalTest, compaction_after_truncation_keeps_the_truncation_boundary) {
+  journal.recordChanged("file1.txt"_relpath, dtype_t::Regular);
+  journal.setMemoryLimit(journal.estimateMemoryUsage());
+
+  journal.recordChanged("file2.txt"_relpath, dtype_t::Regular);
+  ASSERT_EQ(2, journal.getStats()->entryCount);
+  ASSERT_EQ(2, journal.observeLatest()->sequenceID);
+
+  journal.recordChanged("file2.txt"_relpath, dtype_t::Regular);
+  ASSERT_EQ(1, journal.getStats()->entryCount);
+  ASSERT_EQ(3, journal.observeLatest()->sequenceID);
+
+  auto summed = journal.accumulateRange(1);
+  ASSERT_TRUE(summed);
+  EXPECT_TRUE(summed->isTruncated);
+
+  summed = journal.accumulateRange(2);
+  ASSERT_TRUE(summed);
+  EXPECT_FALSE(summed->isTruncated);
+  EXPECT_EQ(1, summed->changedFilesInOverlay.size());
+
+  summed = journal.accumulateRange(3);
+  ASSERT_TRUE(summed);
+  EXPECT_FALSE(summed->isTruncated);
+}
+
 TEST_F(JournalTest, update_transitions_are_all_recorded) {
   RootId root1{"0000000000000000000000000000000000000001"};
   RootId root2{"0000000000000000000000000000000000000002"};

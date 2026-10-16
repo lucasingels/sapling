@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use cmdutil::ConfigExt;
 use fs_err as fs;
 use gitcompat::GitCmd;
 use gitcompat::RepoGit;
@@ -58,6 +59,9 @@ impl Backend {
             }
         }
         if repo.requirements.contains("dotgit") || repo.store_requirements.contains("dotgit") {
+            if !repo.config().get_or("worktree", "git-enabled", || true)? {
+                bail!("worktree commands for git are disabled by worktree.git-enabled");
+            }
             return Ok(Backend::Git);
         }
         bail!("worktree commands require an EdenFS-backed or git-backed (.git) repository");

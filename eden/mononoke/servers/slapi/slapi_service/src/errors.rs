@@ -19,7 +19,7 @@ use types::Key;
 /// Enum to add context to server errors.
 ///
 /// Most of the functions in the SaplingRemoteAPI server return `anyhow::Error`
-/// as their error type. The intention of `ErrorKind` is to be used
+/// as their error type. The intention of `SaplingRemoteApiServiceError` is to be used
 /// in conjunction with `anyhow::Context` to annotate the error with
 /// the appropriate context. In that sense, this type should be used
 /// to "tag" other errors instead of being returned on its own.
@@ -31,9 +31,9 @@ use types::Key;
 /// In situations where a failure will always result in the same status
 /// code (e.g., a permission check failure resulting in a 403), the code
 /// should return an `HttpError` directly but should tag the underlying
-/// error with an `ErrorKind` before wrapping it with `HttpError`.
+/// error with an `SaplingRemoteApiServiceError` before wrapping it with `HttpError`.
 #[derive(Debug, Error)]
-pub enum ErrorKind {
+pub enum SaplingRemoteApiServiceError {
     #[error("Client cancelled the request")]
     ClientCancelled,
     #[error("Failed to parse the request's Content-Length header")]
@@ -105,6 +105,7 @@ impl MononokeErrorExt for MononokeError {
             InvalidRequest(_) => HttpError::e400,
             ServicePermissionDenied { .. } => HttpError::e403,
             NotAvailable { .. } => HttpError::e503,
+            ManifestNotDerived(_) => HttpError::e400,
             HookFailure(_) => HttpError::e400,
             NonFastForwardMove { .. } => HttpError::e400,
             PushrebaseConflicts(_) => HttpError::e400,
@@ -114,6 +115,11 @@ impl MononokeErrorExt for MononokeError {
             MergeConflicts { .. } => HttpError::e400,
             LargeRepoNotFound(_) => HttpError::e400,
             RedactionError { .. } => HttpError::e403,
+            // The set_bookmark handler normally reports this in-band. If it
+            // reaches here, the move was still already applied, so the server
+            // did its job. That is not a server fault, so do not map it to a
+            // 5xx.
+            BookmarkMoveAlreadyProcessed => HttpError::e400,
         })(Error::from(self).context(context))
     }
 }

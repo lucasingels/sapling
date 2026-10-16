@@ -10,7 +10,9 @@
 #include <folly/IntrusiveList.h>
 #include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
+#include <folly/small_vector.h>
 #include <folly/synchronization/DistributedMutex.h>
+#include <chrono>
 #include <list>
 #include <mutex>
 
@@ -123,6 +125,10 @@ class ObjectCache : public std::enable_shared_from_this<
                         ObjectCache<ObjectType, Flavor, ObjectCacheStats>> {
  public:
   using ObjectPtr = std::shared_ptr<const ObjectType>;
+  using Clock = std::chrono::steady_clock;
+
+  /// Expiry of an entry that stays until evicted.
+  static constexpr Clock::time_point kNeverExpires = Clock::time_point::max();
 
   enum class Interest {
     /**
@@ -229,11 +235,17 @@ class ObjectCache : public std::enable_shared_from_this<
    * Inserts a object into the cache for future lookup. If the new total size
    * exceeds the maximum cache size and the minimum entry count, old entries are
    * evicted.
+   *
+   * An object inserted with an expiry is treated as absent once that time has
+   * passed; the next lookup removes it and the next insert replaces it. An
+   * insert for an id that is present and unexpired keeps the existing entry
+   * and its expiry.
    */
   template <ObjectCacheFlavor F = Flavor>
   typename std::enable_if_t<F == ObjectCacheFlavor::Simple, void> insertSimple(
       ObjectId id,
-      ObjectPtr object);
+      ObjectPtr object,
+      Clock::time_point expiresAt = kNeverExpires);
 
   /**
    * Returns true if the cache contains a object for the given id.
@@ -288,8 +300,15 @@ class ObjectCache : public std::enable_shared_from_this<
     // WARNING: leaves index unset. Since the items map and evictionQueue are
     // circular, initialization of index must happen after the CacheItem is
     // constructed.
-    explicit CacheItem(ObjectId id, ObjectPtr b)
-        : id{std::move(id)}, object{std::move(b)} {}
+    explicit CacheItem(
+        ObjectId id,
+        ObjectPtr b,
+        size_t size,
+        Clock::time_point expiresAt)
+        : id{std::move(id)},
+          object{std::move(b)},
+          size{size},
+          expiresAt{expiresAt} {}
 
     // The folly::SafeIntrusiveListHook needs special handling to be
     // copied/moved, removing the move/copy constructor and assignment to
@@ -301,6 +320,11 @@ class ObjectCache : public std::enable_shared_from_this<
 
     ObjectId id;
     ObjectPtr object;
+    /// getSizeBytes() of the object when it was inserted. Eviction subtracts
+    /// this rather than asking the object again, so the accounting stays
+    /// balanced even if the object's reported size changes.
+    size_t size;
+    Clock::time_point expiresAt;
     folly::SafeIntrusiveListHook hook;
 
     /// Incremented on every LikelyNeededAgain or WantInterestHandle.
@@ -332,6 +356,15 @@ class ObjectCache : public std::enable_shared_from_this<
       typename folly::Synchronized<State, folly::DistributedMutex>::LockedPtr;
 
   /**
+   * Objects removed from a shard while its lock is held. Callers declare one
+   * of these before taking the lock so the objects, and whatever their
+   * destructors do, are released only after the lock is dropped. The inline
+   * capacity covers the single eviction the noexcept paths perform, so they
+   * never allocate.
+   */
+  using EvictedObjects = folly::small_vector<ObjectPtr, 2>;
+
+  /**
    * The "core" implementation for the method getInterestHandle().
    *
    * This method is not thread safe in any version of ObjectCache so it expects
@@ -345,7 +378,8 @@ class ObjectCache : public std::enable_shared_from_this<
   getInterestHandleCore(
       LockedState& state,
       const ObjectId& id,
-      Interest interest) noexcept;
+      Interest interest,
+      EvictedObjects& evicted) noexcept;
 
   /**
    * The "core" implementation for the method insertInterestHandle().
@@ -361,10 +395,12 @@ class ObjectCache : public std::enable_shared_from_this<
   insertInterestHandleCore(
       ObjectId id,
       ObjectPtr object,
+      size_t size,
       Interest interest,
       LockedState& state,
       uint64_t cacheItemGeneration,
-      ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle);
+      ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle,
+      EvictedObjects& evicted);
 
   struct PreProcessInterestHandleResult {
     ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle;
@@ -387,12 +423,16 @@ class ObjectCache : public std::enable_shared_from_this<
   preProcessInterestHandle(ObjectId id, ObjectPtr object, Interest interest);
 
   /**
-   * If an object for the given id is in cache, return it. If the object is
-   * not in cache, return nullptr (and an empty interest handle).
+   * If an object for the given id is in cache and has not expired, return it.
+   * Otherwise return nullptr; an expired entry is removed on the way.
    *
    * Does not do anything related to interest handles.
    */
-  CacheItem* getImpl(const ObjectId& id, State& state);
+  CacheItem* getImpl(const ObjectId& id, State& state, EvictedObjects& evicted);
+
+  static bool isExpired(const CacheItem& item) {
+    return item.expiresAt != kNeverExpires && Clock::now() >= item.expiresAt;
+  }
 
   /**
    * Inserts an object into the cache for future lookup. If the new total size
@@ -403,14 +443,19 @@ class ObjectCache : public std::enable_shared_from_this<
    *
    * Does not do anything related to InterestHandles
    */
-  std::pair<CacheItem*, bool>
-  insertImpl(ObjectId id, ObjectPtr object, State& state);
+  std::pair<CacheItem*, bool> insertImpl(
+      ObjectId id,
+      ObjectPtr object,
+      size_t size,
+      Clock::time_point expiresAt,
+      State& state,
+      EvictedObjects& evicted);
 
   void dropInterestHandle(const ObjectId& id, uint64_t generation) noexcept;
 
-  void evictUntilFits(State& state) noexcept;
-  void evictOne(State& state) noexcept;
-  void evictItem(State&, const CacheItem& item) noexcept;
+  void evictUntilFits(State& state, EvictedObjects& evicted);
+  void evictOne(State& state, EvictedObjects& evicted);
+  void evictItem(State&, CacheItem& item, EvictedObjects& evicted);
 
   /**
    * Get the shard for the given ObjectId.

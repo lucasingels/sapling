@@ -13,17 +13,20 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
+use bookmarks::BookmarkKey;
+use bookmarks::BookmarkUpdateReason;
 use context::CoreContext;
 use futures::channel::oneshot;
-use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mercurial_types::blobs::HgBlobChangeset;
 use metaconfig_types::ModernSyncConfig;
 use mononoke_macros::mononoke;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mutable_counters::MutableCounters;
+use mutable_counters::validate_counter_name;
 use repo_blobstore::RepoBlobstore;
 use tokio::sync::mpsc;
 
@@ -41,6 +44,36 @@ mod tree;
 pub(crate) const MODERN_SYNC_COUNTER_NAME: &str = "modern_sync";
 pub(crate) const MODERN_SYNC_BATCH_CHECKPOINT_NAME: &str = "modern_sync_batch_checkpoint";
 pub(crate) const MODERN_SYNC_CURRENT_ENTRY_ID: &str = "modern_sync_batch_id";
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ModernSyncCounterNames {
+    pub completed_entry: String,
+    pub batch_checkpoint: String,
+    pub current_entry: String,
+}
+
+impl ModernSyncCounterNames {
+    pub fn legacy() -> Self {
+        Self {
+            completed_entry: MODERN_SYNC_COUNTER_NAME.to_owned(),
+            batch_checkpoint: MODERN_SYNC_BATCH_CHECKPOINT_NAME.to_owned(),
+            current_entry: MODERN_SYNC_CURRENT_ENTRY_ID.to_owned(),
+        }
+    }
+
+    pub fn for_bookmark(bookmark: &BookmarkKey) -> Result<Self> {
+        let suffix = format!("{}_{}", bookmark.category(), bookmark.as_str());
+        let counter_names = Self {
+            completed_entry: format!("modern_sync_by_bookmark_v1_{suffix}"),
+            batch_checkpoint: format!("modern_sync_batch_checkpoint_by_bookmark_v1_{suffix}"),
+            current_entry: format!("modern_sync_batch_id_by_bookmark_v1_{suffix}"),
+        };
+        validate_counter_name(&counter_names.completed_entry)?;
+        validate_counter_name(&counter_names.batch_checkpoint)?;
+        validate_counter_name(&counter_names.current_entry)?;
+        Ok(counter_names)
+    }
+}
 
 #[derive(Clone)]
 pub struct SendManager {
@@ -89,9 +122,13 @@ pub enum ChangesetMessage {
     // Send the changeset to remote end
     Changeset((HgBlobChangeset, BonsaiChangeset)),
     // Checkpoint position (first argument) within the BUL entry (second argument)
-    CheckpointInEntry(u64, i64),
+    CheckpointInEntry {
+        position: u64,
+        entry_id: i64,
+        counter_names: ModernSyncCounterNames,
+    },
     // Perform bookmark movement and mark BUL entry as completed once the changeset is synced
-    FinishEntry(BookmarkInfo, i64),
+    FinishEntry(BookmarkInfo),
     // Notify changeset sending is done
     NotifyCompletion(oneshot::Sender<Result<()>>),
     // Log changeset completion
@@ -100,8 +137,13 @@ pub enum ChangesetMessage {
 
 pub struct BookmarkInfo {
     pub name: String,
-    pub from_cs_id: Option<HgChangesetId>,
-    pub to_cs_id: Option<HgChangesetId>,
+    pub from_cs_id: Option<ChangesetId>,
+    pub to_cs_id: Option<ChangesetId>,
+    // Source bookmarks_update_log id and reason for this move. The mirror path
+    // reuses both so the replica's log row matches the source row for row.
+    pub log_id: i64,
+    pub reason: BookmarkUpdateReason,
+    pub counter_names: ModernSyncCounterNames,
 }
 
 impl SendManager {
@@ -266,4 +308,42 @@ trait Manager {
         external_sender: Arc<dyn EdenapiSender + Send + Sync>,
         cancellation_requested: Arc<AtomicBool>,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use bookmarks::BookmarkCategory;
+    use bookmarks::BookmarkName;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[mononoke::test]
+    fn bookmark_counter_names_are_readable_and_category_specific() -> Result<()> {
+        let branch = BookmarkKey::new("feature/modern-sync")?;
+        let counters = ModernSyncCounterNames::for_bookmark(&branch)?;
+        assert_eq!(
+            counters.completed_entry,
+            "modern_sync_by_bookmark_v1_branch_feature/modern-sync"
+        );
+        assert_eq!(
+            counters.batch_checkpoint,
+            "modern_sync_batch_checkpoint_by_bookmark_v1_branch_feature/modern-sync"
+        );
+        assert_eq!(
+            counters.current_entry,
+            "modern_sync_batch_id_by_bookmark_v1_branch_feature/modern-sync"
+        );
+
+        let tag = BookmarkKey::with_name_and_category(
+            BookmarkName::new("feature/modern-sync")?,
+            BookmarkCategory::Tag,
+        );
+        assert_ne!(
+            counters.completed_entry,
+            ModernSyncCounterNames::for_bookmark(&tag)?.completed_entry
+        );
+        Ok(())
+    }
 }

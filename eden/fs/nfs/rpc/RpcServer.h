@@ -201,6 +201,17 @@ class RpcServerProcessor {
 class RpcServer;
 
 /**
+ * Size of each freshly allocated recv(2) buffer.
+ *
+ * This is folly::IOBufQueue::preallocate's `newAllocationSize` argument, whose
+ * signature is preallocate(min, newAllocationSize, max = SIZE_MAX). It sizes a
+ * newly allocated buffer; it is not a cap on how much a single recv(2) may
+ * return. We leave `max` at its default, and preallocate's fast path returns
+ * the whole available tailroom, which can exceed this value.
+ */
+inline constexpr size_t kDefaultReadBufferAllocationSize = 64 * 1024;
+
+/**
  * RpcConnectionHandler manages connected RPC sockets, whether for NFS or Mountd
  * or Rpcbind.
  *
@@ -318,6 +329,20 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
       std::unique_ptr<RequestPermit> permit,
       RpcRequestTimeline timeline);
 
+  using ReplyResult =
+      std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>;
+
+  /**
+   * Write a finished reply to the socket. Must run on the EventBase thread.
+   */
+  void writeReply(folly::Try<ReplyResult> result);
+
+  /**
+   * Account for a request that has been answered, completing shutdown if it
+   * was the last one. Must run on the EventBase thread.
+   */
+  void finishRequest();
+
   /**
    * Reply to an rpc call with an error.
    * This function assumes that some data may have already been written to the
@@ -431,7 +456,8 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<folly::Executor> threadPool,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
-      std::chrono::nanoseconds highNfsRequestsLogInterval);
+      std::chrono::nanoseconds highNfsRequestsLogInterval,
+      size_t socketBufferSize = 0);
 
   /**
    * RpcServer must be torn down on its EventBase. destroy() is called by the
@@ -504,9 +530,15 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<folly::Executor> threadPool,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
-      std::chrono::nanoseconds highNfsRequestsLogInterval);
+      std::chrono::nanoseconds highNfsRequestsLogInterval,
+      size_t socketBufferSize);
 
   ~RpcServer() override;
+
+  /**
+   * Apply socketBufferSize_ to a connected socket, if configured.
+   */
+  void configureSocket(folly::AsyncSocket& socket);
 
   // AsyncServerSocket::AcceptCallback
 
@@ -563,6 +595,10 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
   // We log when the number of pending requests exceeds maximumInFlightRequests,
   // however to avoid spamming the logs once per highNfsRequestsLogInterval.
   std::chrono::nanoseconds highNfsRequestsLogInterval_;
+
+  // Send and receive buffer size for connected Unix domain sockets, 0 for
+  // the kernel default.
+  size_t socketBufferSize_;
 };
 
 } // namespace facebook::eden

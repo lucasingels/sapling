@@ -7,6 +7,7 @@
 
 #include "eden/fs/store/ObjectCache.h"
 #include <gtest/gtest.h>
+#include <chrono>
 
 using namespace folly::literals;
 using namespace facebook::eden;
@@ -21,6 +22,10 @@ class CacheObject {
 
   size_t getSizeBytes() const {
     return size_;
+  }
+
+  void setSizeBytes(size_t size) {
+    size_ = size;
   }
 
   CacheObject(ObjectId id, size_t size) : id_{id}, size_{size} {}
@@ -694,4 +699,95 @@ TEST(ObjectCache, multi_shard_size_limit_enforcement) {
       << "Cache should hold at least 5 objects (worst case: all in one shard)";
   EXPECT_LE(totalSize, 10 * objectSize)
       << "Cache should not exceed size limit (best case: evenly distributed)";
+}
+
+TEST(ObjectCache, evictionSubtractsTheSizeRecordedAtInsert) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+  auto growingObject = std::make_shared<CacheObject>(id3, 3);
+
+  cache->insertSimple(id3, growingObject);
+  growingObject->setSizeBytes(100);
+  cache->insertSimple(id9, object9);
+
+  EXPECT_FALSE(cache->contains(id3));
+  EXPECT_EQ(9, cache->getTotalSizeBytes());
+}
+
+TEST(ObjectCache, evictedObjectIsDestroyedAfterTheLockIsReleased) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+  // The deleter locks the cache. It can only run once the eviction has
+  // released the lock; a deleter run under the lock would deadlock here.
+  size_t objectCountSeenByDeleter = 0;
+  cache->insertSimple(
+      id3,
+      std::shared_ptr<const CacheObject>{
+          new CacheObject{id3, 3}, [&](const CacheObject* object) {
+            objectCountSeenByDeleter = cache->getObjectCount();
+            delete object;
+          }});
+
+  cache->insertSimple(id9, object9);
+
+  EXPECT_EQ(1, objectCountSeenByDeleter);
+}
+
+TEST(ObjectCache, objectWithFutureExpiryIsServed) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+
+  cache->insertSimple(
+      id3, object3, std::chrono::steady_clock::now() + std::chrono::hours{1});
+
+  EXPECT_TRUE(cache->contains(id3));
+  EXPECT_EQ(object3, cache->getSimple(id3));
+}
+
+TEST(ObjectCache, expiredObjectIsRemovedOnLookup) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+
+  cache->insertSimple(
+      id3, object3, std::chrono::steady_clock::now() - std::chrono::hours{1});
+
+  EXPECT_FALSE(cache->contains(id3));
+  EXPECT_EQ(nullptr, cache->getSimple(id3));
+  EXPECT_EQ(0, cache->getObjectCount());
+  EXPECT_EQ(0, cache->getTotalSizeBytes());
+}
+
+TEST(ObjectCache, expiredObjectIsReplacedOnInsert) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+  auto stale = std::make_shared<CacheObject>(id3, 3);
+  auto fresh = std::make_shared<CacheObject>(id3, 4);
+
+  cache->insertSimple(
+      id3, stale, std::chrono::steady_clock::now() - std::chrono::hours{1});
+  cache->insertSimple(
+      id3, fresh, std::chrono::steady_clock::now() + std::chrono::hours{1});
+
+  EXPECT_EQ(fresh, cache->getSimple(id3));
+  EXPECT_EQ(4, cache->getTotalSizeBytes());
+}
+
+TEST(ObjectCache, duplicateInsertKeepsTheLiveEntryAndItsExpiry) {
+  auto cache =
+      ObjectCache<CacheObject, ObjectCacheFlavor::Simple, FakeStats>::create(
+          10, 0, makeRefPtr<EdenStats>());
+  auto first = std::make_shared<CacheObject>(id3, 3);
+  auto second = std::make_shared<CacheObject>(id3, 3);
+
+  cache->insertSimple(
+      id3, first, std::chrono::steady_clock::now() + std::chrono::hours{1});
+  cache->insertSimple(
+      id3, second, std::chrono::steady_clock::now() - std::chrono::hours{1});
+
+  EXPECT_EQ(first, cache->getSimple(id3));
 }

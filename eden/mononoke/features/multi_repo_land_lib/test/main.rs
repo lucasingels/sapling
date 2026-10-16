@@ -49,9 +49,11 @@ use multi_repo_land_lib::bulk_read_git_sha1s;
 use multi_repo_land_lib::create_manifest_commit;
 use multi_repo_land_lib::log_scribe_bookmark_update;
 use multi_repo_land_lib::prepare_manifest_commit;
+use multi_repo_land_lib::prepare_manifest_commits;
 use multi_repo_land_lib::repin_manifest_branch;
 use multi_repo_land_lib::resolve_bookmarks_cross_repo;
 use phases::Phases;
+use pushrebase_mutation_mapping::PushrebaseMutationMapping;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
@@ -62,6 +64,8 @@ use test_repo_factory::TestRepoFactory;
 use tests_utils::BasicTestRepo;
 use tests_utils::CreateCommitContext;
 use tests_utils::bookmark;
+
+mod predecessor_hop;
 
 #[mononoke::fbinit_test]
 async fn test_creates_commit_on_top_of_parent(fb: FacebookInit) -> Result<()> {
@@ -81,6 +85,7 @@ async fn test_creates_commit_on_top_of_parent(fb: FacebookInit) -> Result<()> {
         &manifest_path,
         Bytes::from("<manifest/>"),
         "test_service",
+        None,
     )
     .await?;
 
@@ -110,6 +115,7 @@ async fn test_commit_has_correct_file_change(fb: FacebookInit) -> Result<()> {
         &manifest_path,
         Bytes::from(content.as_slice()),
         "test_service",
+        None,
     )
     .await?;
 
@@ -138,8 +144,16 @@ async fn test_commit_stores_correct_content(fb: FacebookInit) -> Result<()> {
 
     let manifest_path = NonRootMPath::new("manifest.xml")?;
     let content = Bytes::from("test content 12345");
-    let cs_id =
-        create_manifest_commit(&ctx, &repo, parent, &manifest_path, content.clone(), "svc").await?;
+    let cs_id = create_manifest_commit(
+        &ctx,
+        &repo,
+        parent,
+        &manifest_path,
+        content.clone(),
+        "svc",
+        None,
+    )
+    .await?;
 
     // Verify the stored file size matches.
     let bcs = cs_id.load(&ctx, repo.repo_blobstore()).await?;
@@ -181,7 +195,7 @@ fn test_repo_provider_blanket_impl() {
 /// facet.
 #[facet::container]
 #[derive(Clone)]
-struct TestRepo {
+pub(crate) struct TestRepo {
     #[facet]
     repo_identity: RepoIdentity,
 
@@ -220,6 +234,9 @@ struct TestRepo {
 
     #[facet]
     phases: dyn Phases,
+
+    #[facet]
+    pushrebase_mutation_mapping: dyn PushrebaseMutationMapping,
 }
 
 /// A mixed batch exercises every outcome (unknown repo, invalid/missing
@@ -338,7 +355,7 @@ async fn test_resolve_bookmarks_cross_repo_mixed_batch(fb: FacebookInit) -> Resu
     assert_eq!(results[0].outcome, ResolveOutcome::Resolved(sha_a));
     assert_eq!(
         results[1].outcome,
-        ResolveOutcome::Error("unknown repo: ghost".to_string()),
+        ResolveOutcome::UnknownRepo("unknown repo: ghost".to_string()),
     );
     assert_eq!(
         results[2].outcome,
@@ -369,6 +386,111 @@ async fn test_resolve_bookmarks_cross_repo_empty(fb: FacebookInit) -> Result<()>
     Ok(())
 }
 
+/// A provider that can load a served repo does so on the first miss; a load
+/// failure is that entry's error and leaves the rest of the batch intact.
+struct LateRepos {
+    loaded: MononokeRepos<TestRepo>,
+    pending: std::sync::Mutex<Option<(String, i32, TestRepo)>>,
+    failing: String,
+}
+
+impl RepoProvider<TestRepo> for LateRepos {
+    fn get_by_name(&self, name: &str) -> Option<Arc<TestRepo>> {
+        self.loaded.get_by_name(name)
+    }
+
+    fn get_or_load<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Arc<TestRepo>>>>
+    where
+        TestRepo: 'a,
+    {
+        use futures::FutureExt;
+        async move {
+            if name == self.failing {
+                anyhow::bail!("storage is not provisioned");
+            }
+            let pending = self
+                .pending
+                .lock()
+                .unwrap()
+                .take_if(|(n, _, _)| n.as_str() == name);
+            if let Some((n, id, repo)) = pending {
+                self.loaded.add(&n, id, repo);
+            }
+            Ok(self.loaded.get_by_name(name))
+        }
+        .boxed()
+    }
+}
+
+#[mononoke::fbinit_test]
+async fn test_resolve_bookmarks_cross_repo_loads_a_served_repo_on_first_use(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let mut factory = TestRepoFactory::new(fb)?;
+    let repo_a: TestRepo = factory
+        .with_id(RepositoryId::new(0))
+        .with_name("repo_a")
+        .build()
+        .await?;
+    let late: TestRepo = factory
+        .with_id(RepositoryId::new(1))
+        .with_name("late")
+        .build()
+        .await?;
+    let head = CreateCommitContext::new_root(&ctx, &late)
+        .add_file("f", "late")
+        .commit()
+        .await?;
+    bookmark(&ctx, &late, "main")
+        .create_publishing(head)
+        .await?;
+    let sha = GitSha1::from_byte_array([0xCC; 20]);
+    late.bonsai_git_mapping()
+        .add(&ctx, BonsaiGitMappingEntry::new(sha, head))
+        .await?;
+
+    let loaded: MononokeRepos<TestRepo> = MononokeRepos::new();
+    loaded.add("repo_a", 0, repo_a);
+    let provider = LateRepos {
+        loaded,
+        pending: std::sync::Mutex::new(Some(("late".to_string(), 1, late))),
+        failing: "broken".to_string(),
+    };
+    let entries = vec![
+        ResolveEntry {
+            repo_name: "late".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+        ResolveEntry {
+            repo_name: "broken".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+        ResolveEntry {
+            repo_name: "ghost".to_string(),
+            bookmark_name: "main".to_string(),
+        },
+    ];
+
+    let results = resolve_bookmarks_cross_repo(&ctx, &provider, &entries).await?;
+    assert_eq!(results[0].outcome, ResolveOutcome::Resolved(sha));
+    assert_eq!(
+        results[1].outcome,
+        ResolveOutcome::LoadFailed(
+            "repo broken failed to load: storage is not provisioned".to_string()
+        ),
+    );
+    assert_eq!(
+        results[2].outcome,
+        ResolveOutcome::UnknownRepo("unknown repo: ghost".to_string()),
+    );
+    assert!(provider.get_by_name("late").is_some(), "the load stuck");
+    Ok(())
+}
+
 /// With no parent override, the generated commit is built on the bookmark head,
 /// `old_cs` is that head (the CAS baseline), and the manifest file is the only
 /// change. A `MappedGitCommitId` is pre-derived.
@@ -394,6 +516,7 @@ async fn test_prepare_manifest_commit_default_parent(fb: FacebookInit) -> Result
             manifest_path: &manifest_path,
             content: Bytes::from("<manifest/>"),
             service_identity: "svc",
+            message: None,
             parent_override: None,
             baseline: CasBaseline::CurrentHead,
         },
@@ -429,6 +552,87 @@ async fn test_prepare_manifest_commit_default_parent(fb: FacebookInit) -> Result
     Ok(())
 }
 
+/// Several branches prepared at once come back in spec order, each saved and
+/// parented on its own head; a spec that cannot resolve fails the whole batch.
+#[mononoke::fbinit_test]
+async fn test_prepare_manifest_commits_keeps_spec_order(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: TestRepo = test_repo_factory::build_empty(fb).await?;
+    let manifest_path = NonRootMPath::new("static/static.xml")?;
+
+    let mut heads = Vec::new();
+    let mut bms = Vec::new();
+    for name in ["c", "a", "b"] {
+        let head = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("base", name)
+            .commit()
+            .await?;
+        bms.push(bookmark(&ctx, &repo, name).create_publishing(head).await?);
+        heads.push(head);
+    }
+    let specs: Vec<ManifestCommitSpec<'_>> = bms
+        .iter()
+        .zip(&heads)
+        .map(|(bm, head)| ManifestCommitSpec {
+            bookmark: bm,
+            manifest_path: &manifest_path,
+            content: Bytes::from(format!("<manifest name=\"{bm}\"/>")),
+            service_identity: "svc",
+            message: None,
+            parent_override: None,
+            baseline: CasBaseline::GeneratedFrom(*head),
+        })
+        .collect();
+
+    let prepared = prepare_manifest_commits(&ctx, &repo, specs, 2).await?;
+
+    assert_eq!(prepared.len(), 3);
+    for (i, (result, head)) in prepared.iter().zip(&heads).enumerate() {
+        assert_eq!(result.old_cs, *head, "result {i} keeps its spec's baseline");
+        let bcs = result.new_cs.load(&ctx, repo.repo_blobstore()).await?;
+        assert_eq!(
+            bcs.parents().collect::<Vec<_>>(),
+            vec![*head],
+            "result {i} is parented on its own head"
+        );
+        assert_eq!(result.mapped_git.oid().as_ref().len(), 20);
+    }
+
+    let missing = BookmarkKey::new("missing")?;
+    let err = prepare_manifest_commits(
+        &ctx,
+        &repo,
+        vec![
+            ManifestCommitSpec {
+                bookmark: &bms[0],
+                manifest_path: &manifest_path,
+                content: Bytes::from("<manifest/>"),
+                service_identity: "svc",
+                message: None,
+                parent_override: None,
+                baseline: CasBaseline::GeneratedFrom(heads[0]),
+            },
+            ManifestCommitSpec {
+                bookmark: &missing,
+                manifest_path: &manifest_path,
+                content: Bytes::from("<manifest/>"),
+                service_identity: "svc",
+                message: None,
+                parent_override: None,
+                baseline: CasBaseline::CurrentHead,
+            },
+        ],
+        2,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("manifest bookmark not found"),
+        "an unresolvable spec fails the batch: {err:#}"
+    );
+    Ok(())
+}
+
 /// A parent override (the user's manifest commit) becomes the generated commit's
 /// parent, while `old_cs` still reflects the live bookmark head.
 #[mononoke::fbinit_test]
@@ -459,6 +663,7 @@ async fn test_prepare_manifest_commit_parent_override(fb: FacebookInit) -> Resul
             manifest_path: &manifest_path,
             content: Bytes::from("<manifest/>"),
             service_identity: "svc",
+            message: None,
             parent_override: Some(user_commit),
             baseline: CasBaseline::CurrentHead,
         },
@@ -496,6 +701,7 @@ async fn test_prepare_manifest_commit_bookmark_not_found(fb: FacebookInit) -> Re
             manifest_path: &manifest_path,
             content: Bytes::from("<manifest/>"),
             service_identity: "svc",
+            message: None,
             parent_override: None,
             baseline: CasBaseline::CurrentHead,
         },
@@ -741,6 +947,7 @@ async fn generated_from_pins_the_cas_baseline_against_a_concurrent_land(
             manifest_path: &manifest_path,
             content: Bytes::from("<manifest/>"),
             service_identity: "svc",
+            message: None,
             parent_override: None,
             baseline: CasBaseline::GeneratedFrom(generated_from),
         },
@@ -759,6 +966,7 @@ async fn generated_from_pins_the_cas_baseline_against_a_concurrent_land(
             manifest_path: &manifest_path,
             content: Bytes::from("<manifest/>"),
             service_identity: "svc",
+            message: None,
             parent_override: None,
             baseline: CasBaseline::CurrentHead,
         },

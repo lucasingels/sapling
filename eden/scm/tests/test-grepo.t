@@ -3,6 +3,7 @@
   $ . $TESTDIR/git.sh
   $ enable smartlog
   $ setconfig grepo.manifestpath=.repo/manifests/static/static.xml
+  $ setconfig experimental.pathhistory-treemanifest=true
 
 Set up small project repos to simulate repos managed by the repo tool.
 project-a is the outer project at vendor/a; project-c is a nested project at
@@ -10,11 +11,16 @@ vendor/a/sub/c. In real-world .repo workspaces, vendor/a/.git does not
 manage vendor/a/sub/c because a .gitignore at vendor/a/sub/.gitignore
 excludes its subdirectories.
 
+Each project gets a second commit so the manifest history below can bump it.
+
   $ git init -q -b main project-a
   $ cd project-a
   $ echo "project-a content" > README
   $ git add README && git commit -qm 'init a'
   $ A_REV=$(git rev-parse HEAD)
+  $ echo "project-a content v2" > README
+  $ git add README && git commit -qm 'update a'
+  $ A2_REV=$(git rev-parse HEAD)
   $ cd ..
 
   $ git init -q -b main project-b
@@ -22,6 +28,9 @@ excludes its subdirectories.
   $ echo "project-b content" > README
   $ git add README && git commit -qm 'init b'
   $ B_REV=$(git rev-parse HEAD)
+  $ echo "project-b content v2" > README
+  $ git add README && git commit -qm 'update b'
+  $ B2_REV=$(git rev-parse HEAD)
   $ cd ..
 
   $ git init -q -b main project-c
@@ -29,13 +38,17 @@ excludes its subdirectories.
   $ echo "project-c content" > README
   $ git add README && git commit -qm 'init c'
   $ C_REV=$(git rev-parse HEAD)
+  $ echo "project-c content v2" > README
+  $ git add README && git commit -qm 'update c'
+  $ C2_REV=$(git rev-parse HEAD)
   $ cd ..
 
   $ mkdir repodir && cd repodir
 
-Set up .repo/manifests as its own git repo with .git symlinked to manifests.git:
+Set up .repo/manifests as its own git repo with .git symlinked to manifests.git.
+`repo init` puts the manifests repo on the local branch `default`:
 
-  $ git init -q -b main .repo/manifests
+  $ git init -q -b default .repo/manifests
   $ mv .repo/manifests/.git .repo/manifests.git
   $ ln -s ../manifests.git .repo/manifests/.git
   $ mkdir -p .repo/manifests/static
@@ -50,6 +63,31 @@ Set up .repo/manifests as its own git repo with .git symlinked to manifests.git:
   > </manifest>
   > EOF
   $ cd .repo/manifests && git add static/static.xml && git commit -qm 'add manifest' && cd ../..
+
+Three more manifest commits, each bumping a different project. The last one
+bumps only the nested project vendor/a/sub/c. The sapling commit graph in a
+grepo workspace is the .repo/manifests git history, so commits are made there:
+
+  $ writemanifest() {
+  >   cat > .repo/manifests/static/static.xml << EOF
+  > <?xml version="1.0" encoding="UTF-8"?>
+  > <manifest>
+  >   <remote name="origin" fetch="file://$TESTTMP"/>
+  >   <default revision="main" remote="origin"/>
+  >   <project name="project-a" path="vendor/a" revision="$1"/>
+  >   <project name="project-b" path="frameworks/b" revision="$2"/>
+  >   <project name="project-c" path="vendor/a/sub/c" revision="$3"/>
+  > </manifest>
+  > EOF
+  >   cd .repo/manifests && git add static/static.xml && git commit -qm "$4" && cd ../..
+  > }
+
+  $ writemanifest $A2_REV $B_REV $C_REV 'bump vendor/a'
+  $ REV_AFTER_BUMP_A=$(cd .repo/manifests && git rev-parse HEAD)
+  $ writemanifest $A2_REV $B2_REV $C_REV 'bump frameworks/b'
+  $ REV_AFTER_BUMP_B=$(cd .repo/manifests && git rev-parse HEAD)
+  $ writemanifest $A2_REV $B2_REV $C2_REV 'bump vendor/a/sub/c'
+  $ REV_AFTER_BUMP_C=$(cd .repo/manifests && git rev-parse HEAD)
 
 Set up projects with .git symlinks back to .repo/projects/:
 
@@ -88,23 +126,28 @@ Sapling recognizes .repo identity
   $TESTTMP/repodir
 
   $ sl smartlog -T '{desc}'
-  @  add manifest
+  @  bump vendor/a/sub/c
+  │
+  o  bump frameworks/b
+  │
+  o  bump vendor/a
+  │
+  o  add manifest
 
 clean status
   $ sl status
 
   $ sl log -r . -T "desc:\n  {desc}\nfiles:\n{files % '  {file}\n'}"
   desc:
-    add manifest
+    bump vendor/a/sub/c
   files:
-    frameworks/b
-    vendor/a
     vendor/a/sub/c
 
 modified outer project is reported by status
   $ cd vendor/a
   $ echo "project vendor/a" > README
   $ git add README && git commit -qm 'add README'
+  $ A_LOCAL_REV=$(git rev-parse HEAD)
   $ cd ../..
   $ sl status
   M vendor/a
@@ -116,14 +159,15 @@ Diff shows subproject commit change for the outer project:
   --- a/vendor/a	* (glob)
   +++ b/vendor/a	* (glob)
   @@ -1,1 +1,1 @@
-  -Subproject commit ac4ea71567e4779db728eebfc962382b53064bdb
-  +Subproject commit 8b78e5ec15214e009eb98624ee4dda34520d9720
+  -Subproject commit 7d040f902e73e68e8ead5bd185e0efcb1adbeb55
+  +Subproject commit 1f165e588b86d366379b684dedb0892249bebb89
 
 Modified nested (overlapping) project is reported by status:
 
   $ cd vendor/a/sub/c
   $ echo "project vendor/a/sub/c" > README
   $ git add README && git commit -qm 'modify c'
+  $ C_LOCAL_REV=$(git rev-parse HEAD)
   $ cd ../../../..
   $ sl status
   M vendor/a
@@ -136,14 +180,15 @@ Exact-path diff also works for the nested overlapping project:
   --- a/vendor/a/sub/c	* (glob)
   +++ b/vendor/a/sub/c	* (glob)
   @@ -1,1 +1,1 @@
-  -Subproject commit 30c3ba4e8b4dced473cce4f5d10ced2eecbd2515
-  +Subproject commit 9f2c189e3840b5857f220136620130d40f5e71ce
+  -Subproject commit 0b678834be64557c4e8710c49ef2fc96886a15a0
+  +Subproject commit c55758fb8d7a24213ba3288ab808a839b6049513
 
 Modified non-overlapping project is reported by status:
 
   $ cd frameworks/b
   $ echo "project frameworks/b" > README
   $ git add README && git commit -qm 'modify b'
+  $ B_LOCAL_REV=$(git rev-parse HEAD)
   $ cd ../..
   $ sl status
   M frameworks/b
@@ -157,8 +202,8 @@ Exact-path diff also works for the non-overlapping project:
   --- a/frameworks/b	* (glob)
   +++ b/frameworks/b	* (glob)
   @@ -1,1 +1,1 @@
-  -Subproject commit 6a9d13442cc0deb7f2b531a00ac679f62d09edf3
-  +Subproject commit 96287d65976c48a2d3046495e3089baeb388a671
+  -Subproject commit 434524b4d4743bcdf1e15d26adca081cfe8fd7d5
+  +Subproject commit ab01d5a104b4500852675c2b96bd84773899b371
 
 sl debuggitmodules lists grepo projects as Submodule entries.
 Mainly used for ISL integration.
@@ -180,7 +225,1882 @@ Mainly used for ISL integration.
   	ref=* (glob)
   	active=true
 
-(bad: blame doesn't work)
-  $ sl blame vendor/a
-  abort: vendor/a@000000000000: not found in manifest!
+copytrace resolves grepo project paths: a project path answers with itself, and
+so does the nested overlapping one, while an unknown path answers null.
+
+  $ sl debugcopytrace -s . -d . vendor/a
+  {"vendor/a": "vendor/a"}
+  $ sl debugcopytrace -s . -d . vendor/a/sub/c
+  {"vendor/a/sub/c": "vendor/a/sub/c"}
+  $ sl debugcopytrace -s . -d . nosuch/path
+  {"nosuch/path": null}
+
+sl log on a project path shows the manifest commits that bumped it. The exact
+vendor/a file identity is independent of its traversable directory cursor:
+
+  $ sl log vendor/a -T '{desc}\n'
+  bump vendor/a
+  add manifest
+
+  $ sl log vendor/a/sub/c -T '{desc}\n'
+  bump vendor/a/sub/c
+  add manifest
+
+A pure directory ancestor tracks structural changes below it:
+
+  $ sl log vendor -T '{desc}\n'
+  bump vendor/a/sub/c
+  bump vendor/a
+  add manifest
+
+A project with no nested project below it only shows its own bumps:
+
+  $ sl log frameworks/b -T '{desc}\n'
+  bump frameworks/b
+  add manifest
+
+A path that is not a project has no history:
+
+  $ sl log vendor/nope -T '{desc}\n'
+
+sl blame on a project path attributes the outer and nested project lines to
+their corresponding manifest commits:
+
+  $ sl blame -n -f vendor/a
+  72057594037927937 vendor/a: Subproject commit * (glob)
+  72057594037927939 vendor/a/sub/c: Subproject commit * (glob)
+
+Helpers for the `goto` tests below. Each test does 4 steps:
+1. `reset_workspace` makes the workspace clean.
+2. The test makes one kind of change.
+3. The test runs `sl goto` with one flag.
+4. `workspace_state` prints everything `goto` can change.
+
+`map_rev_names` replaces each known hash with its variable name, like `A_REV`
+or `REV_AFTER_BUMP_C`. All these variables must be set before you call it. An
+empty one breaks the `sed` command.
+
+  $ map_rev_names() {
+  >   sed -e "s/$A_REV/A_REV/g" -e "s/$A2_REV/A2_REV/g" -e "s/$A_LOCAL_REV/A_LOCAL_REV/g" \
+  >       -e "s/$B_REV/B_REV/g" -e "s/$B2_REV/B2_REV/g" -e "s/$B_LOCAL_REV/B_LOCAL_REV/g" \
+  >       -e "s/$C_REV/C_REV/g" -e "s/$C2_REV/C2_REV/g" -e "s/$C_LOCAL_REV/C_LOCAL_REV/g" \
+  >       -e "s/$REV_AFTER_BUMP_A/REV_AFTER_BUMP_A/g" \
+  >       -e "s/$REV_AFTER_BUMP_B/REV_AFTER_BUMP_B/g" \
+  >       -e "s/$REV_AFTER_BUMP_C/REV_AFTER_BUMP_C/g"
+  > }
+
+`project_heads` prints the HEAD of each project. Under each HEAD it prints the
+project's modified files. It does not print untracked files.
+
+  $ project_heads() {
+  >   for p in vendor/a frameworks/b vendor/a/sub/c; do
+  >     echo "$p: $(git -C $p rev-parse HEAD | map_rev_names)"
+  >     git -C $p status --porcelain --untracked-files=no
+  >   done
+  > }
+
+`read_manifest_revs` reads a manifest from stdin. It prints one `path=REV` pair
+per project, all on one line.
+
+  $ read_manifest_revs() {
+  >   echo $(grep '<project' | sed 's/.*path="([^"]*)" revision="([^"]*)".*/\1=\2/' | map_rev_names)
+  > }
+
+`workspace_state` prints:
+- `sl_workingcopy_parent`: the commit message of `.`.
+- `manifests HEAD`: the branch that HEAD of the manifests repo points to, or
+`detached`. Then the commit.
+- `static.xml index`: the revisions in the Git index of the manifests repo.
+- `static.xml disk`: the revisions in the file on disk. The two differ when
+`goto` moves the index but does not rewrite the file.
+- `manifests:`: `git status` of the manifests repo.
+- The project HEADs, from `project_heads`.
+- `sl status:`: what Sapling says is modified.
+
+  $ workspace_state() {
+  >   echo "sl_workingcopy_parent: $(sl log -r . -T '{desc}')"
+  >   echo "manifests HEAD: $(git -C .repo/manifests symbolic-ref -q HEAD || echo detached) $(git -C .repo/manifests rev-parse HEAD | map_rev_names)"
+  >   echo "static.xml index: $(git -C .repo/manifests show :static/static.xml | read_manifest_revs)"
+  >   echo "static.xml disk: $(read_manifest_revs < .repo/manifests/static/static.xml)"
+  >   git -C .repo/manifests status --porcelain | sed 's/^/manifests: /'
+  >   project_heads
+  >   sl status | sed 's/^/sl status: /'
+  > }
+
+`reset_workspace [REV]` gives a clean checkout of manifest commit REV. REV
+defaults to `$REV_AFTER_BUMP_C`. It uses Git, not `sl goto`, so it works even
+after a `goto` that failed halfway. It:
+- points `refs/heads/default` back at REV. This brings back commits that an
+earlier `goto` orphaned.
+- attaches HEAD of the manifests repo to `default`.
+- resets the manifests index and files.
+- checks out each project at its revision in `static.xml` of REV.
+It does not remove untracked files.
+
+  $ reset_workspace() {
+  >   local rev=${1:-$REV_AFTER_BUMP_C}
+  >   git -C .repo/manifests update-ref refs/heads/default $rev
+  >   git -C .repo/manifests symbolic-ref HEAD refs/heads/default
+  >   git -C .repo/manifests reset -q --hard
+  >   for p in vendor/a frameworks/b vendor/a/sub/c; do
+  >     local r=$(grep "path=\"$p\"" .repo/manifests/static/static.xml | sed 's/.*revision="([^"]*)".*/\1/')
+  >     git -C $p checkout -q -f --detach $r
+  >   done
+  > }
+
+The status tests above left every project at a local commit. `reset_workspace`
+puts each project back at its revision in `static.xml` of `$REV_AFTER_BUMP_C`:
+
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A_LOCAL_REV
+  frameworks/b: B_LOCAL_REV
+  vendor/a/sub/c: C_LOCAL_REV
+  sl status: M frameworks/b
+  sl status: M vendor/a
+  sl status: M vendor/a/sub/c
+  $ reset_workspace
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+Below we make three changes:
+- edit the revision of `vendor/a/sub/c` in `static.xml`.
+- check out `vendor/a/sub/c` at that revision.
+- change a file in `frameworks/b` without committing it.
+`workspace_state` shows all three. `reset_workspace` undoes all three. Note that
+Sapling says `vendor/a/sub/c` is modified, even though it matches `static.xml`
+on disk. This is because `sl status` compares with the committed manifest, not
+with the file on disk.
+
+  $ sed -i "s/$C2_REV/$C_REV/" .repo/manifests/static/static.xml
+  $ git -C vendor/a/sub/c checkout -q --detach $C_REV
+  $ echo "uncommitted change" > frameworks/b/README
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+  sl status: M vendor/a/sub/c
+  $ reset_workspace
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`reset_workspace` also undoes a `goto`. It moves `.` back. It also brings back
+the manifest commits that `goto` orphaned:
+
+  $ sl goto -q $REV_AFTER_BUMP_A
+  $ sl smartlog -T '{desc}' --all
+  @  bump vendor/a
+  │
+  o  add manifest
+  $ reset_workspace
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+  $ sl smartlog -T '{desc}' --all
+  @  bump vendor/a/sub/c
+  │
+  o  bump frameworks/b
+  │
+  o  bump vendor/a
+  │
+  o  add manifest
+
+`goto` tests: clean workspace
+
+Every test below starts clean at `$REV_AFTER_BUMP_C`:
+- The manifests repo has no changes.
+- Each project is at its revision in `static.xml`, with no changes.
+- `sl status` is empty.
+Then it runs `sl goto $REV_AFTER_BUMP_B`. The goto updates the revision of
+only `vendor/a/sub/c`, both in `static.xml` and the checked out submodule
+(`C2_REV` -> `C_REV`).
+
+Nothing is dirty, so every flag should give the same result:
+- `.` is the target.
+- Every project is checked out at its revision in the target's `static.xml`.
+- The manifests index and `static.xml` on disk both match the target. So
+`git status` in the manifests repo is empty.
+- `sl status` is empty.
+- No manifest commit gets orphaned.
+Lines marked `(bad: ...)` show where today's behavior is different.
+
+Each test ends with the args that `sl goto` passes to `hg.updatetotally`:
+- `clean=True` or `updatecheck="noconflict"` uses the Rust checkout.
+- `updatecheck="none"` uses the Python checkout.
+- `updatecheck="abort"` first aborts if Sapling sees uncommitted changes. Then
+it works like `updatecheck="none"`.
+
+Default flags. Expected: the result above.
+(bad: `default` moved back. The `bump vendor/a/sub/c` commit is orphaned.)
+(bad: it says "0 files updated", but it checked out a project.)
+clean=False, updatecheck="noconflict"
+
+  $ sl goto $REV_AFTER_BUMP_B
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ sl smartlog -T '{desc}' --all
+  @  bump frameworks/b
+  │
+  o  bump vendor/a
+  │
+  o  add manifest
+
+`--check`. Expected: the result above.
+(bad: `default` moved back and "0 files updated", same as the default flags.)
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sl goto --check $REV_AFTER_BUMP_B
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--merge`. Expected: the result above. Nothing is dirty, so it works like
+`--check`.
+(bad: same as `--check`)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sl goto --merge $REV_AFTER_BUMP_B
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--clean`. Expected: the result above. Nothing is dirty, so it works like the
+default flags.
+(bad: same as the default flags)
+clean=True
+
+  $ reset_workspace
+  $ sl goto --clean $REV_AFTER_BUMP_B
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Default flags, going to `$REV_AFTER_BUMP_A`. The goto updates the revision of
+two projects, `frameworks/b` and `vendor/a/sub/c`, both in `static.xml` and the
+checked out submodules. Expected: the result above. Both submodules are checked
+out at the new revisions.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sl goto $REV_AFTER_BUMP_A
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B_REV
+  vendor/a/sub/c: C_REV
+
+Default flags, going forward to the commit that the last `goto` orphaned.
+`goto` still finds it by hash, and it ends in the right state.
+clean=False, updatecheck="noconflict"
+
+  $ sl goto $REV_AFTER_BUMP_C
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`goto` tests: dirty project
+
+Every test starts clean at `$REV_AFTER_BUMP_C` and makes one project dirty.
+Then it runs `sl goto $REV_AFTER_BUMP_B`. The dirty project is one of:
+- `vendor/a/sub/c`. The goto updates the revision of this project, both in
+`static.xml` and the checked out submodule.
+- `frameworks/b`. The goto keeps the revision of this project, both in
+`static.xml` and the checked out submodule.
+The project is dirty in one of two ways:
+- A file has an uncommitted change. Sapling can't see this, so `sl status` is
+empty.
+- The project has a local commit (`*_LOCAL_REV`). Sapling shows the project as
+modified.
+
+Expected:
+- Default flags and `--merge`: if the goto keeps the project's revision, keep
+the change. If the goto updates it and the change is not committed, treat the
+project as a conflicting project (see below). If the goto updates it and the
+change is a local commit, refuse before changing anything.
+- `--check`: for a local commit, refuse before changing anything. Sapling sees
+the commit. For an uncommitted change, work like the default flags. Sapling
+can't see the change.
+- `--clean`: throw away the change and check out the target.
+
+A conflicting project is a project where Git refuses the checkout because of a
+change in the project. The checkout is not atomic. goto first moves `.` and the
+manifests HEAD to the target. Then Git checks out each project. A conflicting
+project stays at its source revision and keeps its change. The other projects
+move to the target. At the end, goto reports all conflicting projects in one
+error.
+
+The problems from the clean tests (`default` moved back) show up here too. We do
+not mark them again.
+
+Uncommitted change in `vendor/a/sub/c`. The goto updates the revision of
+this project.
+
+Default flags. Expected: `vendor/a/sub/c` is a conflicting project. `.` and
+`default` move to `$REV_AFTER_BUMP_B`. `vendor/a/sub/c` stays at `C2_REV` and keeps
+the change. goto reports that `vendor/a/sub/c` failed.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
   [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    vendor/a/sub/c (C_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--check`. Expected: `sl status` is empty, so the check passes. Then the result
+is the same as for the default flags.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    vendor/a/sub/c (C_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--merge`. Expected: the same result as the default flags.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    vendor/a/sub/c (C_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--clean`. Expected: throw away the change and check out `C_REV`.
+clean=True
+
+  $ reset_workspace
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Uncommitted change in `frameworks/b`, going to `$REV_AFTER_BUMP_A`. The goto
+updates the revision of two projects, `frameworks/b` and `vendor/a/sub/c`. Git
+checks out `frameworks/b` first. `vendor/a/sub/c` has no change.
+
+Default flags. Expected: `frameworks/b` is a conflicting project. `.` and `default`
+move to `$REV_AFTER_BUMP_A`. `frameworks/b` stays at `B2_REV` and keeps the
+change. `vendor/a/sub/c` moves to `C_REV`. goto reports that `frameworks/b`
+failed.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto $REV_AFTER_BUMP_A > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    frameworks/b (B_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+  sl status: M frameworks/b
+
+Recovery from the failed goto above. The test reverts the change in
+`frameworks/b` with Git. Then it runs the same goto again. Expected: goto
+checks out every project at its revision in the target's `static.xml`.
+clean=False, updatecheck="noconflict"
+
+  $ git -C frameworks/b checkout -q -- README
+  $ sl goto $REV_AFTER_BUMP_A > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B_REV
+  vendor/a/sub/c: C_REV
+
+The same goto with `workingcopy.rust-checkout=false`. Expected: the same
+result as the Rust checkout.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --config workingcopy.rust-checkout=false $REV_AFTER_BUMP_A > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    frameworks/b (B_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+  sl status: M frameworks/b
+
+Uncommitted changes in `frameworks/b` and `vendor/a/sub/c`, going to
+`$REV_AFTER_BUMP_A`. Expected: both projects are conflicting projects. goto
+reports both of them in one error.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto $REV_AFTER_BUMP_A > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 2 projects
+    frameworks/b (B_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+    vendor/a/sub/c (C_REV):
+      error: Your local changes to the following files would be overwritten by checkout:
+      	README
+      Please commit your changes or stash them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C2_REV
+   M README
+  sl status: M frameworks/b
+  sl status: M vendor/a/sub/c
+
+Recovery with the hint from the failed goto above. The test runs the same goto
+again with `--clean`. Expected: goto discards both changes. It checks out every
+project at its revision in the target's `static.xml`.
+clean=True
+
+  $ sl goto --clean $REV_AFTER_BUMP_A > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_A
+  static.xml index: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B_REV
+  vendor/a/sub/c: C_REV
+
+Uncommitted change in `frameworks/b`. The goto keeps the revision of this
+project.
+
+Default flags. Expected: keep the change.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+
+`--check`. Expected: `sl status` is empty, so the check passes. Keep the
+change.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+
+`--merge`. Expected: keep the change.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+   M README
+  vendor/a/sub/c: C_REV
+
+`--clean`. Expected: throw away the change.
+clean=True
+
+  $ reset_workspace
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Local commit in `vendor/a/sub/c`. The goto updates the revision of this
+project. Sapling shows the project as modified.
+
+Default flags. Expected: refuse, because both the local commit and the goto
+change this project.
+(bad: goto checks out `C_REV` and drops `C_LOCAL_REV` without a word.)
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+  sl status: M vendor/a/sub/c
+
+`--merge`. Expected: refuse or report a conflict, because two revisions of a
+project can't be merged.
+(bad: goto checks out `C_REV` and drops `C_LOCAL_REV` without a word.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--clean`. Expected: check out `C_REV`. `C_LOCAL_REV` is still in the project's
+Git repo.
+clean=True
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Local commit in `frameworks/b`. The goto keeps the revision of this
+project. Sapling shows the project as modified.
+
+Default flags. Expected: keep `frameworks/b` at `B_LOCAL_REV`.
+(bad: goto resets it to `B2_REV` and drops `B_LOCAL_REV` without a word.)
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--merge`. Expected: keep `frameworks/b` at `B_LOCAL_REV`.
+(bad: same as the default flags. It even counts the reset as "1 files
+updated".)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--clean`. Expected: reset `frameworks/b` to `B2_REV`. `B_LOCAL_REV` is still in
+the project's Git repo.
+clean=True
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`goto` tests: dirty manifest
+
+Every test starts clean at `$REV_AFTER_BUMP_C`. It edits the revision of one
+project in `static.xml` on disk. It does not commit the edit. Then it runs
+`sl goto $REV_AFTER_BUMP_B`. The goto updates the revision of only
+`vendor/a/sub/c`, both in `static.xml` and the checked out submodule.
+The edit is to one of two lines:
+- The `vendor/a/sub/c` line. The goto also changes this line.
+- The `frameworks/b` line. The goto keeps this line.
+The edited project is in one of two states:
+- It stays at its old revision.
+- It is checked out at the new revision from the edit.
+
+Sapling compares each project with `static.xml` in the commit. It does not read
+`static.xml` on disk. So the edit alone leaves `sl status` empty. A project
+checked out at the new revision shows as modified, like a local commit.
+
+Expected: treat the `static.xml` edit like an uncommitted file change in the
+manifests repo.
+- Default flags: if the goto keeps the edited line, keep the edit. If the goto
+changes the same line, refuse before changing anything.
+- `--check`: refuse before changing anything.
+- `--merge`: merge the edit into `static.xml` of the target. If the goto changes
+the same line, report a conflict.
+- `--clean`: throw away the edit. `static.xml` on disk matches the target.
+Projects follow the same rules as in the dirty project tests.
+
+Today the goto refuses before it changes anything when `static.xml` on disk
+has an edit. Only `--clean` goes through. It refuses even when the goto keeps
+the edited line. The problems from the clean tests show up here too. We do not
+mark them again.
+
+Edit to the `vendor/a/sub/c` line. The project stays at `C2_REV`.
+
+Default flags. Expected: refuse, because the goto changes the same line.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--merge`. Expected: report a conflict on the `vendor/a/sub/c` line.
+(bad: it refuses. It does not report a conflict.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--clean`. Expected: throw away the edit.
+clean=True
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Edit to the `frameworks/b` line. The project stays at `B2_REV`.
+
+Default flags. Expected: keep the edit on top of `static.xml` of the target.
+(bad: it refuses, even though the goto keeps the `frameworks/b` line.)
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--merge`. Expected: merge the edit into `static.xml` of the target.
+(bad: it refuses, same as the default flags.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--clean`. Expected: throw away the edit.
+clean=True
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Edit to the `vendor/a/sub/c` line. The project is checked out at the new
+revision `C_LOCAL_REV`. Sapling shows the project as modified.
+
+Default flags. Expected: refuse, because the goto changes the same line.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+  sl status: M vendor/a/sub/c
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+  sl status: M vendor/a/sub/c
+
+`--merge`. Expected: report a conflict on the `vendor/a/sub/c` line.
+(bad: it refuses. It does not report a conflict.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+  sl status: M vendor/a/sub/c
+
+`--clean`. Expected: throw away the edit and check out `C_REV`.
+clean=True
+
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Edit to the `frameworks/b` line. The project is checked out at the new revision
+`B_LOCAL_REV`. Sapling shows the project as modified.
+
+Default flags. Expected: keep the edit. Keep `frameworks/b` at `B_LOCAL_REV`.
+(bad: it refuses, even though the goto keeps the `frameworks/b` line.)
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--merge`. Expected: keep the edit. Keep `frameworks/b` at `B_LOCAL_REV`.
+(bad: it refuses, same as the default flags.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--clean`. Expected: throw away the edit and reset `frameworks/b` to `B2_REV`.
+clean=True
+
+  $ reset_workspace
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`goto` tests: dirty manifest and dirty project
+
+Every test starts clean at `$REV_AFTER_BUMP_C` and makes three changes to one
+project:
+- check out the project at its local revision (`*_LOCAL_REV`).
+- edit the revision of the project in `static.xml` on disk to match.
+- change a file in the project without committing it.
+Then it runs `sl goto $REV_AFTER_BUMP_B`. The goto updates the revision of only
+`vendor/a/sub/c`, both in `static.xml` and the checked out submodule.
+The dirty project is one of:
+- `vendor/a/sub/c`. The goto updates the revision of this project.
+- `frameworks/b`. The goto keeps the revision of this project.
+
+Expected (the dirty project and dirty manifest rules combined):
+- Default flags and `--merge`: if the goto keeps the project's revision, keep
+all three changes. If the goto updates it, refuse before changing anything.
+- `--check`: refuse before changing anything.
+- `--clean`: throw away all three changes and check out the target.
+The problems from the clean tests show up here too. We do not mark them again.
+
+Dirty project `vendor/a/sub/c`. The goto updates the revision of this project.
+
+Default flags. Expected: refuse before changing anything.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--merge`. Expected: refuse before changing anything.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_LOCAL_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_LOCAL_REV
+   M README
+  sl status: M vendor/a/sub/c
+
+`--clean`. Expected: throw away all three changes and check out `C_REV`.
+clean=True
+
+  $ reset_workspace
+  $ git -C vendor/a/sub/c checkout -q --detach $C_LOCAL_REV
+  $ sed -i "s/$C2_REV/$C_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > vendor/a/sub/c/README
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+Dirty project `frameworks/b`. The goto keeps the revision of this project.
+
+Default flags. Expected: keep all three changes.
+(bad: it refuses before changing anything, because of the `static.xml` edit.)
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+   M README
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--check`. Expected: refuse before changing anything.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: uncommitted changes
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+   M README
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--merge`. Expected: keep all three changes.
+(bad: it refuses, same as the default flags.)
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: could not check out 1 project
+    .repo/manifests (REV_AFTER_BUMP_B):
+      error: Entry 'static/static.xml' not uptodate. Cannot merge.
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B_LOCAL_REV vendor/a/sub/c=C2_REV
+  manifests:  M static/static.xml
+  vendor/a: A2_REV
+  frameworks/b: B_LOCAL_REV
+   M README
+  vendor/a/sub/c: C2_REV
+  sl status: M frameworks/b
+
+`--clean`. Expected: throw away all three changes and reset `frameworks/b` to
+`B2_REV`.
+clean=True
+
+  $ reset_workspace
+  $ git -C frameworks/b checkout -q --detach $B_LOCAL_REV
+  $ sed -i "s/$B2_REV/$B_LOCAL_REV/" .repo/manifests/static/static.xml
+  $ echo "uncommitted change" > frameworks/b/README
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`goto` tests: untracked files
+
+Every test starts clean at `$REV_AFTER_BUMP_C` and adds one untracked file.
+Then it runs `sl goto`. `sl status` does not show untracked files in projects
+or in the manifests repo. `reset_workspace` does not remove them. So each test
+removes its file at the end.
+
+Expected: the same rules as for untracked files in Sapling's own tree.
+- If the target has no file at the untracked path: every flag keeps the file.
+- If the target adds a file at that path: for the default flags, `--check` and
+`--merge`, the project is a conflicting project, as in the dirty project tests.
+`--clean` replaces the file with the target's file.
+The problems from the clean tests show up here too. We do not mark them again.
+
+Untracked file in `vendor/a/sub/c`. The goto updates the revision of this
+project. The target has no file at the untracked path.
+
+Default flags. Expected: keep the file.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/untracked
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? untracked
+  $ cat vendor/a/sub/c/untracked
+  untracked
+  $ rm vendor/a/sub/c/untracked
+
+`--check`. Expected: keep the file.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/untracked
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? untracked
+  $ cat vendor/a/sub/c/untracked
+  untracked
+  $ rm vendor/a/sub/c/untracked
+
+`--merge`. Expected: keep the file.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/untracked
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? untracked
+  $ cat vendor/a/sub/c/untracked
+  untracked
+  $ rm vendor/a/sub/c/untracked
+
+`--clean`. Expected: keep the file.
+clean=True
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/untracked
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? untracked
+  $ cat vendor/a/sub/c/untracked
+  untracked
+  $ rm vendor/a/sub/c/untracked
+
+Untracked file in the manifests repo.
+
+Default flags. Expected: keep the file.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "untracked" > .repo/manifests/untracked
+  $ sl goto $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  manifests: ?? untracked
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ cat .repo/manifests/untracked
+  untracked
+  $ rm .repo/manifests/untracked
+
+`--check`. Expected: keep the file.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ echo "untracked" > .repo/manifests/untracked
+  $ sl goto --check $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  manifests: ?? untracked
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ cat .repo/manifests/untracked
+  untracked
+  $ rm .repo/manifests/untracked
+
+`--merge`. Expected: keep the file.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ echo "untracked" > .repo/manifests/untracked
+  $ sl goto --merge $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  manifests: ?? untracked
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ cat .repo/manifests/untracked
+  untracked
+  $ rm .repo/manifests/untracked
+
+`--clean`. Expected: keep the file.
+clean=True
+
+  $ reset_workspace
+  $ echo "untracked" > .repo/manifests/untracked
+  $ sl goto --clean $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  manifests: ?? untracked
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+  $ cat .repo/manifests/untracked
+  untracked
+  $ rm .repo/manifests/untracked
+
+Untracked file in `vendor/a/sub/c` at a path the target adds.
+
+No revision above adds a path. So the setup below makes two new commits:
+- `C3_REV` in project `c`. It adds the file `added` on top of `C2_REV`.
+- `$REV_AFTER_ADD_C` in the manifests repo, on top of `$REV_AFTER_BUMP_C`. Its
+`static.xml` sets `vendor/a/sub/c` to `C3_REV`.
+`reset_workspace` moves `refs/heads/default` back. The `add-c` branch keeps
+`$REV_AFTER_ADD_C` visible to Sapling after that. `map_rev_names` does not know
+the two new hashes. So the tests rename them with an extra `sed`.
+
+  $ echo "added content" > $TESTTMP/project-c/added
+  $ git -C $TESTTMP/project-c add added
+  $ git -C $TESTTMP/project-c commit -qm 'add file to c'
+  $ C3_REV=$(git -C $TESTTMP/project-c rev-parse HEAD)
+  $ git -C vendor/a/sub/c fetch -q origin
+  $ reset_workspace
+  $ sed -i "s/$C2_REV/$C3_REV/" .repo/manifests/static/static.xml
+  $ git -C .repo/manifests commit -qam 'add file to vendor/a/sub/c'
+  $ REV_AFTER_ADD_C=$(git -C .repo/manifests rev-parse HEAD)
+  $ git -C .repo/manifests branch add-c
+
+Default flags. Expected: `vendor/a/sub/c` is a conflicting project. `.` and
+`default` move to `$REV_AFTER_ADD_C`. `vendor/a/sub/c` stays at `C2_REV` and keeps
+the file. goto reports that `vendor/a/sub/c` failed.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/added
+  $ sl goto $REV_AFTER_ADD_C > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  abort: could not check out 1 project
+    vendor/a/sub/c (C3_REV):
+      error: The following untracked working tree files would be overwritten by checkout:
+      	added
+      Please move or remove them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  sl_workingcopy_parent: add file to vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_ADD_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M vendor/a/sub/c
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? added
+  $ cat vendor/a/sub/c/added
+  untracked
+  $ rm vendor/a/sub/c/added
+
+`--check`. Expected: `sl status` does not show the file, so the check passes.
+Then the result is the same as for the default flags.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/added
+  $ sl goto --check $REV_AFTER_ADD_C > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  abort: could not check out 1 project
+    vendor/a/sub/c (C3_REV):
+      error: The following untracked working tree files would be overwritten by checkout:
+      	added
+      Please move or remove them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  sl_workingcopy_parent: add file to vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_ADD_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M vendor/a/sub/c
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? added
+  $ cat vendor/a/sub/c/added
+  untracked
+  $ rm vendor/a/sub/c/added
+
+`--merge`. Expected: the same result as the default flags.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/added
+  $ sl goto --merge $REV_AFTER_ADD_C > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  abort: could not check out 1 project
+    vendor/a/sub/c (C3_REV):
+      error: The following untracked working tree files would be overwritten by checkout:
+      	added
+      Please move or remove them before you switch branches.
+      Aborting
+  (if local changes conflict, commit, stash or remove them and retry, or use 'sl goto --clean' to discard them)
+  $ workspace_state | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  sl_workingcopy_parent: add file to vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_ADD_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+  sl status: M vendor/a/sub/c
+  $ git -C vendor/a/sub/c status --porcelain
+  ?? added
+  $ cat vendor/a/sub/c/added
+  untracked
+  $ rm vendor/a/sub/c/added
+
+`--clean`. Expected: replace the file with the target's `added`. Check out
+`vendor/a/sub/c` at `C3_REV`.
+clean=True
+
+  $ reset_workspace
+  $ echo "untracked" > vendor/a/sub/c/added
+  $ sl goto --clean $REV_AFTER_ADD_C > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state | sed -e "s/$C3_REV/C3_REV/g" -e "s/$REV_AFTER_ADD_C/REV_AFTER_ADD_C/g"
+  sl_workingcopy_parent: add file to vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_ADD_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C3_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C3_REV
+  $ git -C vendor/a/sub/c status --porcelain
+  $ cat vendor/a/sub/c/added
+  added content
+
+`goto` tests: failing `preupdate` hook
+
+Every test starts clean at `$REV_AFTER_BUMP_C`. It sets a `preupdate` hook that
+always fails. Then it runs `sl goto $REV_AFTER_BUMP_B`.
+
+Expected for every flag: the goto aborts and nothing changes. `.`, the manifests
+HEAD, `static.xml` on disk, the manifests index and every project stay at
+`$REV_AFTER_BUMP_C`.
+
+Default flags. Expected: the result above.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sl goto --config hooks.preupdate=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: preupdate hook exited with status 1
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--check`. Expected: the result above.
+clean=False, updatecheck="abort"
+
+  $ reset_workspace
+  $ sl goto --check --config hooks.preupdate=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: preupdate hook exited with status 1
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--merge`. Expected: the result above.
+clean=False, updatecheck="none"
+
+  $ reset_workspace
+  $ sl goto --merge --config hooks.preupdate=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: preupdate hook exited with status 1
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`--clean`. Expected: the result above.
+clean=True
+
+  $ reset_workspace
+  $ sl goto --clean --config hooks.preupdate=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  [255]
+  $ map_rev_names < $TESTTMP/goto.out
+  abort: preupdate hook exited with status 1
+  $ workspace_state
+  sl_workingcopy_parent: bump vendor/a/sub/c
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_C
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C2_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C2_REV
+
+`goto` tests: Rust checkout turned off
+
+Every test starts clean at `$REV_AFTER_BUMP_C`. It sets
+`workingcopy.rust-checkout=false`. Then it runs `sl goto $REV_AFTER_BUMP_B`.
+Without this config, the default flags and `--clean` use the Rust checkout. With
+it, they use the Python checkout.
+
+Expected: the same result as the Rust checkout.
+The problems from the clean tests show up here too. We do not mark them again.
+
+Default flags. Expected: the result above.
+clean=False, updatecheck="noconflict"
+
+  $ reset_workspace
+  $ sl goto --config workingcopy.rust-checkout=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV
+
+`--clean`. Expected: the result above.
+clean=True
+
+  $ reset_workspace
+  $ sl goto --clean --config workingcopy.rust-checkout=false $REV_AFTER_BUMP_B > $TESTTMP/goto.out 2>&1
+  $ map_rev_names < $TESTTMP/goto.out
+  0 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ workspace_state
+  sl_workingcopy_parent: bump frameworks/b
+  manifests HEAD: refs/heads/default REV_AFTER_BUMP_B
+  static.xml index: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  static.xml disk: vendor/a=A2_REV frameworks/b=B2_REV vendor/a/sub/c=C_REV
+  vendor/a: A2_REV
+  frameworks/b: B2_REV
+  vendor/a/sub/c: C_REV

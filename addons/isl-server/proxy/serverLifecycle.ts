@@ -9,6 +9,7 @@ import type {ServerChallengeResponse} from './server';
 
 import * as http from 'node:http';
 import * as https from 'node:https';
+import {sleep} from 'shared/utils';
 import {type ExistingServerInfo, readExistingServerFile} from './existingServerStateFiles';
 import {areTokensEqual} from './proxyUtils';
 
@@ -66,9 +67,9 @@ export async function checkIfServerIsAliveAndIsISL(
     ]);
 
     response = JSON.parse(result);
-  } catch (error) {
+  } catch {
     if (!silent) {
-      info(`error checking if existing Sapling Web server on port ${port} is authentic: `, error);
+      info(`error checking if existing Sapling Web server on port ${port} is authentic`);
     }
     // if the request fails for any reason, we don't think it's an ISL server.
     return null;
@@ -94,16 +95,13 @@ export async function readExistingServerFileWithRetries(
     try {
       // eslint-disable-next-line no-await-in-loop
       return await readExistingServerFile(port);
-    } catch (error) {
-      sleepMs(500);
+    } catch {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(500);
     }
     tries--;
   }
   return undefined;
-}
-
-function sleepMs(timeMs: number): Promise<void> {
-  return new Promise(res => setTimeout(res, timeMs));
 }
 
 export function validateServerChallengeResponse(v: unknown): v is ServerChallengeResponse {

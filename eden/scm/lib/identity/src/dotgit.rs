@@ -6,12 +6,15 @@
  */
 
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Usually `.git` is a directory. However, submodule repo created by `git`
+/// Usually `.git` is a directory. However, a submodule or linked worktree created by `git`
 /// uses a file `.git` with the content `gitdir: ...`. This function attempts
 /// to follow the file to get a directory. Best-effort.
+///
+/// In Git terminology, returns `$GIT_DIR`, not `$GIT_COMMON_DIR`.
 pub fn follow_dotgit_path(mut git_dir: PathBuf) -> PathBuf {
     for _patience in 0..4 {
         let metadata = match fs::metadata(&git_dir) {
@@ -41,38 +44,45 @@ pub fn follow_dotgit_path(mut git_dir: PathBuf) -> PathBuf {
     util::path::normalize(&git_dir)
 }
 
-/// Resolve the "common" git dir for a (followed) git dir.
+/// Resolve Git's `GIT_COMMON_DIR` from an already resolved `GIT_DIR`.
 ///
-/// A linked git worktree has its own git dir at `<main>/.git/worktrees/<name>`
-/// holding only per-worktree state (`HEAD`, `index`, `refs/bisect`, ...).
-/// That directory contains a `commondir` file pointing (usually relatively) at
-/// the main `.git`, which holds the shared state (`objects`, `refs/heads`,
-/// `packed-refs`, `config`, ...). This mirrors `git rev-parse --git-common-dir`.
-///
-/// Returns `git_dir` unchanged when there is no `commondir` file.
-pub fn read_git_common_dir(git_dir: &Path) -> PathBuf {
-    let commondir_path = git_dir.join("commondir");
-    match fs::read_to_string(&commondir_path) {
-        Ok(content) => {
-            let content = content.trim();
-            if content.is_empty() {
-                return git_dir.to_path_buf();
-            }
-            let common = git_dir.join(content);
-            tracing::trace!(
-                "git common dir {} => {}",
-                git_dir.display(),
-                common.display()
-            );
-            util::path::normalize(&common)
-        }
-        Err(_) => git_dir.to_path_buf(),
+/// A linked worktree records the path, relative to `GIT_DIR`, in its `commondir` file. For other
+/// repositories, where that file does not exist, `GIT_COMMON_DIR` is the same as `GIT_DIR`.
+pub fn resolve_git_common_dir(git_dir: &Path) -> io::Result<PathBuf> {
+    match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(path) => Ok(util::path::normalize(&git_dir.join(path.trim_end()))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(util::path::normalize(git_dir)),
+        Err(err) => Err(err),
     }
 }
 
 /// `.git` mode specific logic to resolve `dot_dir`.
+///
+/// Returns the per-worktree Sapling dot dir `$GIT_DIR/sl`, not `$GIT_COMMON_DIR/sl`.
 pub fn resolve_dot_dir_func(root: &Path, dot_dir: &'static str) -> PathBuf {
     assert!(dot_dir.starts_with(".git"));
     let dot_git_path = &follow_dotgit_path(root.join(".git"));
     dot_git_path.join("sl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_git_common_dir() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let git_dir = temp_dir.path().join("common/worktrees/topic");
+        fs::create_dir_all(&git_dir)?;
+
+        assert_eq!(resolve_git_common_dir(&git_dir)?, git_dir);
+
+        fs::write(git_dir.join("commondir"), "../..")?;
+        assert_eq!(
+            resolve_git_common_dir(&git_dir)?,
+            temp_dir.path().join("common")
+        );
+
+        Ok(())
+    }
 }

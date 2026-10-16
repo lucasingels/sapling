@@ -111,8 +111,8 @@ pub enum Phase {
     Draft,
 }
 
-const HISTORY_KEEP_VERSIONS: u64 = 500;
-const HISTORY_KEEP_DAYS: u64 = 30;
+const HISTORY_KEEP_VERSIONS: u64 = 100;
+const HISTORY_KEEP_DAYS: u64 = 7;
 
 impl Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

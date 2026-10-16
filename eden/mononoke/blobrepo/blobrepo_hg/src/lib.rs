@@ -9,15 +9,15 @@ mod bonsai_generation;
 mod create_changeset;
 pub mod repo_commit;
 
+pub use create_changeset::AclFileChangeRejectedInChangeset;
+pub use create_changeset::AclFileValidation;
+pub use create_changeset::CreateChangeset;
+
 pub use crate::bonsai_generation::save_bonsai_changeset_object;
 pub use crate::repo_commit::ChangesetHandle;
 pub use crate::repo_commit::UploadEntries;
 // TODO: This is exported for testing - is this the right place for it?
 pub use crate::repo_commit::compute_changed_files;
-pub mod errors {
-    pub use blobrepo_errors::*;
-}
-pub use create_changeset::CreateChangeset;
 pub mod file_history {
     pub use blobrepo_common::file_history::*;
 }
@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use anyhow::Error;
+use anyhow::anyhow;
 use async_trait::async_trait;
-use blobrepo_errors::ErrorKind;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bonsai_hg_mapping::BonsaiOrHgChangesetIds;
 use bookmarks::Bookmark;
@@ -298,20 +298,22 @@ impl<T: CommitGraphRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
     {
         STATS::get_hg_changeset_and_parents_from_bonsai.add_value(1);
 
-        let parents = self
-            .commit_graph()
-            .changeset_parents(&ctx, csid)
-            .await?
-            .into_iter()
-            .map(|parent| self.derive_hg_changeset(&ctx, parent));
+        let (parents, changesetid) = future::try_join(
+            self.commit_graph().changeset_parents(&ctx, csid),
+            self.bonsai_hg_mapping().get_hg_from_bonsai(&ctx, csid),
+        )
+        .await?;
 
-        let changesetid = self
-            .bonsai_hg_mapping()
-            .get_hg_from_bonsai(&ctx, csid)
-            .await?
-            .ok_or(ErrorKind::BonsaiNotFound(csid))?;
+        let changesetid = changesetid.ok_or_else(|| anyhow!("Bonsai cs {csid} not found"))?;
 
-        Ok((changesetid, future::try_join_all(parents).await?))
+        let parents = future::try_join_all(
+            parents
+                .into_iter()
+                .map(|parent| self.derive_hg_changeset(&ctx, parent)),
+        )
+        .await?;
+
+        Ok((changesetid, parents))
     }
 
     async fn get_hg_changeset_parents(
@@ -328,7 +330,7 @@ impl<T: CommitGraphRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
             .bonsai_hg_mapping()
             .get_bonsai_from_hg(&ctx, changesetid)
             .await?
-            .ok_or(ErrorKind::BonsaiMappingNotFound(changesetid))?;
+            .ok_or_else(|| anyhow!("Bonsai changeset not found for hg changeset {changesetid}"))?;
 
         let parents = self
             .commit_graph()
@@ -414,8 +416,8 @@ impl<T: CommitGraphRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
     {
         match self.get_filenode_opt(ctx, path, node).await? {
             FilenodeResult::Present(maybe_filenode) => {
-                let filenode = maybe_filenode
-                    .ok_or_else(|| Error::from(ErrorKind::MissingFilenode(path.clone(), node)))?;
+                let filenode =
+                    maybe_filenode.ok_or_else(|| anyhow!("Filenode is missing: {path} {node}"))?;
                 Ok(FilenodeResult::Present(filenode))
             }
             FilenodeResult::Disabled => Ok(FilenodeResult::Disabled),

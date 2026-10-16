@@ -73,7 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     # pyre-fixme[21]: Could not find module `features`.
     import features
-except:
+except Exception:
     features = None
 
 import queue
@@ -220,9 +220,8 @@ def checksocketfamily(name, port=20058):
     if family is None:
         return False
     try:
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.bind(("localhost", port))
-        s.close()
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", port))
         return True
     except socket.error as exc:
         if exc.errno == errno.EADDRINUSE:
@@ -246,9 +245,8 @@ def checkportisavailable(port):
     else:
         family = socket.AF_INET
     try:
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.bind(("localhost", port))
-        s.close()
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", port))
         return True
     except socket.error as exc:
         # pyrefly: ignore [missing-attribute]
@@ -1151,6 +1149,7 @@ class Test(unittest.TestCase):
         self._out = None
         self._skipped = None
         self._testtmp = None
+        self._edenfsmanager = None
 
         self._refout = self.readrefout()
 
@@ -1366,6 +1365,22 @@ class Test(unittest.TestCase):
             killdaemons(entry)
         self._daemonpids = []
 
+        # EdenFS must stop before the tmp dirs are removed: on Linux its control
+        # socket lives under threadtmp, and without it the stop falls back to
+        # SIGKILL, leaving the test's FUSE mounts behind.
+        edenfsmanager = self._edenfsmanager
+        eden = edenfsmanager.eden if edenfsmanager is not None else None
+        if eden is not None:
+            try:
+                eden.kill()
+                if self._keeptmpdir:
+                    log(f"Keeping edenfs dir: {edenfsmanager.test_dir}\n")
+                else:
+                    eden.cleanup()
+                    shutil.rmtree(edenfsmanager.test_dir, ignore_errors=True)
+            except Exception as e:
+                log(f"\nFailed to stop edenfs: {e}\n")
+
         if self._keeptmpdir:
             log(
                 "\nKeeping testtmp dir: %s\nKeeping threadtmp dir: %s"
@@ -1391,17 +1406,6 @@ class Test(unittest.TestCase):
                     )
                 else:
                     shutil.rmtree(self._watchmandir, ignore_errors=True)
-            except Exception:
-                pass
-
-        if use_edenfs:
-            try:
-                self._edenfsmanager.eden.kill()
-                if self._keeptmpdir:
-                    log(f"Keeping edenfs dir: {self._edenfsmanager.test_dir}\n")
-                else:
-                    self._edenfsmanager.eden.cleanup()
-                    shutil.rmtree(self._edenfsmanager.test_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -3400,6 +3404,20 @@ class TestpilotTestRunner:
         return TestpilotTestResult(testpilotjson)
 
 
+KICKSTART_FSEVENTSD = "/usr/local/bin/kickstart-fseventsd"
+
+
+def startfseventsd():
+    """Start fseventsd on macOS hosts that provide KICKSTART_FSEVENTSD.
+
+    Watchman cannot watch anything on macOS without fseventsd. Sandcastle's
+    Mac VM images keep it off and provide the script, which the job user may
+    run with ``sudo -n``; other hosts do not have the script.
+    """
+    if sys.platform == "darwin" and os.access(KICKSTART_FSEVENTSD, os.X_OK):
+        subprocess.call(["sudo", "-n", KICKSTART_FSEVENTSD])
+
+
 class TestRunner:
     """Holds context for executing tests.
 
@@ -3606,6 +3624,7 @@ class TestRunner:
             # pyrefly: ignore [missing-attribute]
             self._watchman = self.options.with_watchman or "watchman"
             os.environ["HGFSMONITOR_TESTS"] = "1"
+            startfseventsd()
         else:
             os.environ["BINDIR"] = self._bindir
             self._watchman = None

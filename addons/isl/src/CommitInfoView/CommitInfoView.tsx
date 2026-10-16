@@ -41,6 +41,7 @@ import {submitAsDraft, SubmitAsDraftCheckbox} from '../codeReview/DraftCheckbox'
 import {showBranchingPrModal} from '../codeReview/github/BranchingPrModal';
 import {overrideDisabledSubmitModes} from '../codeReview/github/branchPrState';
 import {publishWhenReady, PublishWhenReadyCheckbox} from '../codeReview/PublishWhenReadyCheckbox';
+import {submitButtonVerb} from '../codeReview/UICodeReviewProvider';
 import {Commit} from '../Commit';
 import {OpenComparisonViewButton} from '../ComparisonView/OpenComparisonViewButton';
 import {Center} from '../ComponentUtils';
@@ -48,7 +49,6 @@ import {confirmNoBlockingDiagnostics} from '../Diagnostics';
 import {FoldButton, useRunFoldPreview} from '../fold';
 import {getCachedGeneratedFileStatuses, useGeneratedFileStatuses} from '../GeneratedFile';
 import {t, T} from '../i18n';
-import {submitButtonVerb} from '../codeReview/UICodeReviewProvider';
 import {IrrelevantCwdIcon} from '../icons/IrrelevantCwdIcon';
 import {numPendingImageUploads} from '../ImageUpload';
 import {readAtom, writeAtom} from '../jotaiUtils';
@@ -82,7 +82,7 @@ import {showToast} from '../toast';
 import {GeneratedStatus, succeedableRevset} from '../types';
 import {UncommittedChanges} from '../UncommittedChanges';
 import {confirmUnsavedFiles} from '../UnsavedFiles';
-import {useModal} from '../useModal';
+import {showConfirmation, useModal} from '../useModal';
 import {firstOfIterable} from '../utils';
 import {CommitInfoField} from './CommitInfoField';
 import {
@@ -761,10 +761,11 @@ function ActionsBar({
           hasUnsavedEditedCommitMessage(isCommitMode ? 'head' : commit.hash),
         );
         if (hasUnsavedEdits) {
-          const confirmed = await platform.confirm(
-            t('Are you sure you want to discard your edited message?'),
-          );
-          if (confirmed === false) {
+          const confirmed = await showConfirmation({
+            title: t('Are you sure you want to discard your edited message?'),
+            confirmLabel: t('Discard'),
+          });
+          if (!confirmed) {
             return;
           }
         }
@@ -944,6 +945,34 @@ function ActionsBar({
       </div>
     </div>
   );
+}
+
+function SubmitButtonLabel({
+  showCommitOrAmend,
+  isCommitMode,
+  shouldSubmitAsDraft,
+  verb,
+}: {
+  showCommitOrAmend: boolean;
+  isCommitMode: boolean;
+  shouldSubmitAsDraft: boolean;
+  verb: string;
+}) {
+  if (showCommitOrAmend) {
+    if (isCommitMode) {
+      return shouldSubmitAsDraft ? (
+        <T replace={{$verb: verb}}>Commit and $verb Draft</T>
+      ) : (
+        <T replace={{$verb: verb}}>Commit and $verb</T>
+      );
+    }
+    return shouldSubmitAsDraft ? (
+      <T replace={{$verb: verb}}>Amend and $verb Draft</T>
+    ) : (
+      <T replace={{$verb: verb}}>Amend and $verb</T>
+    );
+  }
+  return shouldSubmitAsDraft ? <T replace={{$verb: verb}}>$verb Draft</T> : <>{verb}</>;
 }
 
 function SubmitButton({
@@ -1169,15 +1198,12 @@ function SubmitButton({
           contextKey={`submit-${commit.isDot ? 'head' : commit.hash}`}
           disabled={disabledReason != null}
           runOperation={getApplicableOperations}>
-          {commit.isDot && anythingToCommit ? (
-            isCommitMode ? (
-              <T replace={{$verb: submitButtonVerb(provider)}}>Commit and $verb</T>
-            ) : (
-              <T replace={{$verb: submitButtonVerb(provider)}}>Amend and $verb</T>
-            )
-          ) : (
-            submitButtonVerb(provider)
-          )}
+          <SubmitButtonLabel
+            showCommitOrAmend={commit.isDot && anythingToCommit}
+            isCommitMode={isCommitMode}
+            shouldSubmitAsDraft={shouldSubmitAsDraft}
+            verb={submitButtonVerb(provider)}
+          />
         </OperationDisabledButton>
       )}
     </Tooltip>

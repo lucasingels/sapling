@@ -65,6 +65,7 @@ log before edit
   > fold ff2c9fa2018b c
   > pick 532247a8969b d
   > EOF
+  folded ff2c9fa2018b, 178e35e0ce73 -> 7c6777b45203 "f"
 
 log after edit
   $ sl logt --graph
@@ -117,6 +118,7 @@ rollup will fold without preserving the folded commit's message or date
   > pick 7c6777b45203 f
   > pick 54f64c576eaf d
   > EOF
+  folded 97d72e5f12c7, dcc6f3975330 -> a2e8b40131dd "b"
 
   $ HGEDITOR=$OLDHGEDITOR
 
@@ -281,6 +283,7 @@ folded content is dropped during a merge. The folded commit should properly disa
   > drop 888f9082bf99 2 +5
   > fold 251d831eeec5 3 +6
   > EOF
+  dropping changeset 888f90: +5
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   merging file
   warning: 1 conflicts while merging file! (edit, then use 'sl resolve --mark')
@@ -353,6 +356,7 @@ dropped revision.
   > drop 888f9082bf99 2 +5
   > fold 251d831eeec5 3 +6
   > EOF
+  dropping changeset 888f90: +5
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   merging file
   warning: 1 conflicts while merging file! (edit, then use 'sl resolve --mark')
@@ -385,6 +389,7 @@ dropped revision.
   SL: --
   SL: user: test
   SL: changed file
+  folded 617f94f13c0f, 251d831eeec5, 6fdb948f9d42 -> 10c647b2cdd5 "+4"
   $ sl logt -G
   @  10c647b2cdd5 +4
   │
@@ -438,6 +443,7 @@ Folding with initial rename (issue3729)
   > pick 1c4f440a8085 rename
   > fold e0371e0426bc b
   > EOF
+  folded 1c4f440a8085, e0371e0426bc -> cf858d235c76 "rename"
 
   $ sl logt --follow b.txt
   cf858d235c76 rename
@@ -482,6 +488,7 @@ into the hook command.
   > EOF
   commit 16b87e97178dde2af2f3c6f6ddda882292f21d13
   commit 9599899f62c05f4377548c32bf1c9f1a39634b0c
+  folded 199b6bb90248, a1a953ffb4b0 -> 79b99e9c8e49 "b"
 
   $ sl logt
   9599899f62c0 a
@@ -519,6 +526,7 @@ editors.
   > fold b7389cc4d66e 3 foo2
   > fold 21679ff7675c 4 foo3
   > EOF
+  folded 0e01aeef5fa8, b7389cc4d66e, 21679ff7675c -> e8bedbda72c1 "merged foos"
   $ sl logt
   e8bedbda72c1 merged foos
   578c7455730c a
@@ -566,6 +574,7 @@ Test rolling into a commit with multiple children (issue5498)
   > r 5db65b93a12b
   > EOF
   sl: parse error: first changeset cannot use verb "roll"
+  (roll combines a commit with the kept commit before it)
   [255]
   $ sl log -G -T '{node|short} {desc}'
   @  5db65b93a12b cc
@@ -595,6 +604,7 @@ Set a bogus mergedriver as a tripwire to make sure we don't invoke merge driver.
   > p cb9a9f314b8b
   > r 1e6c11564562
   > EOF
+  folded cb9a9f314b8b, 1e6c11564562 -> 9e233947f73d "a"
   $ sl log -G -T '{node|short} {desc}'
   @  9e233947f73d a
   
@@ -623,6 +633,7 @@ Set a bogus mergedriver as a tripwire to make sure we don't invoke merge driver.
   > fold $C
   > pick $D
   > EOF
+  folded 65ed72240f53, cb7e02cc3db0 -> 8f8b4b8421e6 "B"
   $ sl log -G -p --config diff.git=1
   @  commit:      048204e0ad0b
   │  user:        test
@@ -673,3 +684,109 @@ Set a bogus mergedriver as a tripwire to make sure we don't invoke merge driver.
   $ sl files -r .
   create
   file2
+
+'into' is like fold, but keeps only the message of the commit being folded in
+(and, like fold, its date), without an editor. 'roll' keeps only the earlier
+message, so each keeps exactly one of the original messages:
+
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > E
+  > |
+  > D
+  > |
+  > C
+  > |
+  > B
+  > |
+  > A
+  > EOS
+  $ sl goto -q $E
+  $ sl histedit $B --commands - <<EOF
+  > pick $B
+  > into $C
+  > pick $D
+  > roll $E
+  > EOF
+  folded 112478962961, 26805aba1e60 -> 78d49ca251a9 "C"
+  folded f585351a92f8, 9bc730a19041 -> 711806cc6687 "D"
+  $ sl log -r 'all()' -T '{desc} {files}\n'
+  A A
+  C B C
+  D D E
+
+In a run of combines, 'into' replaces the message and 'roll' leaves it alone:
+
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > D
+  > |
+  > C
+  > |
+  > B
+  > |
+  > A
+  > EOS
+  $ sl goto -q $D
+  $ sl histedit $B --commands - <<EOF
+  > pick $B
+  > i $C
+  > r $D
+  > EOF
+  folded 112478962961, 26805aba1e60, f585351a92f8 -> dfe31a7152c8 "C"
+  $ sl log -r . -T '{desc} {files}\n'
+  C B C D
+
+Like fold and roll, 'into' needs an earlier commit in the plan:
+
+  $ sl histedit 'desc(A)' --commands - <<EOF
+  > into $A
+  > EOF
+  sl: parse error: first changeset cannot use verb "into"
+  (into combines a commit with the kept commit before it)
+  [255]
+
+Continuing after a conflict in a fold or roll finishes the fold. (On EdenFS
+this used to fail with "working copy has pending changes".)
+
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > D  # D/f = 3\n
+  > |
+  > C  # C/f = 2\n
+  > |
+  > B  # B/f = 1\n
+  > |
+  > A
+  > EOS
+  $ sl goto -q $D
+  $ cat > plan <<EOF
+  > pick $B
+  > pick $D
+  > roll $C
+  > EOF
+  $ sl histedit $B --commands plan
+  1 files updated, 0 files merged, 2 files removed, 0 files unresolved (?)
+  merging f
+  warning: 1 conflicts while merging f! (edit, then use 'sl resolve --mark')
+  Fix up the change (pick a255f7246f36)
+  (sl histedit --continue to resume)
+  [1]
+  $ sl resolve --tool internal:other --all
+  (no more unresolved files)
+  continue: sl histedit --continue
+  $ sl histedit --continue
+  merging f
+  warning: 1 conflicts while merging f! (edit, then use 'sl resolve --mark')
+  Fix up the change (roll c9e6a60ee394)
+  (sl histedit --continue to resume)
+  [1]
+  $ sl resolve --tool internal:other --all
+  (no more unresolved files)
+  continue: sl histedit --continue
+  $ sl histedit --continue
+  folded c9e6a60ee394, a255f7246f36 -> c007eec2e7b2 "D"
+  $ sl log -r 'all()' -T '{desc} {files}\n'
+  A A
+  B B f
+  D C D f

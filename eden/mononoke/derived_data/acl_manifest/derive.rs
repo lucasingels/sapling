@@ -16,10 +16,10 @@ use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use blobstore::Storable;
 use cloned::cloned;
+use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derived_data_manager::DerivationContext;
 use filestore::fetch_concat;
-use fsnodes::RootFsnodeId;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
@@ -70,9 +70,9 @@ pub(crate) enum AclFileChange {
 /// to the parent's `create_tree`, providing pre-computed flags for
 /// `AclManifestDirectoryEntry` without requiring a blobstore load.
 #[derive(Clone, Copy, Debug, Default)]
-struct AclManifestNodeInfo {
-    is_restricted: bool,
-    has_restricted_descendants: bool,
+pub(crate) struct AclManifestNodeInfo {
+    pub(crate) is_restricted: bool,
+    pub(crate) has_restricted_descendants: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,12 +153,12 @@ pub(crate) async fn derive_from_scratch(
         .to_string();
 
     // Derive dependencies (fetch both in parallel -- independent blobstore lookups).
-    let (bssm_v3, root_fsnode_id) = futures::try_join!(
+    let (bssm_v3, root_content_manifest_id) = futures::try_join!(
         derivation_ctx.fetch_dependency::<RootBssmV3DirectoryId>(ctx, cs_id),
-        derivation_ctx.fetch_dependency::<RootFsnodeId>(ctx, cs_id),
+        derivation_ctx.fetch_dependency::<RootContentManifestId>(ctx, cs_id),
     )?;
 
-    // Find all ACL files via BSSMV3 and resolve their content IDs via Fsnodes.
+    // Find all ACL files via BSSMV3 and resolve their content IDs via ContentManifests.
     let acl_paths: Vec<NonRootMPath> = bssm_v3
         .find_files_filter_basenames(
             ctx,
@@ -172,19 +172,19 @@ pub(crate) async fn derive_from_scratch(
         .try_collect()
         .await?;
 
-    // Resolve content IDs for each .slacl file via Fsnodes and parse them
-    // before calling derive_manifest. Fsnodes/blobstore failures remain hard
+    // Resolve content IDs for each .slacl file via ContentManifests and parse them
+    // before calling derive_manifest. ContentManifests/blobstore failures remain hard
     // failures; parse failures are logged and omitted from from-scratch output.
     let derive_changes: Vec<(NonRootMPath, Option<RestrictedPathsAclFile>)> =
         stream::iter(acl_paths)
             .map(|path| {
-                cloned!(ctx, blobstore, root_fsnode_id);
+                cloned!(ctx, blobstore, root_content_manifest_id);
                 let acl_file_name = acl_file_name.clone();
                 async move {
-                    let content_id = resolve_content_id_via_fsnode(
+                    let content_id = resolve_content_id(
                         &ctx,
                         &blobstore,
-                        &root_fsnode_id,
+                        &root_content_manifest_id,
                         &MPath::from(path.clone()),
                     )
                     .await?;
@@ -338,7 +338,7 @@ pub(crate) async fn derive_acl_manifest_entry(
 /// 3. Look up the ACL file in the built map to determine the restriction.
 /// 4. Compute `has_restricted_descendants` by checking for Directory entries.
 /// 5. Store the manifest blob and return the ID with node info.
-async fn create_acl_manifest(
+pub(crate) async fn create_acl_manifest(
     ctx: CoreContext,
     blobstore: Arc<dyn KeyedBlobstore>,
     acl_file_name: &[u8],
@@ -622,7 +622,9 @@ pub(crate) async fn prepare_acl_file_changes(
         .await
 }
 
-async fn fetch_and_parse_acl_file(
+/// Fetch and parse an ACL file. `Ok(None)` means it did not parse: logged and
+/// treated as absent, leaving the directory unrestricted.
+pub(crate) async fn fetch_and_parse_acl_file(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
     content_id: ContentId,
@@ -665,7 +667,7 @@ fn log_invalid_acl_file(
 }
 
 /// Store a parsed ACL file as an AclManifestEntryBlob and return the blob ID.
-async fn store_acl_entry_from_acl_file(
+pub(crate) async fn store_acl_entry_from_acl_file(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
     acl_file: &RestrictedPathsAclFile,
@@ -678,22 +680,22 @@ async fn store_acl_entry_from_acl_file(
     entry_blob.into_blob().store(ctx, blobstore).await
 }
 
-/// Resolve a file's ContentId via Fsnodes.
+/// Resolve a file's ContentId via ContentManifests.
 /// Only used by derive_from_scratch for backfilling.
-async fn resolve_content_id_via_fsnode(
+async fn resolve_content_id(
     ctx: &CoreContext,
     blobstore: &Arc<dyn KeyedBlobstore>,
-    root_fsnode_id: &RootFsnodeId,
+    root_content_manifest_id: &RootContentManifestId,
     acl_path: &MPath,
 ) -> Result<ContentId> {
-    let entry = root_fsnode_id
-        .fsnode_id()
+    let entry = root_content_manifest_id
+        .content_manifest_id()
         .find_entry(ctx.clone(), blobstore.clone(), acl_path.clone())
         .await?
-        .ok_or_else(|| anyhow::anyhow!("ACL file not found in fsnodes: {acl_path:?}"))?;
+        .ok_or_else(|| anyhow::anyhow!("ACL file not found in ContentManifests: {acl_path:?}"))?;
 
     match entry {
-        Entry::Leaf(f) => Ok(*f.content_id()),
+        Entry::Leaf(f) => Ok(f.content_id),
         Entry::Tree(_) => anyhow::bail!("expected file but found directory: {acl_path:?}"),
     }
 }

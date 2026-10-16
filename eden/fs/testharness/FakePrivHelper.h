@@ -52,6 +52,12 @@ class FakePrivHelper final : public PrivHelper {
       AbsolutePathPiece mountPath,
       std::shared_ptr<MountDelegate>);
 
+  /**
+   * Forget a previously registered mount so the same path can be registered
+   * again, for tests that tear down and recreate an EdenMount.
+   */
+  void unregisterMount(AbsolutePathPiece mountPath);
+
   // PrivHelper functions
   void attachEventBase(folly::EventBase* eventBase) override;
   void detachEventBase() override;
@@ -82,7 +88,8 @@ class FakePrivHelper final : public PrivHelper {
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
       const std::string& specifiedOutputPath,
-      const bool shouldUpload) override;
+      const bool shouldUpload,
+      folly::File outputFile) override;
   folly::Future<StopFileAccessMonitorResponse> stopFam() override;
   folly::Future<folly::Unit> setMemoryPriorityForProcess(
       pid_t pid,
@@ -90,6 +97,7 @@ class FakePrivHelper final : public PrivHelper {
   folly::Future<folly::Unit> setFuseReadAhead(
       folly::StringPiece mountPath,
       uint32_t readAheadKb) override;
+  folly::Future<folly::Unit> setNfsFstypeOverride(bool enabled) override;
   int stop() override;
   int getRawClientFd() const override {
     return -1;

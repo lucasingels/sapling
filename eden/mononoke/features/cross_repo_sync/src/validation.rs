@@ -19,6 +19,7 @@ use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksMaybeStaleExt;
+use bookmarks::Freshness;
 use bulk_derivation::BulkDerivation;
 use cloned::cloned;
 use commit_transformation::SubmoduleDeps;
@@ -35,8 +36,6 @@ use commit_transformation::git_submodules::validate_working_copy_of_expansion_wi
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
-use either::Either;
-use fsnodes::RootFsnodeId;
 use futures::TryStreamExt;
 use futures::future;
 use futures::future::FutureExt;
@@ -54,11 +53,11 @@ use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
 use metaconfig_types::GitSubmodulesChangesAction;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
+use mononoke_types::ContentManifestId;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::content_manifest::ContentManifest;
-use mononoke_types::content_manifest::compat;
-use mononoke_types::fsnode::Fsnode;
+use mononoke_types::content_manifest::ContentManifestFile;
 use movers::Mover;
 use regex::Regex;
 use sorted_vector_map::SortedVectorMap;
@@ -68,6 +67,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::commit_sync_config_utils::get_git_submodule_action_by_version;
+use crate::commit_sync_outcome::CommitSyncOutcome;
 use crate::commit_syncers_lib::Syncers;
 use crate::commit_syncers_lib::submodule_metadata_file_prefix_and_dangling_pointers;
 use crate::sync_commit::CommitSyncData;
@@ -81,7 +81,7 @@ use crate::types::Target;
 // conditional logic, i.e. the code either does something or skips it based on None or Some.
 
 /// Fast path verification doesn't walk every file in the repository, instead
-/// it leverages FSNodes to compare hashes of entire directories. This was if
+/// it leverages ContentManifests to compare hashes of entire directories. This was if
 /// the repository verifies OK the verification is very fast.
 ///
 /// NOTE: The implementation is a bit hacky due to the path mover functions
@@ -137,50 +137,21 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
     )
     .await?;
 
-    let use_content_manifests = justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(source_repo.repo_identity().name()),
-    ) && justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(target_repo.repo_identity().name()),
-    );
-
-    let (source_root_id, target_root_id): (compat::ContentManifestId, compat::ContentManifestId) =
-        if use_content_manifests {
-            let (source_id, target_id) = future::try_join(
-                source_repo
-                    .repo_derived_data()
-                    .derive::<RootContentManifestId>(ctx, source_hash.0, DerivationPriority::LOW),
-                target_repo
-                    .repo_derived_data()
-                    .derive::<RootContentManifestId>(ctx, target_hash.0, DerivationPriority::LOW),
-            )
-            .await?;
-            (
-                source_id.into_content_manifest_id().into(),
-                target_id.into_content_manifest_id().into(),
-            )
-        } else {
-            let (source_id, target_id) = future::try_join(
-                source_repo.repo_derived_data().derive::<RootFsnodeId>(
-                    ctx,
-                    source_hash.0,
-                    DerivationPriority::LOW,
-                ),
-                target_repo.repo_derived_data().derive::<RootFsnodeId>(
-                    ctx,
-                    target_hash.0,
-                    DerivationPriority::LOW,
-                ),
-            )
-            .await?;
-            (
-                source_id.into_fsnode_id().into(),
-                target_id.into_fsnode_id().into(),
-            )
-        };
+    let (source_root_id, target_root_id): (ContentManifestId, ContentManifestId) = {
+        let (source_id, target_id) = future::try_join(
+            source_repo
+                .repo_derived_data()
+                .derive::<RootContentManifestId>(ctx, source_hash.0, DerivationPriority::LOW),
+            target_repo
+                .repo_derived_data()
+                .derive::<RootContentManifestId>(ctx, target_hash.0, DerivationPriority::LOW),
+        )
+        .await?;
+        (
+            source_id.into_content_manifest_id(),
+            target_id.into_content_manifest_id(),
+        )
+    };
 
     let (small_root_id, large_root_id) = match direction {
         CommitSyncDirection::Forward => (source_root_id, target_root_id),
@@ -241,7 +212,6 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
         submodules_action,
         &sm_exp_data,
         &exp_and_metadata_paths,
-        use_content_manifests,
     )
     .await?;
 
@@ -271,7 +241,6 @@ pub async fn verify_working_copy_with_version<'a, R: Repo>(
         submodules_action,
         &sm_exp_data,
         &exp_and_metadata_paths,
-        use_content_manifests,
     )
     .await?;
     info!("all is well!");
@@ -361,15 +330,14 @@ async fn verify_working_copy_inner<'a>(
     ctx: &'a CoreContext,
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
-    source_root_id: compat::ContentManifestId,
+    source_root_id: ContentManifestId,
     target_repo: Target<&'a impl Repo>,
-    target_root_id: compat::ContentManifestId,
+    target_root_id: ContentManifestId,
     mover: &dyn Mover,
     prefixes_to_visit: Vec<Option<NonRootMPath>>,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
-    use_content_manifests: bool,
 ) -> Result<(), Error> {
     let prefix_set: HashSet<_> = prefixes_to_visit
         .iter()
@@ -390,7 +358,6 @@ async fn verify_working_copy_inner<'a>(
             submodules_action,
             sm_exp_data,
             exp_and_metadata_paths,
-            use_content_manifests,
         )
     }))
     .buffer_unordered(100)
@@ -441,8 +408,8 @@ fn wrap_mover_result(
             Ok(opt_mpath) => Ok(opt_mpath.map(Some)),
             Err(err) => {
                 for cause in err.chain() {
-                    if let Some(movers::ErrorKind::RemovePrefixWholePathFailure) =
-                        cause.downcast_ref::<movers::ErrorKind>()
+                    if let Some(movers::MoverError::RemovePrefixWholePathFailure) =
+                        cause.downcast_ref::<movers::MoverError>()
                     {
                         return Ok(Some(None));
                     }
@@ -455,7 +422,7 @@ fn wrap_mover_result(
 }
 
 /// Verify that submodule expansion in the repo is correct in small->large direction
-/// i.e. for given git submodule in the small repo  (identified by its path and fsnode)
+/// i.e. for given git submodule in the small repo  (identified by its path and content manifest entry)
 /// whether the metadata and expansion directory exist in the target repo and their contents
 /// match the submodule contents.
 async fn verify_git_submodule_expansion_small_to_large<'a>(
@@ -465,9 +432,8 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     mover: &dyn Mover,
     submodule_path: NonRootMPath,
-    submodule_file_entry: compat::ContentManifestFile,
-    large_root_id: compat::ContentManifestId,
-    use_content_manifests: bool,
+    submodule_file_entry: ContentManifestFile,
+    large_root_id: ContentManifestId,
 ) -> Result<Option<ValidationOutputElement>, Error> {
     // STEP 1: Assert that the submodule expansion data is available
     let sm_exp_data = sm_exp_data
@@ -516,8 +482,8 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
             anyhow!("submodule metadata file not found in large repo: {metadata_file_path:?}")
         })?;
 
-    let metadata_file: compat::ContentManifestFile = match metadata_file_entry {
-        Entry::Leaf(file) => file.into(),
+    let metadata_file: ContentManifestFile = match metadata_file_entry {
+        Entry::Leaf(file) => file,
         _ => {
             return Err(anyhow!(
                 "submodule metadata path doesn't represent a file: {metadata_file_path:?}"
@@ -529,7 +495,7 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
     let exp_metadata_git_hash = match git_hash_from_submodule_metadata_file(
         ctx,
         &sm_exp_data.large_repo,
-        metadata_file.content_id(),
+        metadata_file.content_id,
     )
     .await
     {
@@ -540,7 +506,7 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
         }
     };
     let git_hash =
-        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_entry.content_id())
+        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_entry.content_id)
             .await?;
 
     if git_hash != exp_metadata_git_hash {
@@ -555,7 +521,6 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
         submodule_repo,
         git_hash,
         &sm_exp_data.dangling_submodule_pointers,
-        use_content_manifests,
     )
     .await?;
 
@@ -568,7 +533,6 @@ async fn verify_git_submodule_expansion_small_to_large<'a>(
         submodule_repo,
         expansion_manifest_id,
         submodule_manifest_id,
-        use_content_manifests,
     )
     .await
     {
@@ -586,11 +550,10 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
     small_repo: Target<&'a impl Repo>,
     mover: &dyn Mover,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
-    small_root_id: compat::ContentManifestId,
+    small_root_id: ContentManifestId,
     expansion_path: NonRootMPath,
-    expansion_dir_id: compat::ContentManifestId,
-    expansion_metadata_file: compat::ContentManifestFile,
-    use_content_manifests: bool,
+    expansion_dir_id: ContentManifestId,
+    expansion_metadata_file: ContentManifestFile,
 ) -> Result<Option<ValidationOutputElement>, Error> {
     // STEP 1: Assert that the submodule expansion data is available
     let sm_exp_data = sm_exp_data
@@ -610,17 +573,16 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
             submodule_path.clone().into(),
         )
         .await?;
-    let submodule_file_leaf: compat::ContentManifestFile = submodule_entry
+    let submodule_file_leaf: ContentManifestFile = submodule_entry
         .ok_or(anyhow!(
             "No manifest entry in small repo for submodule path {submodule_path}"
         ))?
         .into_leaf()
         .ok_or(anyhow!(
             "Small repo manifest entry for submodule path {submodule_path} is not a leaf"
-        ))?
-        .into();
+        ))?;
 
-    if submodule_file_leaf.file_type() != FileType::GitSubmodule {
+    if submodule_file_leaf.file_type != FileType::GitSubmodule {
         return Err(anyhow!(
             "submodule path is not a git submodule: {submodule_path}!",
         ));
@@ -640,7 +602,7 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
     let exp_metadata_git_hash = match git_hash_from_submodule_metadata_file(
         ctx,
         &sm_exp_data.large_repo,
-        expansion_metadata_file.content_id(),
+        expansion_metadata_file.content_id,
     )
     .await
     {
@@ -651,8 +613,7 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         }
     };
     let git_hash =
-        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_leaf.content_id())
-            .await?;
+        get_git_hash_from_submodule_file(ctx, small_repo.0, submodule_file_leaf.content_id).await?;
 
     if git_hash != exp_metadata_git_hash {
         return Err(anyhow!(
@@ -666,7 +627,6 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         submodule_repo,
         git_hash,
         &sm_exp_data.dangling_submodule_pointers,
-        use_content_manifests,
     )
     .await?;
 
@@ -679,7 +639,6 @@ async fn verify_git_submodule_expansion_large_to_small<'a>(
         submodule_repo,
         expansion_dir_id,
         submodule_manifest_id,
-        use_content_manifests,
     )
     .await
     {
@@ -740,8 +699,8 @@ fn list_possible_expansion_and_metadata_paths<'a>(
 // submodule expansion directory and its metadata file.
 struct SubmoduleExpansionDirectoryAndMetadata {
     expansion_path: NonRootMPath,
-    expansion_dir_id: compat::ContentManifestId,
-    expansion_metadata_file: compat::ContentManifestFile,
+    expansion_dir_id: ContentManifestId,
+    expansion_metadata_file: ContentManifestFile,
 }
 
 enum ElemAction {
@@ -757,18 +716,15 @@ enum ElemAction {
 fn find_submodule_expansion(
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
     source_dir_path: &MPath,
-    source_dir_map: &HashMap<
-        MPathElement,
-        Entry<compat::ContentManifestId, compat::ContentManifestFile>,
-    >,
+    source_dir_map: &HashMap<MPathElement, Entry<ContentManifestId, ContentManifestFile>>,
     elem: &MPathElement,
-    entry: Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+    entry: Entry<ContentManifestId, ContentManifestFile>,
 ) -> Result<ElemAction, Error> {
     // validation errors
     if let Entry::Leaf(leaf) = entry.clone() {
         // if submodule expansion is ON then the submodules have no business to exist in
         // the large repo
-        if leaf.file_type() == FileType::GitSubmodule {
+        if leaf.file_type == FileType::GitSubmodule {
             return Ok(ElemAction::Skip(Some(SubmoduleExpansionMismatch(
                 "git submodules not allowed in large to small sync".to_string(),
             ))));
@@ -781,7 +737,7 @@ fn find_submodule_expansion(
         .get(&source_elem_path)
     {
         let expansion_metadata_file = if let Entry::Leaf(leaf) = entry {
-            if leaf.file_type() != FileType::Regular {
+            if leaf.file_type != FileType::Regular {
                 return Ok(ElemAction::Skip(Some(SubmoduleExpansionMismatch(format!(
                     "git submodule expansion metadata file {source_elem_path} has to be a regular file",
                 )))));
@@ -827,43 +783,28 @@ async fn verify_and_filter_out_submodule_changes<'a>(
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
     source_path: &MPath,
-    source_dir: Either<ContentManifest, Fsnode>,
+    source_dir: ContentManifest,
     target_repo: Target<&'a impl Repo>,
-    target_root_id: compat::ContentManifestId,
+    target_root_id: ContentManifestId,
     mover: &dyn Mover,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
-    use_content_manifests: bool,
 ) -> Result<
     (
         Vec<ValidationOutputElement>,
-        Vec<(
-            NonRootMPath,
-            Entry<compat::ContentManifestId, compat::ContentManifestFile>,
-        )>,
+        Vec<(NonRootMPath, Entry<ContentManifestId, ContentManifestFile>)>,
     ),
     Error,
 > {
     let source_blobstore = source_repo.0.repo_blobstore_arc();
 
-    // Materialize entries once, analogous to the original Fsnode::into_subentries().
-    // For Fsnode this is in-memory; for ContentManifest it streams from the blobstore.
-    let source_subentries: Vec<(
-        MPathElement,
-        Entry<compat::ContentManifestId, compat::ContentManifestFile>,
-    )> = source_dir
-        .list(ctx, &source_blobstore)
-        .await?
-        .map_ok(|(elem, entry)| {
-            let entry = match entry {
-                Entry::Tree(id) => Entry::Tree(id),
-                Entry::Leaf(leaf) => Entry::Leaf(leaf.into()),
-            };
-            (elem, entry)
-        })
-        .try_collect()
-        .await?;
+    let source_subentries: Vec<(MPathElement, Entry<ContentManifestId, ContentManifestFile>)> =
+        source_dir
+            .list(ctx, &source_blobstore)
+            .await?
+            .try_collect()
+            .await?;
 
     let mut filtered_directory_entries = Vec::new();
     let mut output_elements = vec![];
@@ -916,7 +857,6 @@ async fn verify_and_filter_out_submodule_changes<'a>(
                             exp_and_metadata.expansion_path,
                             exp_and_metadata.expansion_dir_id,
                             exp_and_metadata.expansion_metadata_file,
-                            use_content_manifests,
                         );
                         verification_futures.push(verification_fut.boxed());
                     }
@@ -927,7 +867,7 @@ async fn verify_and_filter_out_submodule_changes<'a>(
         CommitSyncDirection::Forward => {
             for (elem, entry) in source_subentries {
                 if let Entry::Leaf(ref leaf) = entry {
-                    if leaf.file_type() == FileType::GitSubmodule {
+                    if leaf.file_type == FileType::GitSubmodule {
                         match submodules_action {
                             // when keeping submodules don't filter them out - we need a matching
                             // submodule on both sides of sync
@@ -950,7 +890,6 @@ async fn verify_and_filter_out_submodule_changes<'a>(
                                         submodule_path,
                                         leaf.clone(),
                                         target_root_id,
-                                        use_content_manifests,
                                     )
                                     .boxed(),
                                 );
@@ -984,15 +923,14 @@ async fn verify_dir<'a>(
     direction: CommitSyncDirection,
     source_repo: Source<&'a impl Repo>,
     source_path: Option<NonRootMPath>,
-    source_root_id: compat::ContentManifestId,
+    source_root_id: ContentManifestId,
     target_repo: Target<&'a impl Repo>,
-    target_root_id: compat::ContentManifestId,
+    target_root_id: ContentManifestId,
     mover: &dyn Mover,
     prefixes_to_visit: &HashSet<NonRootMPath>,
     submodules_action: GitSubmodulesChangesAction,
     sm_exp_data: &Option<SubmoduleExpansionData<'a, impl Repo>>,
     exp_and_metadata_paths: &ExpansionAndMetadataPaths,
-    use_content_manifests: bool,
 ) -> Result<ValidationOutput, Error> {
     let source_blobstore = source_repo.repo_blobstore_arc();
     let target_blobstore = target_repo.repo_blobstore_arc();
@@ -1010,7 +948,7 @@ async fn verify_dir<'a>(
             Entry::Leaf(source_leaf) => {
                 vec![(
                     source_path.clone().expect("leaf path can't be empty!"),
-                    Entry::Leaf(source_leaf.into()),
+                    Entry::Leaf(source_leaf),
                 )]
             }
             Entry::Tree(source_dir_id) => {
@@ -1028,7 +966,6 @@ async fn verify_dir<'a>(
                         submodules_action,
                         sm_exp_data,
                         exp_and_metadata_paths,
-                        use_content_manifests,
                     )
                     .await?;
                 outs.extend(validation_errors);
@@ -1046,7 +983,7 @@ async fn verify_dir<'a>(
             init,
             move |(source_path, source_entry): (
                 NonRootMPath,
-                Entry<compat::ContentManifestId, compat::ContentManifestFile>,
+                Entry<ContentManifestId, ContentManifestFile>,
             )| {
                 cloned!(start_source_path, source_blobstore, target_blobstore);
                 Box::pin(async move {
@@ -1090,7 +1027,6 @@ async fn verify_dir<'a>(
                                     submodules_action,
                                     sm_exp_data,
                                     exp_and_metadata_paths,
-                                    use_content_manifests,
                                 )
                                 .await?;
                             return Ok((validation_errors, recurse));
@@ -1113,7 +1049,6 @@ async fn verify_dir<'a>(
                             submodules_action,
                             sm_exp_data,
                             exp_and_metadata_paths,
-                            use_content_manifests,
                         )
                         .await?;
                         return Ok((validation_errors, recurse));
@@ -1121,18 +1056,18 @@ async fn verify_dir<'a>(
 
                     let source_elem = match source_entry {
                         Entry::Leaf(source_leaf) => RewriteMismatchElement::File((
-                            source_leaf.content_id(),
-                            source_leaf.file_type(),
+                            source_leaf.content_id,
+                            source_leaf.file_type,
                         )),
                         Entry::Tree(_) => RewriteMismatchElement::Directory,
                     };
 
                     let target_elem = match target_entry {
                         Some(Entry::Leaf(target_leaf)) => {
-                            let target_file: compat::ContentManifestFile = target_leaf.into();
+                            let target_file: ContentManifestFile = target_leaf;
                             RewriteMismatchElement::File((
-                                target_file.content_id(),
-                                target_file.file_type(),
+                                target_file.content_id,
+                                target_file.file_type,
                             ))
                         }
                         Some(Entry::Tree(_id)) => RewriteMismatchElement::Directory,
@@ -1284,6 +1219,76 @@ pub async fn find_bookmark_diff<R: Repo>(
     }
 
     Ok(diff)
+}
+
+/// Find the cross-repository difference for one source-side bookmark.
+///
+/// The caller supplies the source key even when it no longer exists. This is
+/// what allows prefix-scoped consumers to validate target-only bookmarks
+/// discovered by a separate inventory comparison without scanning every
+/// bookmark in either repository again. `None` means there is no actionable
+/// difference: either the bookmark does not map to the target, both sides are
+/// consistent, or the source has no sync outcome and the target is absent.
+/// The last case intentionally matches [`find_bookmark_diff`], which only
+/// reports `NoSyncOutcome` for a bookmark already present in the target.
+pub async fn find_bookmark_diff_for_source_bookmark<R: Repo>(
+    ctx: CoreContext,
+    commit_sync_data: &CommitSyncData<R>,
+    source_bookmark: BookmarkKey,
+) -> Result<Option<BookmarkDiff>, Error> {
+    let Some(target_bookmark) = commit_sync_data.rename_bookmark(&source_bookmark).await? else {
+        return Ok(None);
+    };
+    let source_repo = commit_sync_data.get_source_repo();
+    let target_repo = commit_sync_data.get_target_repo();
+    let (source_cs_id, target_cs_id) = future::try_join(
+        source_repo
+            .bookmarks()
+            .get(ctx.clone(), &source_bookmark, Freshness::MaybeStale),
+        target_repo
+            .bookmarks()
+            .get(ctx.clone(), &target_bookmark, Freshness::MaybeStale),
+    )
+    .await?;
+
+    let Some(source_cs_id) = source_cs_id else {
+        return Ok(
+            target_cs_id.map(|target_cs_id| BookmarkDiff::InconsistentValue {
+                target_bookmark,
+                target_cs_id,
+                source_cs_id: None,
+            }),
+        );
+    };
+
+    let remapped_source_cs_id = match commit_sync_data
+        .get_commit_sync_outcome(&ctx, source_cs_id)
+        .await?
+    {
+        Some(CommitSyncOutcome::RewrittenAs(cs_id, _))
+        | Some(CommitSyncOutcome::EquivalentWorkingCopyAncestor(cs_id, _)) => cs_id,
+        Some(CommitSyncOutcome::NotSyncCandidate(_)) => {
+            return Err(format_err!("{source_cs_id} is not a sync candidate"));
+        }
+        None => {
+            return Ok(target_cs_id.map(|_| BookmarkDiff::NoSyncOutcome { target_bookmark }));
+        }
+    };
+
+    Ok(match target_cs_id {
+        Some(target_cs_id) if target_cs_id != remapped_source_cs_id => {
+            Some(BookmarkDiff::InconsistentValue {
+                target_bookmark,
+                target_cs_id,
+                source_cs_id: Some(source_cs_id),
+            })
+        }
+        None => Some(BookmarkDiff::MissingInTarget {
+            target_bookmark,
+            source_cs_id,
+        }),
+        Some(_) => None,
+    })
 }
 
 /// Given a list of differences of a given type (`T`)
@@ -1716,6 +1721,7 @@ mod test {
     use mononoke_types::RepositoryId;
     use rendezvous::RendezVousOptions;
     use sql_construct::SqlConstruct;
+    use synced_commit_mapping::EquivalentWorkingCopyEntry;
     use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
     use synced_commit_mapping::SyncedCommitMapping;
     use synced_commit_mapping::SyncedCommitMappingEntry;
@@ -1757,6 +1763,150 @@ mod test {
 
         let actual_diff = find_bookmark_diff(ctx.clone(), &commit_sync_data).await?;
         assert!(!actual_diff.is_empty());
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_bookmark_diff_for_source_bookmark(fb: FacebookInit) -> Result<(), Error> {
+        let ctx = CoreContext::test_mock(fb);
+        let (syncers, _config) = init(fb, CommitSyncDirection::Forward).await?;
+        let commit_sync_data = &syncers.small_to_large;
+        let small_repo = commit_sync_data.get_small_repo();
+        let large_repo = commit_sync_data.get_large_repo();
+        let source_bookmark = BookmarkKey::new("feature")?;
+        let target_bookmark = BookmarkKey::new("prefix/feature")?;
+        let master = BookmarkKey::new("master")?;
+        let source_cs_id = small_repo
+            .bookmarks()
+            .get(ctx.clone(), &master, bookmarks::Freshness::MostRecent)
+            .await?
+            .ok_or_else(|| Error::msg("small repo master not found"))?;
+        let target_cs_id = large_repo
+            .bookmarks()
+            .get(ctx.clone(), &master, bookmarks::Freshness::MostRecent)
+            .await?
+            .ok_or_else(|| Error::msg("large repo master not found"))?;
+
+        bookmark(&ctx, &small_repo, source_bookmark.clone())
+            .set_to(source_cs_id)
+            .await?;
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(
+                ctx.clone(),
+                commit_sync_data,
+                source_bookmark.clone(),
+            )
+            .await?,
+            Some(BookmarkDiff::MissingInTarget {
+                target_bookmark: target_bookmark.clone(),
+                source_cs_id,
+            })
+        );
+
+        bookmark(&ctx, &large_repo, target_bookmark.clone())
+            .set_to(target_cs_id)
+            .await?;
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(
+                ctx.clone(),
+                commit_sync_data,
+                source_bookmark.clone(),
+            )
+            .await?,
+            None
+        );
+
+        bookmark(&ctx, &small_repo, source_bookmark.clone())
+            .delete()
+            .await?;
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(ctx.clone(), commit_sync_data, source_bookmark,)
+                .await?,
+            Some(BookmarkDiff::InconsistentValue {
+                target_bookmark,
+                target_cs_id,
+                source_cs_id: None,
+            })
+        );
+
+        let unsynced_source_bookmark = BookmarkKey::new("unsynced")?;
+        let unsynced_target_bookmark = BookmarkKey::new("prefix/unsynced")?;
+        let unsynced_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![source_cs_id])
+            .add_file("unsynced", "content")
+            .commit()
+            .await?;
+        bookmark(&ctx, &small_repo, unsynced_source_bookmark.clone())
+            .set_to(unsynced_cs_id)
+            .await?;
+
+        // Match the batch API: a source-only bookmark with no sync outcome is
+        // not actionable until its target bookmark exists.
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(
+                ctx.clone(),
+                commit_sync_data,
+                unsynced_source_bookmark.clone(),
+            )
+            .await?,
+            None
+        );
+
+        bookmark(&ctx, &large_repo, unsynced_target_bookmark.clone())
+            .set_to(target_cs_id)
+            .await?;
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(
+                ctx.clone(),
+                commit_sync_data,
+                unsynced_source_bookmark,
+            )
+            .await?,
+            Some(BookmarkDiff::NoSyncOutcome {
+                target_bookmark: unsynced_target_bookmark,
+            })
+        );
+
+        assert_eq!(
+            find_bookmark_diff_for_source_bookmark(
+                ctx.clone(),
+                &syncers.large_to_small,
+                BookmarkKey::new("outside-prefix")?,
+            )
+            .await?,
+            None
+        );
+
+        let not_sync_candidate = CreateCommitContext::new(&ctx, &large_repo, vec![target_cs_id])
+            .add_file("outside-prefix", "content")
+            .commit()
+            .await?;
+        bookmark(&ctx, &large_repo, "prefix/not-sync-candidate")
+            .set_to(not_sync_candidate)
+            .await?;
+        assert!(
+            commit_sync_data
+                .get_mapping()
+                .insert_equivalent_working_copy(
+                    &ctx,
+                    EquivalentWorkingCopyEntry {
+                        large_repo_id: large_repo.repo_identity().id(),
+                        large_bcs_id: not_sync_candidate,
+                        small_repo_id: small_repo.repo_identity().id(),
+                        small_bcs_id: None,
+                        version_name: Some(CommitSyncConfigVersion("noop".to_string())),
+                    },
+                )
+                .await?
+        );
+        let error = find_bookmark_diff_for_source_bookmark(
+            ctx,
+            &syncers.large_to_small,
+            BookmarkKey::new("prefix/not-sync-candidate")?,
+        )
+        .await
+        .expect_err("a not-sync-candidate bookmark must fail validation");
+        assert!(error.to_string().contains("is not a sync candidate"));
 
         Ok(())
     }

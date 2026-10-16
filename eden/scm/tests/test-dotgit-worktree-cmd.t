@@ -58,8 +58,8 @@ and it knows its label:
   commit2
   $ cat $(sl root --dotdir)/worktreename
   first (no-eol)
-  $ sl root --shared
-  $TESTTMP/repo
+  $ sl root --shared --dotdir
+  $TESTTMP/repo/.git/sl
 
 Add a worktree at an older revision:
 

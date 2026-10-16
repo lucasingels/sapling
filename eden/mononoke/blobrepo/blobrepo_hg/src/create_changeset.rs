@@ -40,18 +40,21 @@ use mercurial_types::subtree::HgSubtreeChanges;
 use mononoke_macros::mononoke;
 use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
 use mononoke_types::subtree_change::SubtreeChange;
 use repo_blobstore::RepoBlobstoreArc;
+use restricted_paths::AclFileChangeRejection;
+use restricted_paths::RestrictedPaths;
+use restricted_paths::RestrictedPathsError;
 use restricted_paths_common::ArcRestrictedPathsConfigBased;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::SortedVectorMap;
 use stats::prelude::*;
 use uuid::Uuid;
 
-use crate::ErrorKind;
 use crate::bonsai_generation::create_bonsai_changeset_object;
 use crate::bonsai_generation::save_bonsai_changeset_object;
 use crate::repo_commit::*;
@@ -62,6 +65,66 @@ define_stats! {
     create_changeset_compute_cf: timeseries("create_changeset.compute_changed_files"; Rate, Sum),
     create_changeset_expected_cf: timeseries("create_changeset.expected_changed_files"; Rate, Sum),
     create_changeset_cf_count: timeseries("create_changeset.changed_files_count"; Average, Sum),
+}
+
+/// Validates `.slacl` changes in each changeset derived by [`CreateChangeset`],
+/// before the changeset becomes reachable (commit graph and bonsai-hg mapping).
+pub struct AclFileValidation {
+    pub restricted_paths: Arc<RestrictedPaths>,
+    pub repo_name: String,
+}
+
+/// A `.slacl` change rejected while creating `hg_cs_id`. Children of the
+/// rejected commit fail with this same error, so it names the commit. It has
+/// no source, so it stays the root cause under the creation context.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{rejection} (changeset {hg_cs_id})")]
+pub struct AclFileChangeRejectedInChangeset {
+    pub hg_cs_id: HgChangesetId,
+    pub rejection: AclFileChangeRejection,
+}
+
+impl AclFileValidation {
+    /// Validate the bonsai's `.slacl` changes against its parents. The bonsai
+    /// file changes come from the manifest diff, so this doesn't trust the
+    /// client-supplied list of changed files. A rejection is reported as
+    /// [`AclFileChangeRejectedInChangeset`] for `hg_cs_id`.
+    async fn validate(
+        &self,
+        ctx: &CoreContext,
+        hg_cs_id: HgChangesetId,
+        bonsai: &BonsaiChangeset,
+    ) -> Result<()> {
+        let acl_file_name = self.restricted_paths.config().acl_file_name().as_bytes();
+        let touched_acl_files: Vec<NonRootMPath> = bonsai
+            .file_changes()
+            .map(|(path, _)| path)
+            .filter(|path| path.basename().as_ref() == acl_file_name)
+            .cloned()
+            .collect();
+        if touched_acl_files.is_empty() {
+            return Ok(());
+        }
+
+        let parents: Vec<ChangesetId> = bonsai.parents().collect();
+        self.restricted_paths
+            .validate_acl_file_changes_in_changesets(
+                ctx,
+                &self.repo_name,
+                &parents,
+                &[touched_acl_files.as_slice()],
+            )
+            .await
+            .map_err(|e| match e {
+                RestrictedPathsError::AclFileChangeRejected(rejection) => {
+                    Error::from(AclFileChangeRejectedInChangeset {
+                        hg_cs_id,
+                        rejection,
+                    })
+                }
+                e => Error::from(e),
+            })
+    }
 }
 
 pub struct CreateChangeset {
@@ -79,6 +142,9 @@ pub struct CreateChangeset {
     /// manually after this call. Effectively, the commit will be in the blobstore, but
     /// unreachable.
     pub upload_to_blobstore_only: bool,
+    /// If set, reject the changeset before it becomes reachable when it
+    /// modifies `.slacl` files the caller may not modify.
+    pub acl_file_validation: Option<AclFileValidation>,
 }
 
 impl CreateChangeset {
@@ -200,12 +266,9 @@ impl CreateChangeset {
 
                 if let Some(expected_nodeid) = expected_nodeid {
                     if cs_id != expected_nodeid {
-                        return Err(ErrorKind::InconsistentChangesetHash(
-                            expected_nodeid,
-                            cs_id,
-                            hg_cs,
-                        )
-                        .into());
+                        return Err(anyhow!(
+                            "Inconsistent node hash for changeset: provided: {expected_nodeid}, computed: {cs_id} for blob: {hg_cs:#?}"
+                        ));
                     }
                 }
 
@@ -268,8 +331,18 @@ impl CreateChangeset {
 
         let commit_graph_writer = repo.commit_graph_writer_arc();
         let bonsai_hg_mapping = repo.bonsai_hg_mapping_arc();
+        let acl_file_validation = self.acl_file_validation;
         let changeset_complete_fut = async move {
             let ((hg_cs, bonsai_cs), _) = future::try_join(changeset, parents_complete).await?;
+
+            // Parents are complete (and so reachable) here, so their
+            // restrictions can be looked up.
+            if let Some(acl_file_validation) = acl_file_validation {
+                acl_file_validation
+                    .validate(&ctx, hg_cs.get_changeset_id(), &bonsai_cs)
+                    .await
+                    .context("While validating ACL file changes")?;
+            }
 
             if !self.upload_to_blobstore_only {
                 // update changeset mapping

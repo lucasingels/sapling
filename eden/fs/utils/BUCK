@@ -64,6 +64,7 @@ cpp_library(
     ],
     deps = [
         "fbsource//third-party/fmt:fmt",
+        "//folly/container:f14_hash",
         "//folly/logging:logging",
     ],
     exported_deps = [
@@ -81,7 +82,6 @@ cpp_library(
         "//eden/common/utils:path",
         "//folly:range",
         "//folly/io:iobuf",
-        "//thrift/lib/cpp2/protocol/detail:protocol_methods",
     ],
 )
 
@@ -235,6 +235,10 @@ cpp_library(
         "ChronoParse.cpp",
         "ChronoUnit.cpp",
     ],
+    headers = [
+        "ChronoParse.h",
+        "ChronoUnit.h",
+    ],
     deps = [
         "//folly:conv",
         "//folly:string",
@@ -249,8 +253,27 @@ cpp_library(
 )
 
 cpp_library(
+    name = "invalidation_queue",
+    headers = ["InvalidationQueue.h"],
+    exported_deps = [
+        "//eden/common/utils:immediate_future",
+        "//folly:cancellation_token",
+        "//folly:function",
+        "//folly:scope_guard",
+        "//folly:synchronized",
+        "//folly/futures:core",
+        "//folly/logging:logging",
+        "//folly/synchronization:call_once",
+        "//folly/system:thread_name",
+    ],
+)
+
+cpp_library(
     name = "thread",
     srcs = ["Thread.cpp"],
+    headers = [
+        "Thread.h",
+    ],
     external_deps = [
         ("glibc", None, "pthread"),
     ],
@@ -279,6 +302,7 @@ cpp_library(
     srcs = ["NfsSocket.cpp"],
     headers = ["NfsSocket.h"],
     deps = [
+        "fbsource//third-party/fmt:fmt",
         "//folly:exception",
     ],
     exported_deps = [
@@ -354,9 +378,9 @@ cpp_library(
     headers = ["MountInfoTable.h"],
     deps = [
         ":statmount",
-        "//folly/logging:logging",
+        "//folly:file_util",
     ],
-    exported_deps = ["//folly:expected"],
+    exported_deps = ["//eden/common/utils:proc_mount_info"],
 )
 
 cpp_library(

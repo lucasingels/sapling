@@ -1101,13 +1101,52 @@ TEST(RestrictedTreeInode, omittedMode_fuseReaddirResumesAcrossOmittedEntry) {
   }
 }
 
+CO_TEST(RestrictedTreeInode, omittedMode_readdirIndexReflectsPermissionGrant) {
+  // Granting access clears the restricted bit in place, which leaves the
+  // entries' mutation count alone. An index cached by a listing that was
+  // abandoned before its end therefore stays usable, and must list the
+  // entry that just became visible.
+  FakeTreeBuilder builder;
+  builder.setFile("parent/a.txt", "a");
+  builder.setFile("parent/b.txt", "b");
+  builder.setFile("parent/c.txt", "c");
+  builder.setFile("parent/z_restricted/secret.txt", "secret");
+  builder.setDirIsRestricted("parent/z_restricted");
+  auto testMount = makeOmittedModeTestMount(builder);
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto restrictedInode = testMount->getTreeInode("parent/z_restricted"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  CO_ASSERT_TRUE(restrictedInode->isRestricted());
+
+  // Too small for ".", "..", "a.txt", "b.txt" and "c.txt", so the listing
+  // ends early and leaves its index behind.
+  auto firstPage =
+      parentInode->fuseReaddir(FuseDirList{128}, 0, context).extract();
+  CO_ASSERT_FALSE(firstPage.empty());
+  CO_ASSERT_LT(firstPage.size(), 5u);
+
+  testMount->getBackingStore()->setCheckPermissionResult(
+      restrictedInode->getObjectId().value(), true);
+  co_await restrictedInode->co_stat(context);
+  CO_ASSERT_FALSE(restrictedInode->isRestricted());
+
+  auto relisted =
+      parentInode->fuseReaddir(FuseDirList{4096}, 0, context).extract();
+  EXPECT_NE(
+      std::find_if(
+          relisted.begin(),
+          relisted.end(),
+          [](const auto& entry) { return entry.name == "z_restricted"; }),
+      relisted.end());
+}
+
 TEST(
     RestrictedTreeInode,
     omittedMode_nfsReaddirReportsEofWithTrailingOmittedEntry) {
   // NFS is the only consumer of readdirImpl's EOF bit, and the planned
-  // batched enumeration-time permission refresh will rework this loop.
-  // Restricted entries never enter the offset index, so pin now that a
-  // drain whose trailing entry is omitted still reports EOF.
+  // batched enumeration-time permission refresh will rework this loop, so
+  // pin now that a drain whose trailing entry is omitted still reports EOF.
   //
   // Inode numbers are allocated in name order, so z_restricted's inode
   // number (and thus readdir offset) is the largest — the omitted entry
@@ -1302,3 +1341,159 @@ TEST(
   EXPECT_TRUE(sawInodeInvalidation(*fuse, parentInode->getNodeId()));
 }
 #endif // __linux__
+
+#ifndef _WIN32
+namespace {
+// Reads the restricted bit of parent/restricted_child straight out of the
+// parent's DirContents, bypassing the omitted-mode listing filter.
+bool entryIsRestricted(
+    const TreeInodePtr& parentInode,
+    PathComponentPiece name) {
+  auto contents = parentInode->lockContentsRead();
+  return contents->entries.find(name)->second.isRestricted();
+}
+
+ObjectId entryObjectId(
+    const TreeInodePtr& parentInode,
+    PathComponentPiece name) {
+  auto contents = parentInode->lockContentsRead();
+  return contents->entries.find(name)->second.getObjectId();
+}
+
+bool restrictedChildIsHidden(const TreeInodePtr& parentInode) {
+  return entryIsRestricted(parentInode, "restricted_child"_pc);
+}
+
+ObjectId restrictedChildId(const TreeInodePtr& parentInode) {
+  return entryObjectId(parentInode, "restricted_child"_pc);
+}
+
+bool listsRestrictedChild(const TreeInodePtr& parentInode) {
+  auto context = ObjectFetchContext::getNullContext();
+  auto result =
+      parentInode->fuseReaddir(FuseDirList{4096}, 0, context).extract();
+  return std::any_of(result.begin(), result.end(), [](const auto& entry) {
+    return entry.name == "restricted_child";
+  });
+}
+} // namespace
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshRechecksHiddenRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, true);
+
+  // The kernel holds the parent's listing, so the walk has something to
+  // refresh.
+  parentInode->incFsRefcount();
+
+  EXPECT_FALSE(listsRestrictedChild(parentInode));
+  EXPECT_EQ(0, backingStore->getCheckPermissionCount(childId));
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+  EXPECT_TRUE(listsRestrictedChild(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshSkipsTreeTheKernelDoesNotHold) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, true);
+
+  ASSERT_EQ(0, parentInode->debugGetFsRefcount());
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(0, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+
+  // The refcount is the only thing that was holding the check back.
+  parentInode->incFsRefcount();
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshLeavesDeniedChildHidden) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, false);
+  parentInode->incFsRefcount();
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+  EXPECT_FALSE(listsRestrictedChild(parentInode));
+
+  // Within the TTL a second walk schedules no new check.
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshSkipsLoadedRestrictedDirTheKernelHolds) {
+  // An explicit lookup loads a restricted directory and hands the kernel a
+  // reference to it. The walk must step over it, not read its contents, or
+  // the rest of the mount after it in traversal order is never visited.
+  FakeTreeBuilder builder;
+  // Distinct contents so the two restricted trees get distinct ObjectIds.
+  builder.setFile("early_restricted/secret.txt", "early secret content");
+  builder.setDirIsRestricted("early_restricted");
+  builder.setFile("parent/normal.txt", "normal content");
+  builder.setFile("parent/restricted_child/secret.txt", "secret content");
+  builder.setDirIsRestricted("parent/restricted_child");
+  auto testMount = makeOmittedModeTestMount(builder);
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto earlyInode = testMount->getTreeInode("early_restricted"_relpath);
+  ASSERT_TRUE(earlyInode->isRestricted());
+  auto context = ObjectFetchContext::getNullContext();
+  auto earlyId = entryObjectId(rootInode, "early_restricted"_pc);
+  auto childId = restrictedChildId(parentInode);
+  ASSERT_NE(earlyId, childId);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(earlyId, false);
+  backingStore->setCheckPermissionResult(childId, true);
+
+  rootInode->incFsRefcount();
+  earlyInode->incFsRefcount();
+  parentInode->incFsRefcount();
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+
+  // The still-denied directory was rechecked by its parent and stays hidden.
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(earlyId));
+  EXPECT_TRUE(entryIsRestricted(rootInode, "early_restricted"_pc));
+  EXPECT_TRUE(earlyInode->isRestricted());
+  // The walk went on past it and refreshed the directory further along.
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+  EXPECT_TRUE(listsRestrictedChild(parentInode));
+}
+#endif // _WIN32

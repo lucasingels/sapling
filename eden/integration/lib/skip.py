@@ -4,8 +4,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
-
 import os
 import sys
 from typing import Dict, List, Union
@@ -20,6 +18,12 @@ from typing import Dict, List, Union
 # should gradually remove tests from this list as we get them passing on Windows.
 #
 TEST_DISABLED: Dict[str, Union[List[str], bool]] = {}
+if sys.platform == "linux":
+    # These fsck cases never mount a checkout, so transport variants add no coverage.
+    TEST_DISABLED["fsck.basic_snapshot_tests.Basic20251104TestIoUring"] = [
+        "test_incorrect_next_inode_number",
+        "test_corrupt_next_inode_number",
+    ]
 if sys.platform == "win32":
     # Note that on Windows we also exclude some test source files entirely
     # in CMakeLists.txt, for tests that never make sense to run on Windows.
@@ -122,6 +126,11 @@ if sys.platform == "win32":
         ],
         "hg.split_test.SplitTest": ["test_split_one_commit_into_two"],
         "hg.status_deadlock_test.StatusDeadlockTest": True,
+        "hg.symlink_test.SymlinkTest": [
+            # ProjectedFS rejects creating a file under a directory that a
+            # blocked checkout is holding, so the race cannot be staged.
+            "test_update_symlink_with_file_created_during_checkout",
+        ],
         "hg.status_test.StatusTest": [
             # TODO: Opening a file with O_TRUNC inside an EdenFS mount fails on Windows
             "test_partial_truncation_after_open_modifies_file",
@@ -136,6 +145,9 @@ if sys.platform == "win32":
             "test_file_locked_removal",
         ],
         "hg.update_test.UpdateTest": [
+            # Windows keeps abort-on-eden-conflict-error off, so the abort
+            # this test expects never happens.
+            "test_update_reports_checkout_error",
             # TODO: A \r\n is used
             "test_mount_state_during_unmount_with_in_progress_checkout",
             # Windows doesn't support executable files; mode changes are no-op
@@ -433,7 +445,7 @@ if "SANDCASTLE" in os.environ:
         TEST_DISABLED["changes_test.ChangesTestNix"] = [
             "test_modify_folder_chown",
         ]
-    class_name = "chown_test.ChownTestDefault"
+    class_name = "chown_test.ChownTest"
     method_name = "test_chown_with_bindmount"
     class_skipped = TEST_DISABLED.get(class_name)
     if class_skipped is None:
@@ -462,6 +474,18 @@ for class_name, value_name in TEST_DISABLED.items():
             VARIANT_PARITY[class_name + suffix] = value_name
 TEST_DISABLED.update(VARIANT_PARITY)
 
+# These platform limitations also apply to the independent io_uring siblings.
+if sys.platform == "linux":
+    for test_class in (
+        "hg.doctor_test.DoctorTest",
+        "hg.post_clone_test.SymlinkTest",
+        "hg.update_test.UpdateTest",
+    ):
+        for suffix in ("TreeOnly", "TreeOnlyFilteredHg"):
+            name = test_class + suffix
+            if name in TEST_DISABLED:
+                TEST_DISABLED[name + "IoUring"] = TEST_DISABLED[name]
+
 # Any future FilteredHg skips should be added here
 FILTEREDFS_TEST_DISABLED = {
     # These tests will behave the exact same on FilteredFS. Duplicating them can
@@ -480,10 +504,13 @@ FILTEREDFS_TEST_DISABLED = {
 for testModule, disabled in FILTEREDFS_TEST_DISABLED.items():
     # We should add skips for all combinations of FilteredHg mixins.
     other_mixins = ["", "NFS"] if sys.platform != "win32" else ["", "InMemory"]
-    for mixin in other_mixins:
+    filtered_variants = [f"{mixin}FilteredHg" for mixin in other_mixins]
+    if sys.platform == "linux":
+        filtered_variants.append("FilteredHgIoUring")
+    for variant in filtered_variants:
         # We need to be careful that we don't overwrite any pre-existing lists
         # or bulk disables that were disabled by other criteria.
-        new_class_name = testModule + mixin + "FilteredHg"
+        new_class_name = testModule + variant
         prev_disabled = TEST_DISABLED.get(new_class_name)
         if prev_disabled is None:
             # There are no previously disabled tests, we're free to bulk add

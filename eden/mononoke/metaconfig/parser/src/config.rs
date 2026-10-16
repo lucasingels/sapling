@@ -426,6 +426,7 @@ fn build_repo_config(
         hook_manager_params,
         hooks,
         redaction,
+        mirror_upload_redaction_bypass_enabled,
         generation_cache_size,
         scuba_table_hooks,
         cache_warmup,
@@ -450,6 +451,7 @@ fn build_repo_config(
         update_logging_config,
         commit_graph_config,
         deep_sharding_config,
+        lazy_loading_config,
         everstore_local_path,
         metadata_logger_config,
         commit_cloud_config,
@@ -519,6 +521,9 @@ fn build_repo_config(
         Redaction::Disabled
     };
 
+    let mirror_upload_redaction_bypass_enabled =
+        mirror_upload_redaction_bypass_enabled.unwrap_or(false);
+
     let infinitepush = infinitepush.convert()?.unwrap_or_default();
 
     let generation_cache_size: usize = generation_cache_size
@@ -556,6 +561,7 @@ fn build_repo_config(
 
     let commit_graph_config = commit_graph_config.convert()?.unwrap_or_default();
     let deep_sharding_config = deep_sharding_config.convert()?;
+    let lazy_loading_config = lazy_loading_config.convert()?;
     let metadata_logger_config = metadata_logger_config.convert()?.unwrap_or_default();
     let zelos_config = zelos_config.convert()?;
     let pipeline_zelos_config = pipeline_zelos_config.convert()?;
@@ -602,6 +608,7 @@ fn build_repo_config(
         hash_validation_percentage,
         readonly: metadata.readonly,
         redaction,
+        mirror_upload_redaction_bypass_enabled,
         infinitepush,
         list_keys_patterns_max,
         filestore,
@@ -621,6 +628,7 @@ fn build_repo_config(
         commit_graph_config,
         default_commit_identity_scheme: metadata.default_commit_identity_scheme,
         deep_sharding_config,
+        lazy_loading_config,
         everstore_local_path,
         metadata_logger_config,
         zelos_config,
@@ -1671,7 +1679,6 @@ mod test {
                         not_generated_filenodes_limit: 500,
                         monitoring_bookmark: None,
                         merge_resolution_excluded_path_prefixes: Default::default(),
-                        pessimistic_locking_bookmarks: Vec::new(),
                         merge_resolution_override: MergeResolutionOverride::UseJk,
                         land_instance_id: None,
                         phab_diff_id: None,
@@ -1693,6 +1700,7 @@ mod test {
                 hash_validation_percentage: 0,
                 readonly: RepoReadOnly::ReadWrite,
                 redaction: Redaction::Enabled,
+                mirror_upload_redaction_bypass_enabled: false,
                 infinitepush: InfinitepushParams {
                     allow_writes: true,
                     namespace: Some(InfinitepushNamespace::new(
@@ -1795,6 +1803,7 @@ mod test {
                     disable_commit_graph_v2_with_empty_common: false,
                 },
                 deep_sharding_config: Some(ShardingModeConfig { status: hashmap!() }),
+                lazy_loading_config: None,
                 everstore_local_path: None,
 
                 metadata_logger_config: MetadataLoggerConfig {
@@ -1897,6 +1906,7 @@ mod test {
                 hash_validation_percentage: 0,
                 readonly: RepoReadOnly::ReadWrite,
                 redaction: Redaction::Enabled,
+                mirror_upload_redaction_bypass_enabled: false,
                 infinitepush: InfinitepushParams::default(),
                 list_keys_patterns_max: LIST_KEYS_PATTERNS_MAX_DEFAULT,
                 hook_max_file_size: HOOK_MAX_FILE_SIZE_DEFAULT,
@@ -1915,6 +1925,7 @@ mod test {
                 update_logging_config: UpdateLoggingConfig::default(),
                 commit_graph_config: CommitGraphConfig::default(),
                 deep_sharding_config: None,
+                lazy_loading_config: None,
                 everstore_local_path: None,
                 metadata_logger_config: MetadataLoggerConfig::default(),
                 zelos_config: None,

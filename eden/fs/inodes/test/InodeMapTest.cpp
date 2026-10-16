@@ -7,6 +7,7 @@
 
 #include "eden/fs/inodes/InodeMap.h"
 
+#include <folly/Portability.h>
 #include <folly/String.h>
 #include <folly/test/TestUtils.h>
 #include <gtest/gtest.h>
@@ -59,6 +60,40 @@ TEST(InodeMap, forgetMultipleReferencesFromLoadedInode) {
   EXPECT_EQ(0, file->debugGetFsRefcount());
 }
 #endif
+
+TEST(InodeMap, decFsRefcountOnRememberedInodeWithoutReference) {
+  if (folly::kIsLinux) {
+    GTEST_SKIP() << "FUSE reference counts are exact";
+  }
+  auto builder = FakeTreeBuilder();
+  builder.setFile("src/test.txt", "this is a test file");
+  TestMount testMount{builder, false};
+
+  // Leave the load of "src" pending so the InodeMap remembers the inode
+  // without an FS reference.
+  auto rootInode = testMount.getEdenMount()->getRootInode();
+  auto srcFuture =
+      rootInode->getOrLoadChild("src"_pc, ObjectFetchContext::getNullContext())
+          .semi()
+          .via(testMount.getServerExecutor().get());
+  testMount.drainServerExecutor();
+  ASSERT_FALSE(srcFuture.isReady());
+
+  auto* inodeMap = testMount.getEdenMount()->getInodeMap();
+  const auto srcIno = rootInode->getChildInodeNumber("src"_pc);
+  ASSERT_TRUE(inodeMap->isInodeRemembered(srcIno));
+
+  // A PrjFS invalidation of an entry without an on-disk placeholder reaches
+  // this call while the load is in flight.
+  inodeMap->decFsRefcount(srcIno);
+  EXPECT_TRUE(inodeMap->isInodeRemembered(srcIno));
+
+  builder.setReady("src");
+  testMount.drainServerExecutor();
+  ASSERT_TRUE(srcFuture.isReady());
+  auto srcTree = std::move(srcFuture).get(std::chrono::seconds(1));
+  EXPECT_EQ(srcIno, srcTree->getNodeId());
+}
 
 TEST(InodeMap, simpleLookups) {
   // Test simple lookups that succeed immediately from the LocalStore
@@ -513,6 +548,7 @@ TEST(InodeMap, unloadedUnlinkedTreesAreRemovedFromOverlay) {
   dir2.reset();
 
   edenMount->getInodeMap()->decFsRefcount(dir2ino);
+  edenMount->getOverlay()->flushPendingAsync().get();
   EXPECT_FALSE(mount.hasOverlayDir(dir1ino));
   EXPECT_FALSE(mount.hasOverlayDir(dir2ino));
 #ifndef _WIN32
@@ -522,6 +558,86 @@ TEST(InodeMap, unloadedUnlinkedTreesAreRemovedFromOverlay) {
 }
 
 #ifndef _WIN32
+
+TEST(InodeMap, unloadedUnlinkedFilesAreRemovedFromOverlay) {
+  TestMount mount{FakeTreeBuilder{}};
+  auto edenMount = mount.getEdenMount();
+  auto* overlay = edenMount->getOverlay();
+  auto root = edenMount->getRootInode();
+
+  auto file1 =
+      root->mknod("file1"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  auto file2 =
+      root->mknod("file2"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  auto file1ino = file1->getNodeId();
+  auto file2ino = file2->getNodeId();
+  EXPECT_TRUE(overlay->hasOverlayFile(file1ino));
+  EXPECT_TRUE(overlay->hasOverlayFile(file2ino));
+
+  // Test both having a positive and zero fuse reference counts.
+  file2->incFsRefcount();
+  file1.reset();
+  file2.reset();
+
+  for (auto name : {"file1"_pc, "file2"_pc}) {
+    auto fut = root->unlink(
+                       name,
+                       InvalidationRequired::No,
+                       ObjectFetchContext::getNullContext())
+                   .semi()
+                   .via(mount.getServerExecutor().get());
+    mount.drainServerExecutor();
+    std::move(fut).get(0ms);
+  }
+
+  // Unlinked and unreferenced: removed once the overlay GC thread gets to it.
+  overlay->flushPendingAsync().get();
+  EXPECT_FALSE(overlay->hasOverlayFile(file1ino));
+  // Still referenced by the filesystem: kept until that reference drops.
+  EXPECT_TRUE(overlay->hasOverlayFile(file2ino));
+  edenMount->getInodeMap()->decFsRefcount(file2ino);
+  overlay->flushPendingAsync().get();
+  EXPECT_FALSE(overlay->hasOverlayFile(file2ino));
+}
+
+TEST(InodeMap, lookupOfRemovedUnloadedInodeWhoseNameWasReused) {
+  TestMount mount{FakeTreeBuilder{}};
+  auto edenMount = mount.getEdenMount();
+  auto* inodeMap = edenMount->getInodeMap();
+  auto root = edenMount->getRootInode();
+
+  auto file =
+      root->mknod("file"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  const auto oldIno = file->getNodeId();
+  file->incFsRefcount();
+  file.reset();
+  root->unloadChildrenNow();
+  ASSERT_TRUE(inodeMap->isInodeRemembered(oldIno));
+
+  // Recursive removal drops an unloaded child without loading it, and the
+  // InodeMap keeps remembering the inode for the FS reference.
+  root->removeRecursively(
+          "file"_pc,
+          InvalidationRequired::No,
+          ObjectFetchContext::getNullContext())
+      .get(0ms);
+  auto newFile =
+      root->mknod("file"_pc, S_IFREG | 0644, 0, InvalidationRequired::No);
+  ASSERT_NE(oldIno, newFile->getNodeId());
+
+  // Looking the old inode up by number must fail instead of loading the new
+  // file under the old number.
+  auto lookup =
+      inodeMap->lookupInode(oldIno).semi().via(mount.getServerExecutor().get());
+  mount.drainServerExecutor();
+  EXPECT_THROW_ERRNO(std::move(lookup).get(0ms), ENOENT);
+  EXPECT_EQ(newFile->getNodeId(), root->getChildInodeNumber("file"_pc));
+
+  // The old inode stays remembered until its FS reference is released.
+  EXPECT_TRUE(inodeMap->isInodeRemembered(oldIno));
+  inodeMap->decFsRefcount(oldIno);
+  EXPECT_FALSE(inodeMap->isInodeRemembered(oldIno));
+}
 
 TEST(InodeMap, unloadedFileMetadataIsForgotten) {
   FakeTreeBuilder builder;
@@ -558,10 +674,12 @@ TEST(InodeMap, unloadedFileMetadataIsForgotten) {
           ObjectFetchContext::getNullContext())
       .get(0ms);
 
+  edenMount->getOverlay()->flushPendingAsync().get();
   EXPECT_TRUE(mount.hasMetadata(file1ino));
   EXPECT_FALSE(mount.hasMetadata(file2ino));
 
   edenMount->getInodeMap()->decFsRefcount(file1ino);
+  edenMount->getOverlay()->flushPendingAsync().get();
   EXPECT_FALSE(mount.hasMetadata(file1ino));
   EXPECT_FALSE(mount.hasMetadata(file2ino));
 }
@@ -751,13 +869,13 @@ TEST_F(
 }
 
 #ifndef _WIN32
-TEST_F(InodePersistenceTreeTest, preservesLastFsRequestTimeDuringTakeover) {
+TEST_F(InodePersistenceTreeTest, preservesLastGcRefTimeDuringTakeover) {
   TestMount testMount{builder};
   auto edenMount = testMount.getEdenMount();
   auto file = testMount.getInode("dir/file1.txt"_relpath);
   file->incFsRefcount();
   const auto inodeNumber = file->getNodeId();
-  const auto expectedLastFsRequestTime = file->getLastFsRequestTime();
+  const auto expectedLastGcRefTime = file->getLastGcRefTime();
 
   testMount.getClock().advance(120s);
   edenMount.reset();
@@ -766,7 +884,7 @@ TEST_F(InodePersistenceTreeTest, preservesLastFsRequestTimeDuringTakeover) {
 
   auto reloaded =
       testMount.getEdenMount()->getInodeMap()->lookupInode(inodeNumber).get();
-  EXPECT_EQ(expectedLastFsRequestTime, reloaded->getLastFsRequestTime());
+  EXPECT_EQ(expectedLastGcRefTime, reloaded->getLastGcRefTime());
 }
 #endif
 
@@ -866,6 +984,29 @@ TEST(InodeMap, totalInodeCountFastMatchesInodeCounts) {
 
   EXPECT_EQ(getTotalFromCounts(), inodeMap->getTotalInodeCountFast());
   EXPECT_LT(inodeMap->getTotalInodeCountFast(), countBeforeForget);
+}
+
+TEST(InodeMap, forgottenCountExcludesReloadedInodes) {
+  FakeTreeBuilder builder;
+  builder.setFile("file", "contents");
+  TestMount testMount{builder};
+  auto* mount = testMount.getEdenMount().get();
+  auto* inodeMap = mount->getInodeMap();
+  auto file = testMount.getInode("file"_relpath);
+  const auto ino = file->getNodeId();
+  file->incFsRefcount();
+  file.reset();
+  mount->getRootInode()->unloadChildrenNow();
+  ASSERT_TRUE(inodeMap->isInodeRemembered(ino));
+  const auto before = inodeMap->getInodeCounts().forgottenInodeCount;
+
+  file = inodeMap->lookupInode(ino).get();
+  EXPECT_EQ(before, inodeMap->getInodeCounts().forgottenInodeCount);
+  file.reset();
+  mount->getRootInode()->unloadChildrenNow();
+  EXPECT_TRUE(inodeMap->clearFsRefcount(ino));
+  EXPECT_EQ(before + 1, inodeMap->getInodeCounts().forgottenInodeCount);
+  EXPECT_FALSE(inodeMap->isInodeLoadedOrRemembered(ino));
 }
 
 TEST(InodeMap, inodeLoadFailureLogsError) {

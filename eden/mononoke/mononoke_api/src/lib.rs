@@ -55,6 +55,7 @@ pub use crate::changeset::ChangesetHistoryOptions;
 pub use crate::changeset::ChangesetLinearHistoryOptions;
 pub use crate::changeset::FingerprintVersion;
 pub use crate::changeset::Generation;
+pub use crate::changeset::PathVisibility;
 pub use crate::changeset_path::ChangesetPathContentContext;
 pub use crate::changeset_path::ChangesetPathHistoryOptions;
 pub use crate::changeset_path::PathEntry;
@@ -97,6 +98,8 @@ pub use crate::repo::update_submodule_expansion::SubmoduleExpansionUpdateCommitI
 pub use crate::restricted_paths::PathAccessInfo;
 pub use crate::restricted_paths::RestrictedChangeGroup;
 pub use crate::restricted_paths::RestrictedPathsChangesInfo;
+pub use crate::restricted_paths::RestrictedPathsPolicy;
+pub use crate::restricted_paths::SCS_ENABLE_PARTIAL_RESPONSES_JK;
 pub use crate::specifiers::ChangesetId;
 pub use crate::specifiers::ChangesetIdPrefix;
 pub use crate::specifiers::ChangesetPrefixSpecifier;
@@ -106,7 +109,6 @@ pub use crate::specifiers::Globalrev;
 pub use crate::specifiers::HgChangesetId;
 pub use crate::specifiers::HgChangesetIdPrefix;
 pub use crate::tree::TreeContext;
-pub use crate::tree::TreeSummary;
 pub use crate::xrepo::CandidateSelectionHintArgs;
 
 /// An instance of Mononoke, which may manage multiple repositories.
@@ -188,14 +190,18 @@ impl<R: RepoIdentityRef> Mononoke<R> {
 
 impl<R> Mononoke<R> {
     /// Start a request on a repository by name.
-    // Method is async and fallible as in the future this may involve
-    // instantiating the repo lazily.
+    // Async and fallible because this can instantiate the repo lazily. The
+    // bound is the detached build's, not this method's: it sits here rather
+    // than on the impl block so nothing that never builds a repo inherits it.
     pub async fn repo(
         &self,
         ctx: CoreContext,
         name: impl AsRef<str>,
-    ) -> Result<Option<RepoContextBuilder<R>>, MononokeError> {
-        match self.repos.get_by_name(name.as_ref()) {
+    ) -> Result<Option<RepoContextBuilder<R>>, MononokeError>
+    where
+        R: Send + Sync + 'static,
+    {
+        match self.repos.get(name.as_ref()).await? {
             None => Ok(None),
             Some(repo) => Ok(Some(
                 RepoContextBuilder::new(ctx, repo, self.repos.clone()).await?,

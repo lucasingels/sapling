@@ -66,6 +66,12 @@ class NfsDispatcher {
     std::optional<struct stat> preStat;
     /** Attributes of the file after changing its attributes */
     std::optional<struct stat> postStat;
+    /**
+     * Whether the request asked only for attributes the file already had.
+     * Such a request changes nothing and is what the chmod EdenFS issues to
+     * invalidate the NFS client's cache of a directory looks like.
+     */
+    bool noop{false};
   };
 
   /**
@@ -89,10 +95,10 @@ class NfsDispatcher {
       const ObjectFetchContextPtr& context) = 0;
 
   /**
-   * Update the last fs request time of the inode. Parents won't be updated.
+   * Record a reference to the inode for inode garbage collection. Parents
+   * won't be updated.
    */
-  virtual ImmediateFuture<folly::Unit> updateLastFsRequestTime(
-      InodeNumber ino) = 0;
+  virtual ImmediateFuture<folly::Unit> markGcRef(InodeNumber ino) = 0;
 
   /**
    * Find the given file in the passed in directory. It's InodeNumber and

@@ -13,6 +13,9 @@ rust_library(
             "MononokeAppStats_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeAppStats_ods3-rust",
         }
     ),
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
+    ],
     deps = (
         [
             "fbsource//third-party/rust:anyhow",
@@ -81,6 +84,7 @@ rust_library(
             []
             if rust_oss.is_oss_build()
             else [
+                "//common/rust/srserver:srserver",
                 "//configerator/structs/infrasec/if:acl-rust",
                 "//eden/mononoke/facebook/ods3_schemas:MononokeAppStats_ods3-rs_bindings",
             ]

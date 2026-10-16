@@ -130,8 +130,9 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getInterestHandle(
   if (interest == Interest::None) {
     return GetResult{};
   }
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
-  return getInterestHandleCore(state, id, interest);
+  return getInterestHandleCore(state, id, interest, evicted);
 }
 
 template <
@@ -145,9 +146,10 @@ typename std::enable_if_t<
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getInterestHandleCore(
     LockedState& state,
     const ObjectId& id,
-    Interest interest) noexcept {
+    Interest interest,
+    EvictedObjects& evicted) noexcept {
   ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle;
-  auto item = getImpl(id, *state);
+  auto item = getImpl(id, *state, evicted);
   if (!item) {
     return GetResult{};
   }
@@ -189,9 +191,10 @@ typename std::enable_if_t<
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getSimple(
     const ObjectId& id) {
   XLOGF(DBG6, "ObjectCache::getSimple {}", id);
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
 
-  if (auto item = getImpl(id, *state)) {
+  if (auto item = getImpl(id, *state, evicted)) {
     return item->object;
   }
   return nullptr;
@@ -204,9 +207,15 @@ template <
 typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::CacheItem*
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getImpl(
     const ObjectId& id,
-    State& state) {
+    State& state,
+    EvictedObjects& evicted) {
   XLOGF(DBG6, "ObjectCache::getImpl {}", id);
   auto* item = folly::get_ptr(state.items, id);
+  if (item && isExpired(*item)) {
+    XLOGF(DBG6, "ObjectCache::getImpl expired {}", id);
+    evictItem(state, *item, evicted);
+    item = nullptr;
+  }
   if (!item) {
     XLOG(DBG6, "ObjectCache::getImpl missed");
     stats_->increment(&ObjectCacheStats::getMiss);
@@ -253,14 +262,18 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertInterestHandle(
       " creating entry with generation={}",
       preProcessRes.cacheItemGeneration);
 
+  auto size = object->getSizeBytes();
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
   return insertInterestHandleCore(
       std::move(id),
       std::move(object),
+      size,
       interest,
       state,
       preProcessRes.cacheItemGeneration,
-      std::move(preProcessRes.interestHandle));
+      std::move(preProcessRes.interestHandle),
+      evicted);
 }
 
 template <
@@ -304,11 +317,14 @@ typename std::enable_if_t<
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertInterestHandleCore(
     ObjectId id,
     ObjectPtr object,
+    size_t size,
     Interest interest,
     LockedState& state,
     uint64_t cacheItemGeneration,
-    ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle) {
-  auto [item, inserted] = insertImpl(std::move(id), std::move(object), *state);
+    ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle,
+    EvictedObjects& evicted) {
+  auto [item, inserted] = insertImpl(
+      std::move(id), std::move(object), size, kNeverExpires, *state, evicted);
   switch (interest) {
     case Interest::UnlikelyNeededAgain:
     case Interest::None:
@@ -339,10 +355,14 @@ template <ObjectCacheFlavor F>
 typename std::enable_if_t<F == ObjectCacheFlavor::Simple, void>
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertSimple(
     ObjectId id,
-    ObjectCache<ObjectType, Flavor, ObjectCacheStats>::ObjectPtr object) {
+    ObjectCache<ObjectType, Flavor, ObjectCacheStats>::ObjectPtr object,
+    Clock::time_point expiresAt) {
   XLOGF(DBG6, "ObjectCache::insertSimple {}", id);
+  auto size = object->getSizeBytes();
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
-  insertImpl(std::move(id), std::move(object), *state);
+  insertImpl(
+      std::move(id), std::move(object), size, expiresAt, *state, evicted);
 }
 
 template <
@@ -355,16 +375,25 @@ std::pair<
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertImpl(
     ObjectId id,
     ObjectPtr object,
-    State& state) {
+    size_t size,
+    Clock::time_point expiresAt,
+    State& state,
+    EvictedObjects& evicted) {
   XLOGF(DBG6, "ObjectCache::insertImpl {}", id);
 
-  auto size = object->getSizeBytes();
+  // An expired entry gives way to the fresh object rather than being renewed.
+  if (auto* expired = folly::get_ptr(state.items, id);
+      expired && isExpired(*expired)) {
+    evictItem(state, *expired, evicted);
+  }
+
   ObjectId key = id;
 
   // the following should be no except
 
   auto [iter, inserted] = state.items.try_emplace(
-      std::move(key), CacheItem{std::move(id), std::move(object)});
+      std::move(key),
+      CacheItem{std::move(id), std::move(object), size, expiresAt});
 
   auto* itemPtr = &iter->second;
   if (inserted) {
@@ -375,7 +404,7 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertImpl(
       throw;
     }
     state.totalSize += size;
-    evictUntilFits(state);
+    evictUntilFits(state, evicted);
   } else {
     state.evictionQueue.splice(
         state.evictionQueue.end(),
@@ -392,7 +421,8 @@ template <
 bool ObjectCache<ObjectType, Flavor, ObjectCacheStats>::contains(
     const ObjectId& id) const {
   auto state = getShard(id).lock();
-  return 1 == state->items.count(id);
+  auto* item = folly::get_ptr(state->items, id);
+  return item != nullptr && !isExpired(*item);
 }
 
 template <
@@ -481,6 +511,7 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::dropInterestHandle(
     const ObjectId& id,
     uint64_t generation) noexcept {
   XLOGF(DBG6, "dropInterestHandle {} generation={}", id, generation);
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
 
   auto* item = folly::get_ptr(state->items, id);
@@ -504,9 +535,8 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::dropInterestHandle(
   }
 
   if (--item->referenceCount == 0) {
-    state->evictionQueue.erase(state->evictionQueue.iterator_to(*item));
     stats_->increment(&ObjectCacheStats::objectDrop);
-    evictItem(*state, *item);
+    evictItem(*state, *item, evicted);
   }
 }
 
@@ -515,7 +545,8 @@ template <
     ObjectCacheFlavor Flavor,
     typename ObjectCacheStats>
 void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictUntilFits(
-    State& state) noexcept {
+    State& state,
+    EvictedObjects& evicted) {
   XLOGF(
       DBG6,
       "ObjectCache::evictUntilFits state.totalSize={}, maximumCacheSizeBytes={}, evictionQueue.size()={}, minimumEntryCount={}",
@@ -525,7 +556,7 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictUntilFits(
       state.minimumEntryCount);
   while (state.totalSize > state.maximumCacheSizeBytes &&
          state.evictionQueue.size() > state.minimumEntryCount) {
-    evictOne(state);
+    evictOne(state, evicted);
   }
 }
 
@@ -534,11 +565,10 @@ template <
     ObjectCacheFlavor Flavor,
     typename ObjectCacheStats>
 void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictOne(
-    State& state) noexcept {
-  const auto& front = state.evictionQueue.front();
-  state.evictionQueue.pop_front();
+    State& state,
+    EvictedObjects& evicted) {
+  evictItem(state, state.evictionQueue.front(), evicted);
   stats_->increment(&ObjectCacheStats::insertEviction);
-  evictItem(state, front);
 }
 
 template <
@@ -547,20 +577,19 @@ template <
     typename ObjectCacheStats>
 void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictItem(
     State& state,
-    const CacheItem& item) noexcept {
+    CacheItem& item,
+    EvictedObjects& evicted) {
   XLOGF(
       DBG6,
       "ObjectCache::evictItem evicting {} generation={}",
       item.id,
       item.generation);
-  auto size = item.object->getSizeBytes();
-  // TODO: Releasing this ObjectPtr here can run arbitrary deleters which
-  // could, in theory, try to reacquire the ObjectCache's lock. The object
-  // could be scheduled for deletion in a deletion queue but then it's hard to
-  // ensure that scheduling is noexcept. Instead, ObjectPtr should be replaced
-  // with an refcounted pointer that doesn't allow running custom deleters.
+  // Growing the buffer is the only step that can throw, so it happens before
+  // the entry is touched; a failure leaves the cache consistent.
+  evicted.push_back(item.object);
+  state.evictionQueue.erase(state.evictionQueue.iterator_to(item));
+  state.totalSize -= item.size;
   state.items.erase(item.id);
-  state.totalSize -= size;
 }
 
 template <
@@ -570,11 +599,11 @@ template <
 void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::invalidate(
     const ObjectId& id) noexcept {
   XLOGF(DBG6, "ObjectCache::invalidate {}", id);
+  EvictedObjects evicted;
   auto state = getShard(id).lock();
 
-  if (auto item = getImpl(id, *state)) {
-    state->evictionQueue.erase(state->evictionQueue.iterator_to(*item));
-    evictItem(*state, *item);
+  if (auto item = getImpl(id, *state, evicted)) {
+    evictItem(*state, *item, evicted);
   }
 };
 } // namespace facebook::eden

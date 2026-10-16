@@ -11,13 +11,14 @@
 #include <folly/FileUtil.h>
 #include <folly/Portability.h>
 #include <folly/Range.h>
+#include <folly/ScopeGuard.h>
+#include <folly/SocketAddress.h>
 #include <folly/Synchronized.h>
 #include <folly/futures/Future.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseThread.h>
-#include <folly/json/json.h>
 #include <folly/portability/Fcntl.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/synchronization/SaturatingSemaphore.h>
@@ -25,13 +26,29 @@
 #include <folly/testing/TestUtil.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
+
+#ifdef __linux__
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/securebits.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include "eden/fs/privhelper/priority/LinuxMemoryPriority.h"
+#include "eden/fs/utils/Statmount.h"
+#endif
 
 #include "eden/common/telemetry/DynamicEvent.h"
 #include "eden/common/testharness/TempFile.h"
@@ -40,6 +57,7 @@
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperImpl.h"
+#include "eden/fs/privhelper/PrivHelperRollback.h"
 #include "eden/fs/privhelper/RestartSentinel.h"
 #include "eden/fs/privhelper/test/PrivHelperTestServer.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
@@ -61,6 +79,62 @@ using folly::test::TemporaryDirectory;
 using folly::test::TemporaryFile;
 using std::string;
 using testing::UnorderedElementsAre;
+
+#ifdef __linux__
+namespace {
+void runInMountNamespace(
+    const std::function<void()>& test,
+    uid_t mappedUid = 0) {
+  const auto uid = getuid();
+  const auto gid = getgid();
+  const auto pid = fork();
+  if (pid < 0) {
+    FAIL() << "fork failed: " << folly::errnoStr(errno);
+  }
+  if (pid == 0) {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+      _exit(77);
+    }
+    try {
+      checkUnixError(
+          folly::writeFile(
+              fmt::format("{} {} 1\n", mappedUid, uid), "/proc/self/uid_map")
+              ? 0
+              : -1);
+      checkUnixError(
+          folly::writeFile(StringPiece{"deny\n"}, "/proc/self/setgroups") ? 0
+                                                                          : -1);
+      checkUnixError(
+          folly::writeFile(fmt::format("0 {} 1\n", gid), "/proc/self/gid_map")
+              ? 0
+              : -1);
+      checkUnixError(
+          mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr));
+      test();
+    } catch (const std::exception& ex) {
+      ADD_FAILURE() << ex.what();
+    }
+    _exit(::testing::Test::HasFailure() ? 1 : 0);
+  }
+  int status;
+  ASSERT_EQ(pid, waitpid(pid, &status, 0));
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+    GTEST_SKIP() << "user/mount namespaces are unavailable";
+  }
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+void installPrivHelperRollbackMarker() {
+  checkUnixError(mount("tmpfs", "/etc", "tmpfs", 0, "size=1m"));
+  boost::filesystem::create_directory("/etc/eden");
+  File marker(
+      kDisablePrivHelperHardeningPath,
+      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+      0600);
+  ASSERT_TRUE(disablePrivHelperHardening());
+}
+} // namespace
+#endif
 
 TEST(TccDisclaimKillswitch, presentWhenFileExists) {
   TemporaryFile killswitch;
@@ -152,6 +226,10 @@ class PrivHelperThreadedTestServer : public PrivHelperServer {
     return std::move(data->requestedVfsTypes);
   }
 
+  void setAfterSanityCheck(std::function<void()> callback) {
+    data_.wlock()->afterSanityCheck = std::move(callback);
+  }
+
  private:
   struct Data {
     std::unordered_map<string, std::list<Future<File>>> fuseMountResults;
@@ -160,7 +238,18 @@ class PrivHelperThreadedTestServer : public PrivHelperServer {
     std::unordered_map<string, std::list<Future<Unit>>> bindMountResults;
     std::unordered_map<string, std::list<Future<Unit>>> bindUnmountResults;
     std::vector<File> logFiles;
+    std::function<void()> afterSanityCheck;
   };
+
+  void sanityCheckOpenedMountPoint(
+      const std::string& mountPoint,
+      int mountPointFd) override {
+    PrivHelperServer::sanityCheckOpenedMountPoint(mountPoint, mountPointFd);
+    auto callback = std::move(data_.wlock()->afterSanityCheck);
+    if (callback) {
+      callback();
+    }
+  }
 
   template <typename T>
   folly::Future<T> getResultFuture(
@@ -323,14 +412,10 @@ static_assert(PrivHelperConn::REQ_SET_USE_EDENFS == 10);
 // without sleeping.
 constexpr uint64_t kFakeNow = 1'700'000'000ull;
 
-// Distinct bytes above 2^32, so a truncated width or a swapped field fails.
-constexpr uint64_t kSentinelNonce = 0x0123456789abcdefull;
-
 EdenFsRestartArgs makeRestartArgs(std::string sentinelPath) {
   EdenFsRestartArgs args;
   args.enabled = true;
   args.sentinelPath = std::move(sentinelPath);
-  args.sentinelNonce = kSentinelNonce;
   args.restartCount = 1;
   args.firstRestartEpochSec = kFakeNow;
   args.maxRestarts = 3;
@@ -338,34 +423,18 @@ EdenFsRestartArgs makeRestartArgs(std::string sentinelPath) {
   return args;
 }
 
-#ifdef __APPLE__
 const std::vector<std::string> kSentinelArgv{
     "/usr/local/libexec/eden/edenfs",
     "--edenfs"};
 
-folly::dynamic makeSentinelEnv() {
-  return folly::dynamic::object("PATH", "/usr/bin")("HOME", "/home/test");
+/**
+ * Restrict the sentinel to its owner, as the daemon writes it. Both
+ * folly::writeFile and TemporaryFile create a file 0666 & ~umask, so under a
+ * group-writable umask the privhelper would refuse a sentinel it should accept.
+ */
+void restrictSentinelToOwner(const std::string& path) {
+  checkUnixError(::chmod(path.c_str(), 0600));
 }
-
-/** The relaunch command as EdenServer::armPrivHelperRestart() writes it. */
-std::string makeSentinelContents(
-    uint64_t nonce = kSentinelNonce,
-    folly::dynamic env = makeSentinelEnv()) {
-  folly::dynamic argv = folly::dynamic::array;
-  for (const auto& arg : kSentinelArgv) {
-    argv.push_back(arg);
-  }
-  return folly::toJson(
-      folly::dynamic::object("argv", argv)("env", std::move(env))(
-          "nonce", static_cast<int64_t>(nonce)));
-}
-
-/** As a daemon too old to stamp a generation writes it. */
-std::string makeSentinelContentsWithoutNonce() {
-  return folly::toJson(
-      folly::dynamic::object("argv", folly::dynamic::array("/bin/edenfs")));
-}
-#endif // __APPLE__
 
 EdenFsRestartArgs roundTrip(const EdenFsRestartArgs& args) {
   auto msg = PrivHelperConn::serializeSetRestartArgsRequest(/*xid=*/42, args);
@@ -377,6 +446,89 @@ EdenFsRestartArgs roundTrip(const EdenFsRestartArgs& args) {
   return parsed;
 }
 
+std::string serializeRestartArgsRejection(const EdenFsRestartArgs& args) {
+  try {
+    PrivHelperConn::serializeSetRestartArgsRequest(/*xid=*/42, args);
+  } catch (const std::invalid_argument& ex) {
+    return ex.what();
+  } catch (const std::exception& ex) {
+    ADD_FAILURE() << "expected std::invalid_argument, got: " << ex.what();
+    return {};
+  }
+  ADD_FAILURE() << "the serializer accepted oversized restart args";
+  return {};
+}
+
+void appendLengthPrefixedString(
+    folly::io::Appender& appender,
+    folly::StringPiece value) {
+  appender.write<uint32_t>(static_cast<uint32_t>(value.size()));
+  appender.push(folly::ByteRange(value));
+}
+
+// What is left unread when the parser rejects the relaunch command: the four
+// trailing counters.
+constexpr size_t kBytesAfterRelaunchCommand =
+    3 * sizeof(uint32_t) + sizeof(uint64_t);
+// Rejecting the sentinel path leaves the argv and env counts as well.
+constexpr size_t kBytesAfterSentinelPath =
+    2 * sizeof(uint32_t) + kBytesAfterRelaunchCommand;
+
+/**
+ * An enabled restart-args body whose sentinel path declares
+ * `sentinelPathLength` bytes without supplying any, whose relaunch command is
+ * whatever `writeRelaunchCommand` appends, and whose four trailing counters
+ * are zero. Encoded independently of the serializer under test.
+ */
+template <typename Fn>
+folly::IOBuf makeRestartArgsBody(
+    uint32_t sentinelPathLength,
+    Fn writeRelaunchCommand) {
+  constexpr size_t kBodySize = 256;
+  folly::IOBuf body{folly::IOBuf::CREATE, kBodySize};
+  folly::io::Appender appender{&body, kBodySize};
+  appender.write<uint8_t>(1);
+  appender.write<uint32_t>(sentinelPathLength);
+  writeRelaunchCommand(appender);
+  appender.write<uint32_t>(0);
+  appender.write<uint64_t>(0);
+  appender.write<uint32_t>(0);
+  appender.write<uint32_t>(0);
+  return body;
+}
+
+/** The errno the parser rejected `cursor` with, or 0 if it accepted it. */
+int parseRestartArgsRejection(folly::io::Cursor& cursor) {
+  EdenFsRestartArgs args;
+  try {
+    PrivHelperConn::parseSetRestartArgsRequest(cursor, args);
+  } catch (const std::system_error& ex) {
+    return ex.code().value();
+  } catch (const std::exception& ex) {
+    ADD_FAILURE() << "expected a std::system_error, got: " << ex.what();
+    return 0;
+  }
+  ADD_FAILURE() << "the parser accepted a malformed message";
+  return 0;
+}
+
+/**
+ * Assert `body` is rejected without the parser ever sizing an allocation from
+ * the length or count it declares.
+ *
+ * Only Cursor::readFixedString() sizes anything from the wire here, and it
+ * reserves the declared length before draining the message looking for those
+ * bytes. Finding `bytesLeftUnread` still there is what shows it was never
+ * reached.
+ */
+void expectRejectedBeforeSizingAnything(
+    const folly::IOBuf& body,
+    size_t bytesLeftUnread) {
+  folly::io::Cursor cursor{&body};
+  EXPECT_EQ(EINVAL, parseRestartArgsRejection(cursor));
+  EXPECT_EQ(bytesLeftUnread, cursor.totalLength());
+}
+
 } // namespace
 
 TEST(PrivHelperConnRestartArgs, roundTripPreservesAwkwardValues) {
@@ -384,8 +536,139 @@ TEST(PrivHelperConnRestartArgs, roundTripPreservesAwkwardValues) {
       makeRestartArgs("/var/eden dir/.edenfs_restart_armed \xc3\xa9");
   // Above 2^32, to catch a truncated width on the wire.
   expected.firstRestartEpochSec = uint64_t{1} << 33;
+  expected.relaunchArgv = {
+      "/usr/local/libexec/eden/edenfs",
+      "--edenfsctlPath=/opt/eden dir/edenfsctl",
+      "--configPath=/home/us\xc3\xa9r/.edenrc",
+      ""};
+  // Duplicate keys are deliberate: the codec must not reorder or coalesce them.
+  expected.relaunchEnv = {
+      {"PATH", "/usr/bin:/bin"},
+      {"EDENFS_EXTRA_ARGS", "--logging=eden=DBG2,eden.fs=DBG7"},
+      {"EMPTY", ""},
+      {"HOME", "/home/first"},
+      {"HOME", "/home/last"}};
 
   EXPECT_EQ(expected, roundTrip(expected));
+}
+
+TEST(PrivHelperConnRestartArgs, roundTripPreservesAnEmptyRelaunchCommand) {
+  auto expected = makeRestartArgs("/var/eden/.edenfs_restart_armed");
+  ASSERT_TRUE(expected.relaunchArgv.empty());
+  ASSERT_TRUE(expected.relaunchEnv.empty());
+
+  EXPECT_EQ(expected, roundTrip(expected));
+}
+
+TEST(PrivHelperConnRestartArgs, serializerRejectsAnOversizedSentinelPath) {
+  auto args = makeRestartArgs(
+      std::string(PrivHelperConn::kMaxSentinelPathBytes + 1, 'a'));
+
+  EXPECT_THAT(
+      serializeRestartArgsRejection(args),
+      ::testing::HasSubstr("sentinel path"));
+}
+
+TEST(PrivHelperConnRestartArgs, serializerRejectsTooManyArgvEntries) {
+  auto args = makeRestartArgs("/var/eden/.edenfs_restart_armed");
+  args.relaunchArgv.resize(PrivHelperConn::kMaxRelaunchArgvEntries + 1);
+
+  EXPECT_THAT(
+      serializeRestartArgsRejection(args),
+      ::testing::HasSubstr("relaunch argv"));
+}
+
+TEST(PrivHelperConnRestartArgs, serializerRejectsTooManyEnvEntries) {
+  auto args = makeRestartArgs("/var/eden/.edenfs_restart_armed");
+  args.relaunchEnv.resize(PrivHelperConn::kMaxRelaunchEnvEntries + 1);
+
+  EXPECT_THAT(
+      serializeRestartArgsRejection(args),
+      ::testing::HasSubstr("relaunch env"));
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsASentinelPathBeyondItsByteLimit) {
+  expectRejectedBeforeSizingAnything(
+      makeRestartArgsBody(
+          std::numeric_limits<uint32_t>::max(),
+          [](folly::io::Appender& appender) {
+            appender.write<uint32_t>(0); // argv count
+            appender.write<uint32_t>(0); // env count
+          }),
+      kBytesAfterSentinelPath);
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsAnArgvCountBeyondTheLimit) {
+  expectRejectedBeforeSizingAnything(
+      makeRestartArgsBody(
+          0,
+          [](folly::io::Appender& appender) {
+            appender.write<uint32_t>(
+                PrivHelperConn::kMaxRelaunchArgvEntries + 1);
+          }),
+      kBytesAfterRelaunchCommand);
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsAnEnvCountBeyondTheLimit) {
+  expectRejectedBeforeSizingAnything(
+      makeRestartArgsBody(
+          0,
+          [](folly::io::Appender& appender) {
+            appender.write<uint32_t>(0); // argv count
+            appender.write<uint32_t>(
+                PrivHelperConn::kMaxRelaunchEnvEntries + 1);
+          }),
+      kBytesAfterRelaunchCommand);
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsAStringBeyondTheByteLimit) {
+  expectRejectedBeforeSizingAnything(
+      makeRestartArgsBody(
+          0,
+          [](folly::io::Appender& appender) {
+            appender.write<uint32_t>(1); // argv count
+            appender.write<uint32_t>(std::numeric_limits<uint32_t>::max());
+          }),
+      kBytesAfterRelaunchCommand);
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsAStringLongerThanTheMessage) {
+  expectRejectedBeforeSizingAnything(
+      makeRestartArgsBody(
+          0,
+          [](folly::io::Appender& appender) {
+            appender.write<uint32_t>(1); // argv count
+            appender.write<uint32_t>(PrivHelperConn::kMaxRelaunchBytes / 2);
+          }),
+      kBytesAfterRelaunchCommand);
+}
+
+TEST(PrivHelperConnRestartArgs, rejectsARelaunchCommandOverTheByteLimit) {
+  const std::string halfLimit(PrivHelperConn::kMaxRelaunchBytes / 2, 'a');
+  auto body =
+      makeRestartArgsBody(0, [&halfLimit](folly::io::Appender& appender) {
+        appender.write<uint32_t>(2); // argv count
+        appendLengthPrefixedString(appender, halfLimit);
+        appendLengthPrefixedString(appender, halfLimit);
+        appender.write<uint32_t>(1); // env count
+        appender.write<uint32_t>(1); // env name length
+      });
+  folly::io::Cursor cursor{&body};
+
+  EXPECT_EQ(EINVAL, parseRestartArgsRejection(cursor));
+}
+
+TEST(PrivHelperConnRestartArgs, serializerRejectsARelaunchCommandOverTheLimit) {
+  // The budget spans argv and env together, so the environment is what tips
+  // this one over.
+  auto args = makeRestartArgs("/var/eden/.edenfs_restart_armed");
+  const size_t half = PrivHelperConn::kMaxRelaunchBytes / 2;
+  args.relaunchArgv = {std::string(half, 'a'), std::string(half, 'b')};
+  args.relaunchEnv = {{"PATH", "/usr/bin"}};
+
+  const auto error = serializeRestartArgsRejection(args);
+  EXPECT_THAT(error, ::testing::HasSubstr("relaunch env name"));
+  EXPECT_THAT(error, ::testing::HasSubstr("budget"));
 }
 
 TEST(PrivHelperRestartCounterEnv, absentIsZero) {
@@ -414,7 +697,7 @@ TEST(PrivHelperRestartCounterEnv, readsAValueAbove32Bits) {
       uint64_t{1} << 32, readEdenFsRestartCounterEnv(kEdenFsFirstRestartAtEnv));
 }
 
-TEST(PrivHelperConnRestartArgs, notifyCleanShutdownRoundTrip) {
+TEST(PrivHelperConnCleanShutdown, roundTrip) {
   constexpr folly::StringPiece kReason{"graceful restart"};
   auto msg = PrivHelperConn::serializeNotifyCleanShutdownRequest(
       /*xid=*/7, kReason);
@@ -424,6 +707,68 @@ TEST(PrivHelperConnRestartArgs, notifyCleanShutdownRoundTrip) {
   std::string reason;
   PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
   EXPECT_EQ(kReason, reason);
+}
+
+TEST(PrivHelperConnCleanShutdown, acceptsAReasonAtTheByteLimit) {
+  constexpr size_t kReasonByteLimit = 4096;
+  static_assert(
+      PrivHelperConn::kMaxCleanShutdownReasonBytes == kReasonByteLimit);
+  const std::string expected(kReasonByteLimit, 'a');
+  auto msg = PrivHelperConn::serializeNotifyCleanShutdownRequest(
+      /*xid=*/7, expected);
+  folly::io::Cursor cursor{&msg.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  std::string reason;
+  PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+  EXPECT_EQ(expected, reason);
+}
+
+TEST(PrivHelperConnCleanShutdown, truncatesAReasonBeyondTheByteLimit) {
+  const std::string expected(PrivHelperConn::kMaxCleanShutdownReasonBytes, 'a');
+  auto msg = PrivHelperConn::serializeNotifyCleanShutdownRequest(
+      /*xid=*/7, expected + "b");
+  folly::io::Cursor cursor{&msg.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  std::string reason;
+  PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+  EXPECT_EQ(expected, reason);
+}
+
+TEST(
+    PrivHelperConnCleanShutdown,
+    rejectsAReasonBeyondTheByteLimitBeforeAllocation) {
+  constexpr uint32_t kTrailingMarker = 0x12345678;
+  folly::IOBuf body{folly::IOBuf::CREATE, 2 * sizeof(uint32_t)};
+  folly::io::Appender appender{&body, 2 * sizeof(uint32_t)};
+  appender.write<uint32_t>(PrivHelperConn::kMaxCleanShutdownReasonBytes + 1);
+  appender.write<uint32_t>(kTrailingMarker);
+  folly::io::Cursor cursor{&body};
+
+  std::string reason;
+  try {
+    PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+    ADD_FAILURE() << "the parser accepted an oversized shutdown reason";
+  } catch (const std::system_error& ex) {
+    EXPECT_EQ(EINVAL, ex.code().value());
+  }
+  EXPECT_EQ(sizeof(kTrailingMarker), cursor.totalLength());
+}
+
+TEST(PrivHelperNfsMount, onlyUnixSocketTransportsNeedFstypeOverride) {
+  NFSMountOptions options;
+  options.mountdAddr = folly::SocketAddress::makeFromPath("/tmp/mountd.sock");
+  options.nfsdAddr = folly::SocketAddress::makeFromPath("/tmp/nfsd.sock");
+  EXPECT_TRUE(needsFstypeOverride(options));
+
+  options.mountdAddr = folly::SocketAddress{"127.0.0.1", 1};
+  options.nfsdAddr = folly::SocketAddress{"127.0.0.1", 2049};
+  EXPECT_FALSE(needsFstypeOverride(options));
+
+  options.mountdAddr = folly::SocketAddress{"::1", 1};
+  options.nfsdAddr = folly::SocketAddress{"::1", 2049};
+  EXPECT_FALSE(needsFstypeOverride(options));
 }
 
 class RawPrivHelperClient : private UnixSocket::ReceiveCallback {
@@ -629,6 +974,15 @@ class PrivHelperRawProtocolTest : public ::testing::Test {
   std::optional<RawPrivHelperClient> client_;
 };
 
+TEST_F(PrivHelperTest, restartArgsValidationFailureCompletesTheFuture) {
+  auto args = makeRestartArgs(
+      std::string(PrivHelperConn::kMaxSentinelPathBytes + 1, 'a'));
+
+  auto result = client_->setRestartArgs(args);
+
+  EXPECT_THROW(std::move(result).get(), std::invalid_argument);
+}
+
 TEST_F(PrivHelperRawProtocolTest, legacyMacFuseConfigRequestsAreNoOps) {
   auto timeoutResponse = client_->sendAndRecv(makeLegacyMacFuseConfigRequest(
       1, PrivHelperConn::REQ_SET_DAEMON_TIMEOUT, 60'000'000'000));
@@ -640,6 +994,478 @@ TEST_F(PrivHelperRawProtocolTest, legacyMacFuseConfigRequestsAreNoOps) {
   PrivHelperConn::parseEmptyResponse(
       PrivHelperConn::REQ_SET_USE_EDENFS, useEdenFsResponse);
 }
+
+TEST_F(PrivHelperTest, nfsFstypeOverrideCanBeTurnedOff) {
+  EXPECT_TRUE(server_.nfsFstypeOverrideEnabled());
+  client_->setNfsFstypeOverride(false).get(1s);
+  EXPECT_FALSE(server_.nfsFstypeOverrideEnabled());
+}
+
+#ifdef __linux__
+TEST_F(PrivHelperTest, fuseReadAheadRequiresARegisteredMount) {
+  auto dir = makeTempDir();
+  const auto path = dir.path().string();
+  EXPECT_THROW_RE(
+      client_->setFuseReadAhead(path, 1024).get(1s),
+      std::exception,
+      "No FUSE mount found");
+
+  client_->takeoverStartup(path, {}).get(1s);
+  server_.setFuseUnmountResult(path).setValue();
+  // An ordinary registered directory has no BDI configuration to update.
+  EXPECT_NO_THROW(client_->setFuseReadAhead(path, 1024).get(1s));
+
+  client_->takeoverShutdown(path).get(1s);
+  EXPECT_THROW_RE(
+      client_->setFuseReadAhead(path, 1024).get(1s),
+      std::exception,
+      "No FUSE mount found");
+}
+
+TEST(PrivHelperMemoryPriorityTest, checksOwnershipBeforeWriting) {
+  runInMountNamespace([&] {
+    int pipeFds[2];
+    checkUnixError(pipe(pipeFds));
+    File reader(pipeFds[0], true);
+    File writer(pipeFds[1], true);
+    const auto pid = fork();
+    if (pid < 0) {
+      FAIL() << "fork failed: " << folly::errnoStr(errno);
+    }
+    if (pid == 0) {
+      writer.close();
+      char byte;
+      _exit(folly::readNoInt(reader.fd(), &byte, 1) == 0 ? 0 : 1);
+    }
+    reader.close();
+    SCOPE_EXIT {
+      writer.close();
+      int status;
+      EXPECT_EQ(pid, waitpid(pid, &status, 0));
+      EXPECT_TRUE(WIFEXITED(status));
+      EXPECT_EQ(0, WEXITSTATUS(status));
+    };
+
+    LinuxMemoryPriority owned(1000, getuid());
+    const auto original = owned.getPriorityForProcess(pid);
+    ASSERT_TRUE(original.has_value());
+    LinuxMemoryPriority otherOwner(1000, getuid() + 1);
+    EXPECT_THROW_RE(
+        otherOwner.setPriorityForProcess(pid),
+        std::system_error,
+        "is not owned by user");
+    EXPECT_EQ(original, owned.getPriorityForProcess(pid));
+    EXPECT_EQ(0, owned.setPriorityForProcess(pid));
+    EXPECT_EQ(1000, owned.getPriorityForProcess(pid));
+
+    installPrivHelperRollbackMarker();
+    EXPECT_EQ(0, otherOwner.setPriorityForProcess(pid));
+    EXPECT_EQ(1000, owned.getPriorityForProcess(pid));
+  });
+}
+
+TEST(PrivHelperMemoryPriorityTest, allowsSettingItsOwnPriority) {
+  EXPECT_EXIT(
+      {
+        LinuxMemoryPriority priority(1000, getuid() + 1);
+        const auto result = priority.setPriorityForProcess(getpid());
+        _exit(
+            result == 0 && priority.getPriorityForProcess(getpid()) == 1000
+                ? 0
+                : 1);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
+
+TEST_F(PrivHelperRawProtocolTest, famRequestsCannotCreateFilesOnLinux) {
+  TemporaryDirectory dir;
+  const auto outputPath = (dir.path() / "victim.txt").string();
+  auto response = client_->sendAndRecv(
+      PrivHelperConn::serializeStartFamRequest(
+          1,
+          {dir.path().string()},
+          outputPath,
+          outputPath,
+          false,
+          File("/dev/null", O_WRONLY)));
+  EXPECT_THROW_RE(
+      PrivHelperConn::parseStartFamResponse(response),
+      std::exception,
+      "unexpected privhelper message type");
+  EXPECT_EQ(-1, access(outputPath.c_str(), F_OK));
+  EXPECT_EQ(ENOENT, errno);
+
+  response = client_->sendAndRecv(PrivHelperConn::serializeStopFamRequest(2));
+  EXPECT_THROW_RE(
+      PrivHelperConn::parseEmptyResponse(
+          PrivHelperConn::REQ_STOP_FAM, response),
+      std::exception,
+      "unexpected privhelper message type");
+}
+#endif
+
+class PrivHelperFamTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::processStartFam;
+  using PrivHelperServer::processStopFam;
+
+ private:
+  AbsolutePath getFamBinaryPath() const override {
+    return canonicalPath("/bin/echo");
+  }
+};
+
+TEST(PrivHelperFamTest, writesToPassedDescriptorWithoutOpeningMetadataPath) {
+  TemporaryDirectory dir;
+  const auto outputPath = (dir.path() / "absent.txt").string();
+  int pipeFds[2];
+  checkUnixError(pipe(pipeFds));
+  File reader(pipeFds[0], true);
+  File writer(pipeFds[1], true);
+  auto request = PrivHelperConn::serializeStartFamRequest(
+      1, {"/monitored"}, outputPath, outputPath, false, std::move(writer));
+  folly::io::Cursor cursor{&request.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  PrivHelperFamTestServer server;
+  server.processStartFam(cursor, request);
+  std::string output;
+  const auto readOk = folly::readFile(reader.fd(), output);
+  server.processStopFam();
+
+  ASSERT_TRUE(readOk);
+  EXPECT_EQ(
+      "--path-prefix /monitored --events NOTIFY_OPEN NOTIFY_CLOSE\n", output);
+  EXPECT_EQ(-1, access(outputPath.c_str(), F_OK));
+  EXPECT_EQ(ENOENT, errno);
+}
+
+TEST(PrivHelperFamTest, rejectsMissingOutputDescriptor) {
+  TemporaryDirectory dir;
+  const auto outputPath = (dir.path() / "absent.txt").string();
+  auto request = PrivHelperConn::serializeStartFamRequest(
+      1, {"/monitored"}, outputPath, outputPath, false, File{});
+  request.files.clear();
+  folly::io::Cursor cursor{&request.data};
+  PrivHelperConn::parsePacket(cursor);
+
+  PrivHelperFamTestServer server;
+  EXPECT_THROW_RE(
+      server.processStartFam(cursor, request),
+      std::runtime_error,
+      "expected 1 output file descriptor");
+  EXPECT_EQ(-1, access(outputPath.c_str(), F_OK));
+  EXPECT_EQ(ENOENT, errno);
+}
+
+#ifdef __linux__
+
+class PrivHelperSanityTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::bindMount;
+  using PrivHelperServer::openPathAsUser;
+  using PrivHelperServer::processSetFuseReadAhead;
+  void registerMount(const std::string& path) {
+    registerMountPoint(path);
+  }
+
+  explicit PrivHelperSanityTestServer(uid_t owner) {
+    uid_ = owner;
+    gid_ = getgid();
+  }
+
+  void checkMount(const std::string& path, bool byFd) {
+    if (byFd) {
+      openAndSanityCheckMountPoint(path, SanityCheckOptions::forTakeover());
+    } else {
+      sanityCheckMountPoint(path, SanityCheckOptions::forTakeover());
+    }
+  }
+};
+
+TEST(PrivHelperSanityTest, rootProcessChecksTheServedOwnersMount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    ASSERT_EQ(0, getuid());
+    PrivHelperSanityTestServer server(1);
+    EXPECT_THROW(server.checkMount(dir.path().string(), false), std::exception);
+    EXPECT_THROW(server.checkMount(dir.path().string(), true), std::exception);
+
+    checkUnixError(
+        mount("tmpfs", dir.path().c_str(), "tmpfs", MS_RDONLY, "size=1m"));
+    PrivHelperSanityTestServer rootServer(0);
+    EXPECT_NO_THROW(rootServer.checkMount(dir.path().string(), false));
+    EXPECT_NO_THROW(rootServer.checkMount(dir.path().string(), true));
+
+    installPrivHelperRollbackMarker();
+    EXPECT_NO_THROW(server.checkMount(dir.path().string(), false));
+    EXPECT_NO_THROW(server.checkMount(dir.path().string(), true));
+  });
+}
+
+TEST(PrivHelperSanityTest, takeoverRollbackUsesLegacyPathResolution) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    File directory(dir.path().c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    const auto path = fmt::format("/proc/self/fd/{}", directory.fd());
+    PrivHelperSanityTestServer server(getuid());
+    EXPECT_THROW(server.checkMount(path, true), std::system_error);
+
+    installPrivHelperRollbackMarker();
+    EXPECT_NO_THROW(server.checkMount(path, true));
+  });
+}
+
+TEST(PrivHelperSanityTest, readAheadRollbackBypassesRegistration) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    PrivHelperSanityTestServer server(getuid());
+    const auto configure = [&] {
+      auto request = PrivHelperConn::serializeSetFuseReadAheadRequest(
+          1, dir.path().string(), 1024);
+      folly::io::Cursor cursor{&request.data};
+      PrivHelperConn::parsePacket(cursor);
+      server.processSetFuseReadAhead(cursor);
+    };
+    EXPECT_THROW_RE(configure(), std::domain_error, "No FUSE mount found");
+
+    installPrivHelperRollbackMarker();
+    EXPECT_NO_THROW(configure());
+
+    checkUnixError(unlink(kDisablePrivHelperHardeningPath));
+    EXPECT_THROW_RE(configure(), std::domain_error, "No FUSE mount found");
+  });
+}
+
+TEST(PrivHelperSanityTest, userPathResolutionFollowsOrdinarySymlinks) {
+  TemporaryDirectory dir;
+  const auto real = dir.path() / "real";
+  boost::filesystem::create_directory(real);
+  boost::filesystem::create_directory(real / "leaf");
+  checkUnixError(symlink("real", (dir.path() / "link").c_str()));
+  PrivHelperSanityTestServer server(getuid());
+  auto fd = server.openPathAsUser(
+      (dir.path() / "link" / "leaf").string(), R_OK | X_OK);
+  struct stat actual{}, expected{};
+  checkUnixError(fstat(fd.fd(), &actual));
+  checkUnixError(stat((real / "leaf").c_str(), &expected));
+  EXPECT_EQ(expected.st_ino, actual.st_ino);
+  EXPECT_EQ(expected.st_dev, actual.st_dev);
+  EXPECT_NE(0, fcntl(fd.fd(), F_GETFL) & O_PATH);
+  EXPECT_NO_THROW(server.openPathAsUser("/", R_OK | X_OK));
+}
+
+TEST(PrivHelperSanityTest, userPathResolutionRejectsAnInaccessibleAncestor) {
+  if (getuid() == 0) {
+    GTEST_SKIP() << "requires a non-root user";
+  }
+  TemporaryDirectory dir;
+  const auto blocked = dir.path() / "blocked";
+  boost::filesystem::create_directory(blocked);
+  boost::filesystem::create_directory(blocked / "leaf");
+  checkUnixError(chmod(blocked.c_str(), 0000));
+  SCOPE_EXIT {
+    checkUnixError(chmod(blocked.c_str(), 0700));
+  };
+  PrivHelperSanityTestServer server(getuid());
+  EXPECT_THROW(
+      server.openPathAsUser((blocked / "leaf").string(), R_OK | X_OK),
+      std::system_error);
+  EXPECT_EQ(getuid(), geteuid());
+}
+
+TEST(PrivHelperSanityTest, bindMountClonesAnOPathSourceDescriptor) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto source = dir.path() / "source";
+    const auto root = dir.path() / "checkout";
+    const auto target = root / "redirect";
+    boost::filesystem::create_directory(source);
+    boost::filesystem::create_directories(target);
+    ASSERT_TRUE(
+        folly::writeFile(StringPiece{"content"}, (source / "file").c_str()));
+
+    PrivHelperSanityTestServer server(getuid());
+    server.registerMount(root.string());
+    server.bindMount(source.c_str(), target.c_str(), root.string());
+
+    std::string contents;
+    ASSERT_TRUE(folly::readFile((target / "file").c_str(), contents));
+    EXPECT_EQ("content", contents);
+    struct stat sourceStat{}, targetStat{};
+    checkUnixError(stat(source.c_str(), &sourceStat));
+    checkUnixError(stat(target.c_str(), &targetStat));
+    EXPECT_EQ(sourceStat.st_ino, targetStat.st_ino);
+    EXPECT_EQ(sourceStat.st_dev, targetStat.st_dev);
+  });
+}
+
+TEST(PrivHelperSanityTest, userPathResolutionDisablesDacOverrides) {
+  TemporaryDirectory dir;
+  runInMountNamespace(
+      [&] {
+        ASSERT_EQ(1, getuid());
+        checkUnixError(
+            mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+        checkUnixError(prctl(PR_SET_SECUREBITS, SECBIT_NO_SETUID_FIXUP));
+        const auto blocked = dir.path() / "blocked";
+        const auto leaf = blocked / "leaf";
+        boost::filesystem::create_directories(leaf);
+        checkUnixError(chmod(blocked.c_str(), 0000));
+        EXPECT_NO_THROW(File(leaf.c_str(), O_PATH | O_DIRECTORY));
+
+        PrivHelperSanityTestServer server(getuid());
+        EXPECT_THROW(
+            server.openPathAsUser(leaf.string(), R_OK | X_OK),
+            std::system_error);
+        EXPECT_THROW(
+            server.openPathAsUser(blocked.string(), R_OK | X_OK),
+            std::system_error);
+        EXPECT_THROW(server.checkMount(leaf.string(), true), std::system_error);
+
+        EXPECT_NO_THROW(File(leaf.c_str(), O_PATH | O_DIRECTORY));
+      },
+      1);
+}
+#endif
+
+class PrivHelperStaleMountTestServer : public PrivHelperServer {
+ public:
+  using PrivHelperServer::detectAndUnmountStaleMount;
+  bool unmounted{false};
+  bool simulateCachedStat{false};
+  bool simulateChildError{true};
+  std::function<void()> beforeChildProbe;
+
+ private:
+  int statMountPoint(const char* path, struct stat* st) const override {
+    if (StringPiece{path}.endsWith("/this-file-does-not-exist")) {
+      if (beforeChildProbe) {
+        beforeChildProbe();
+      }
+      errno = simulateChildError ? ENOTCONN : ENOENT;
+      return -1;
+    }
+    return simulateCachedStat ? 0 : ::stat(path, st);
+  }
+
+  void unmount(const char*, UnmountOptions) override {
+    unmounted = true;
+  }
+};
+
+TEST(PrivHelperStaleMountTest, childProbeErrorDoesNotUnmountAnUnrelatedPath) {
+  TemporaryDirectory dir;
+  PrivHelperStaleMountTestServer server;
+  EXPECT_FALSE(
+      server.detectAndUnmountStaleMount(dir.path().string(), false, false));
+  EXPECT_FALSE(server.unmounted);
+}
+
+#ifdef __linux__
+TEST(PrivHelperStaleMountTest, identifiesMountWithoutStatmountSyscalls) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statmount, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listmount, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    sock_fprog program{static_cast<unsigned short>(std::size(filter)), filter};
+    checkUnixError(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+    checkUnixError(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program));
+    checkUnixError(mount("edenfs:", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+
+    PrivHelperStaleMountTestServer server;
+    EXPECT_TRUE(
+        server.detectAndUnmountStaleMount(dir.path().string(), false, false));
+    EXPECT_FALSE(server.unmounted);
+  });
+}
+
+TEST(PrivHelperStaleMountTest, ancestorReplacementCannotRedirectUnmount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    checkUnixError(mount("tmpfs", dir.path().c_str(), "tmpfs", 0, "size=1m"));
+    const auto original = dir.path() / "original";
+    const auto moved = dir.path() / "moved";
+    const auto victim = dir.path() / "victim";
+    boost::filesystem::create_directories(original / "mount");
+    boost::filesystem::create_directories(victim / "mount");
+    checkUnixError(
+        mount("edenfs:", (original / "mount").c_str(), "tmpfs", 0, "size=1m"));
+    checkUnixError(
+        mount("victim", (victim / "mount").c_str(), "tmpfs", 0, "size=1m"));
+    ASSERT_TRUE(
+        folly::writeFile(
+            StringPiece{"eden"}, (original / "mount" / "marker").c_str()));
+    ASSERT_TRUE(
+        folly::writeFile(
+            StringPiece{"victim"}, (victim / "mount" / "marker").c_str()));
+
+    PrivHelperStaleMountTestServer server;
+    server.beforeChildProbe = [&] {
+      boost::filesystem::rename(original, moved);
+      boost::filesystem::create_directory_symlink(victim, original);
+    };
+    EXPECT_TRUE(server.detectAndUnmountStaleMount(
+        (original / "mount").string(), false, false));
+    EXPECT_FALSE(server.unmounted);
+    EXPECT_FALSE(boost::filesystem::exists(moved / "mount" / "marker"));
+    EXPECT_TRUE(boost::filesystem::exists(victim / "mount" / "marker"));
+  });
+}
+
+TEST(PrivHelperStaleMountTest, unmountsDisconnectedFuseThroughDescriptor) {
+  if (access("/dev/fuse", R_OK | W_OK) != 0) {
+    GTEST_SKIP() << "/dev/fuse is unavailable";
+  }
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    for (bool cachedStat : {false, true}) {
+      File connection("/dev/fuse", O_RDWR | O_CLOEXEC);
+      const auto options = fmt::format(
+          "fd={},rootmode=40755,user_id={},group_id={}",
+          connection.fd(),
+          getuid(),
+          getgid());
+      checkUnixError(mount(
+          "edenfs:",
+          dir.path().c_str(),
+          "fuse",
+          MS_NOSUID | MS_NODEV,
+          options.c_str()));
+      connection.close();
+      struct stat st{};
+      ASSERT_EQ(-1, stat(dir.path().c_str(), &st));
+      ASSERT_EQ(ENOTCONN, errno);
+
+      PrivHelperStaleMountTestServer server;
+      server.simulateCachedStat = cachedStat;
+      server.simulateChildError = false;
+      EXPECT_TRUE(
+          server.detectAndUnmountStaleMount(dir.path().string(), false, false));
+      EXPECT_FALSE(server.unmounted);
+      EXPECT_EQ(0, stat(dir.path().c_str(), &st));
+    }
+  });
+}
+
+TEST(PrivHelperStaleMountTest, rollbackAllowsLegacyChildProbeUnmount) {
+  TemporaryDirectory dir;
+  runInMountNamespace([&] {
+    installPrivHelperRollbackMarker();
+    PrivHelperStaleMountTestServer server;
+    EXPECT_TRUE(
+        server.detectAndUnmountStaleMount(dir.path().string(), false, false));
+    EXPECT_TRUE(server.unmounted);
+  });
+}
+#endif
 
 TEST_F(PrivHelperRawProtocolTest, cleanShutdownNotificationIsNotAnswered) {
   client_->send(
@@ -792,7 +1618,7 @@ TEST_F(PrivHelperTest, fuseMountPermissions) {
         folly::to<std::string>(
             "std::domain_error: User:",
             getuid(),
-            " cannot stat ",
+            " cannot open ",
             path,
             ": Permission denied"));
   }
@@ -1127,6 +1953,45 @@ TEST_F(
   server_.setBindMountResult(bindPath).setValue();
   EXPECT_THROW_RE(
       client_->bindMount(source.path().string(), bindPath).get(1s),
+      std::exception,
+      "No such file or directory");
+#endif
+}
+
+TEST_F(PrivHelperTest, takeoverKeepsValidatedRootWhenAncestorIsReplaced) {
+#ifdef __APPLE__
+  GTEST_SKIP() << "Linux-specific registered mount descriptors";
+#else
+  if (getuid() == 0) {
+    GTEST_SKIP() << "root bypasses mount ownership validation";
+  }
+  auto root = makeTempDir("takeover-root");
+  auto source = makeTempDir("source");
+  const auto ancestor = root.path() / "ancestor";
+  const auto moved = root.path() / "moved";
+  const auto replacement = root.path() / "replacement";
+  boost::filesystem::create_directories(
+      ancestor / "registered" / "original-only");
+  boost::filesystem::create_directories(
+      replacement / "registered" / "replacement-only");
+
+  const auto registeredPath = (ancestor / "registered").string();
+  server_.setAfterSanityCheck([ancestor, moved, replacement] {
+    boost::filesystem::rename(ancestor, moved);
+    boost::filesystem::create_directory_symlink(replacement, ancestor);
+  });
+  client_->takeoverStartup(registeredPath, {}).get(1s);
+  server_.setFuseUnmountResult(registeredPath).setValue();
+
+  const auto originalPath = registeredPath + "/original-only";
+  server_.setBindMountResult(originalPath).setValue();
+  EXPECT_NO_THROW(
+      client_->bindMount(source.path().string(), originalPath).get(1s));
+
+  const auto replacementPath = registeredPath + "/replacement-only";
+  server_.setBindMountResult(replacementPath).setValue();
+  EXPECT_THROW_RE(
+      client_->bindMount(source.path().string(), replacementPath).get(1s),
       std::exception,
       "No such file or directory");
 #endif
@@ -1579,15 +2444,15 @@ TEST(PrivHelperConnectionLossTest, cleanShutdownLogsNoEvent) {
   EXPECT_EQ(0ul, recorder->getEvents().size());
 }
 
-#ifdef __APPLE__
-
 /**
- * The sentinel is written by the daemon's unprivileged user and read by a root
- * privhelper, so these cases are all about what a replaced file can do to the
- * reader rather than about ordinary parse errors.
+ * The sentinel is created by the daemon's unprivileged user and examined by a
+ * root privhelper, so these cases are all about what a file planted at the name
+ * can make that examination conclude.
  */
 class PrivHelperSentinelTest : public ::testing::Test {
  protected:
+  using DisarmState = RestartSentinel::DisarmState;
+
   void SetUp() override {
     dir_ = std::make_unique<TemporaryDirectory>("edenfs_sentinel");
     sentinel_.setConfig(makeRestartArgs(sentinelPath()));
@@ -1597,95 +2462,171 @@ class PrivHelperSentinelTest : public ::testing::Test {
     return (dir_->path() / "sentinel").string();
   }
 
-  /** Owned by us and only ours to write, as the daemon writes it. */
-  void writeSentinel(const std::string& contents) {
-    ASSERT_TRUE(folly::writeFile(contents, sentinelPath().c_str()));
-    checkUnixError(::chmod(sentinelPath().c_str(), 0600));
+  /** Empty, owned by us and only ours to write, as the daemon writes it. */
+  void writeSentinel() {
+    ASSERT_TRUE(folly::writeFile(std::string{}, sentinelPath().c_str()));
+    restrictSentinelToOwner(sentinelPath());
+  }
+
+  void expectDisarmed() {
+    EXPECT_EQ(DisarmState::ShutdownAnnounced, sentinel_.disarmState());
   }
 
   RestartSentinel sentinel_{getuid()};
   std::unique_ptr<TemporaryDirectory> dir_;
 };
 
-TEST_F(PrivHelperSentinelTest, readsTheCommandAndEnvironment) {
-  writeSentinel(makeSentinelContents());
+TEST_F(PrivHelperSentinelTest, anEmptyFileTheDaemonOwnsIsArmed) {
+  writeSentinel();
 
-  const auto command = sentinel_.readRelaunchCommand();
-  ASSERT_TRUE(command.has_value());
-  EXPECT_EQ(kSentinelArgv, command->argv);
-  EXPECT_THAT(
-      command->env,
-      UnorderedElementsAre(
-          std::pair<std::string, std::string>{"PATH", "/usr/bin"},
-          std::pair<std::string, std::string>{"HOME", "/home/test"}));
+  EXPECT_EQ(DisarmState::Armed, sentinel_.disarmState());
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsASymlink) {
+TEST_F(PrivHelperSentinelTest, aSymlinkIsNotArmed) {
   const auto target = (dir_->path() / "target").string();
-  ASSERT_TRUE(folly::writeFile(makeSentinelContents(), target.c_str()));
+  ASSERT_TRUE(folly::writeFile(std::string{}, target.c_str()));
   checkUnixError(::symlink(target.c_str(), sentinelPath().c_str()));
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  expectDisarmed();
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAFifo) {
-  // Without the regular-file check, opening this would block a root process
-  // that still owes the mounts a cleanup.
+TEST_F(PrivHelperSentinelTest, aFifoIsNotArmed) {
+  // Without O_NONBLOCK and the regular-file check, opening this would block a
+  // root process that still owes the mounts a cleanup.
   checkUnixError(::mkfifo(sentinelPath().c_str(), 0600));
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  expectDisarmed();
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsASentinelOwnedByAnotherUser) {
-  writeSentinel(makeSentinelContents());
+TEST_F(PrivHelperSentinelTest, aDirectoryIsNotArmed) {
+  checkUnixError(::mkdir(sentinelPath().c_str(), 0700));
+
+  expectDisarmed();
+}
+
+TEST_F(PrivHelperSentinelTest, aSentinelOwnedByAnotherUserIsNotArmed) {
+  writeSentinel();
   RestartSentinel otherOwner{getuid() + 1};
   otherOwner.setConfig(makeRestartArgs(sentinelPath()));
 
-  EXPECT_FALSE(otherOwner.readRelaunchCommand().has_value());
+  EXPECT_EQ(DisarmState::ShutdownAnnounced, otherOwner.disarmState());
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAGroupWritableSentinel) {
-  writeSentinel(makeSentinelContents());
+TEST_F(PrivHelperSentinelTest, aGroupWritableSentinelIsNotArmed) {
+  writeSentinel();
   checkUnixError(::chmod(sentinelPath().c_str(), 0660));
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  expectDisarmed();
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAnOversizedFile) {
-  writeSentinel(std::string(2 * 1024 * 1024, 'x'));
-
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+TEST_F(PrivHelperSentinelTest, aMissingSentinelIsNotArmed) {
+  expectDisarmed();
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAnEmptyFile) {
-  writeSentinel("");
+TEST_F(PrivHelperSentinelTest, aNameThatCannotBeExaminedIsUnknown) {
+  // A unix socket is the one thing that fails the open without settling what
+  // is at the name, so it is the only route to Unknown from a resolvable path.
+  const auto path = sentinelPath();
+  ASSERT_LT(path.size(), sizeof(sockaddr_un::sun_path));
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  const int socketFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  checkUnixError(socketFd);
+  const folly::File socket{socketFd, /*ownsFd=*/true};
+  checkUnixError(
+      ::bind(
+          socket.fd(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)));
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  EXPECT_EQ(DisarmState::Unknown, sentinel_.disarmState());
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAMissingFile) {
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+TEST_F(PrivHelperSentinelTest, aMarkerFromAnotherGenerationIsNotArmed) {
+  // Generations share the state directory and the name prefix, differing only
+  // in pid and token, so only the exact configured leaf may arm.
+  const auto foreign =
+      (dir_->path() / ".edenfs_restart_armed.999.00000000deadbeef").string();
+  ASSERT_TRUE(folly::writeFile(std::string{}, foreign.c_str()));
+  restrictSentinelToOwner(foreign);
+
+  // The neighbour is a marker root would arm on, so the leaf is the only thing
+  // separating the two verdicts below.
+  sentinel_.setConfig(makeRestartArgs(foreign));
+  ASSERT_EQ(DisarmState::Armed, sentinel_.disarmState());
+
+  // This generation's own marker was never created.
+  sentinel_.setConfig(makeRestartArgs(
+      (dir_->path() / ".edenfs_restart_armed.1234.000000000000000a").string()));
+
+  expectDisarmed();
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsASentinelFromAnotherGeneration) {
-  writeSentinel(makeSentinelContents(kSentinelNonce + 1));
+/**
+ * The relaunch command as the daemon hands it over in the restart arguments.
+ * No sentinel file is involved: these cases are about the configuration alone.
+ */
+class PrivHelperRelaunchCommandTest : public ::testing::Test {
+ protected:
+  /** The duplicated key is deliberate: order is part of the contract. */
+  static std::vector<std::pair<std::string, std::string>> relaunchEnv() {
+    return {
+        {"PATH", "/usr/bin"}, {"HOME", "/home/first"}, {"HOME", "/home/last"}};
+  }
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  void configure(
+      std::vector<std::string> argv,
+      std::vector<std::pair<std::string, std::string>> env) {
+    auto args = makeRestartArgs("/unused");
+    args.relaunchArgv = std::move(argv);
+    args.relaunchEnv = std::move(env);
+    sentinel_.setConfig(std::move(args));
+  }
+
+  RestartSentinel sentinel_{getuid()};
+};
+
+TEST_F(PrivHelperRelaunchCommandTest, servesTheConfiguredCommandInOrder) {
+  configure(kSentinelArgv, relaunchEnv());
+
+  const auto command = sentinel_.relaunchCommand();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(kSentinelArgv, command->argv);
+  EXPECT_EQ(relaunchEnv(), command->env);
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsASentinelWithNoNonce) {
-  writeSentinel(makeSentinelContentsWithoutNonce());
+TEST_F(PrivHelperRelaunchCommandTest, hasNoCommandBeforeAnyConfiguration) {
+  const RestartSentinel unconfigured{getuid()};
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  EXPECT_EQ(std::nullopt, unconfigured.relaunchCommand());
 }
 
-TEST_F(PrivHelperSentinelTest, rejectsAConfigurationWithNoNonce) {
-  writeSentinel(makeSentinelContentsWithoutNonce());
-  auto args = makeRestartArgs(sentinelPath());
-  args.sentinelNonce = 0;
-  sentinel_.setConfig(std::move(args));
+TEST_F(PrivHelperRelaunchCommandTest, freshArgsReplaceTheCommand) {
+  configure(kSentinelArgv, relaunchEnv());
+  const std::vector<std::string> argv{"/opt/eden/edenfs", "--foreground"};
+  const std::vector<std::pair<std::string, std::string>> env{
+      {"HOME", "/home/second"}};
 
-  EXPECT_FALSE(sentinel_.readRelaunchCommand().has_value());
+  configure(argv, env);
+
+  const auto command = sentinel_.relaunchCommand();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(argv, command->argv);
+  EXPECT_EQ(env, command->env);
+}
+
+TEST_F(PrivHelperRelaunchCommandTest, rejectsAConfigurationWithNoArgv) {
+  configure({}, relaunchEnv());
+
+  EXPECT_EQ(std::nullopt, sentinel_.relaunchCommand());
+}
+
+TEST_F(PrivHelperRelaunchCommandTest, servesACommandWithNoEnvironment) {
+  configure(kSentinelArgv, {});
+
+  const auto command = sentinel_.relaunchCommand();
+  ASSERT_TRUE(command.has_value());
+  EXPECT_EQ(kSentinelArgv, command->argv);
+  EXPECT_TRUE(command->env.empty());
 }
 
 class PrivHelperBreakerTest : public ::testing::Test {
@@ -1936,6 +2877,7 @@ class PrivHelperDisarmTest : public ::testing::Test {
 
   void SetUp() override {
     sentinelFile_ = std::make_unique<TemporaryFile>("edenfs_restart_armed");
+    restrictSentinelToOwner(sentinelFile_->path().string());
     // Nothing calls initPartial() here, which is what would otherwise
     // construct the sentinel from the daemon's uid.
     server_.sentinel_.emplace(getuid());
@@ -2021,8 +2963,8 @@ TEST_F(PrivHelperDisarmTest, aSentinelPathRootCannotResolveIsUnknown) {
 }
 
 TEST_F(PrivHelperDisarmTest, aLeafThatAlwaysResolvesIsUnknown) {
-  // faccessat() resolves "." and ".." whatever the directory holds, so a
-  // sentinel named either could never be reported gone.
+  // "." and ".." resolve whatever the directory holds, so a sentinel named
+  // either could never be reported gone.
   expectSentinelPathRejected(sentinelDir() + "/.");
   expectSentinelPathRejected(sentinelDir() + "/..");
 }
@@ -2037,6 +2979,67 @@ TEST_F(PrivHelperDisarmTest, aServerThatNeverReceivedRestartArgsHasNoState) {
   const RestartSentinel unconfigured{getuid()};
 
   EXPECT_EQ(std::nullopt, unconfigured.disarmState());
+}
+
+class PrivHelperRealSpawnTestServer : public PrivHelperServer {
+ public:
+  bool launchExecutable(folly::StringPiece binary) {
+    const RestartPlan plan{
+        canonicalPath(binary),
+        RestartSentinel::RelaunchCommand{{"edenfs"}, {}},
+        1,
+        kFakeNow};
+    return launchRestart(plan);
+  }
+
+ private:
+  void validateRestartOwner() const override {}
+};
+
+/**
+ * Checks whether this environment can spawn a process with reset user and
+ * group IDs. Returns false for EPERM, EACCES, or EINVAL from the spawn.
+ * Other spawn errors propagate.
+ */
+bool canSpawnWithResetIds() {
+  SpawnedProcess::Options opts;
+  opts.nullStdin();
+  opts.resetIds();
+  try {
+    SpawnedProcess proc({"/usr/bin/true"}, std::move(opts));
+    // Whatever the probe exited with, the reset was permitted. Report the
+    // oddity rather than skipping over it.
+    const auto status = proc.wait();
+    EXPECT_EQ(0, status.exitStatus()) << "the reset-ids probe " << status.str();
+    return true;
+  } catch (const std::system_error& ex) {
+    // POSIX_SPAWN_RESETIDS is all this probe asks for beyond a plain spawn, so
+    // a setuid/setgid the kernel refuses arrives as one of these.
+    const auto errorCode = ex.code().value();
+    if (ex.code().category() == std::generic_category() &&
+        (errorCode == EPERM || errorCode == EACCES || errorCode == EINVAL)) {
+      return false;
+    }
+    throw;
+  }
+}
+
+TEST(PrivHelperRestartLaunchTest, aChildThatExitsNonzeroDidNotFinishStarting) {
+  if (!canSpawnWithResetIds()) {
+    GTEST_SKIP() << "this environment forbids spawning with reset ids";
+  }
+  PrivHelperRealSpawnTestServer server;
+
+  EXPECT_FALSE(server.launchExecutable("/usr/bin/false"));
+}
+
+TEST(PrivHelperRestartLaunchTest, aChildThatExitsZeroFinishedStarting) {
+  if (!canSpawnWithResetIds()) {
+    GTEST_SKIP() << "this environment forbids spawning with reset ids";
+  }
+  PrivHelperRealSpawnTestServer server;
+
+  EXPECT_TRUE(server.launchExecutable("/usr/bin/true"));
 }
 
 /**
@@ -2074,6 +3077,7 @@ class PrivHelperRestartTestServer : public PrivHelperServer {
   std::atomic<uint64_t> now{0};
   std::atomic<bool> spawnSucceeds{true};
   std::atomic<bool> restartOwnerValid{true};
+  std::atomic<bool> cleanupRan{false};
   // Every attempt, including the ones spawnSucceeds turned into a failure.
   folly::Synchronized<std::vector<Spawn>> spawns;
 
@@ -2088,12 +3092,17 @@ class PrivHelperRestartTestServer : public PrivHelperServer {
       throw std::runtime_error("real uid is root");
     }
   }
+
+  void cleanupMountPoints() override {
+    cleanupRan.store(true);
+  }
 };
 
 /**
  * Exercises the restart decision directly, without a socket or an event loop.
  *
- * The privhelper is armed by default once it has restart args; each test here
+ * The privhelper is armed by default once it has restart args: an empty
+ * sentinel on disk, and the command to relaunch inside the args. Each test here
  * removes exactly one of the reasons to restart and checks that nothing is
  * launched.
  */
@@ -2101,25 +3110,27 @@ class PrivHelperRestartDecisionTest : public ::testing::Test {
  protected:
   void SetUp() override {
     sentinelFile_ = std::make_unique<TemporaryFile>("edenfs_restart_armed");
-    writeSentinel(makeSentinelContents());
+    restrictSentinelToOwner(sentinelPath());
     server_.now.store(kFakeNow);
     // Nothing calls initPartial() here, so the sentinel's owner has to be
-    // declared by hand for the reader's ownership check to pass.
+    // declared by hand for the ownership check to pass.
     server_.sentinel_.emplace(getuid());
     configure(restartArgs());
   }
 
+  std::string sentinelPath() const {
+    return sentinelFile_->path().string();
+  }
+
   EdenFsRestartArgs restartArgs() const {
-    return makeRestartArgs(sentinelFile_->path().string());
+    auto args = makeRestartArgs(sentinelPath());
+    args.relaunchArgv = kSentinelArgv;
+    args.relaunchEnv = {{"PATH", "/usr/bin"}, {"HOME", "/home/test"}};
+    return args;
   }
 
   void configure(EdenFsRestartArgs args) {
     server_.sentinel_->setConfig(std::move(args));
-  }
-
-  void writeSentinel(const std::string& contents) {
-    ASSERT_TRUE(
-        folly::writeFile(contents, sentinelFile_->path().string().c_str()));
   }
 
   void removeSentinel() {
@@ -2147,9 +3158,15 @@ class PrivHelperRestartDecisionTest : public ::testing::Test {
   std::unique_ptr<TemporaryFile> sentinelFile_;
 };
 
-TEST_F(PrivHelperRestartDecisionTest, restartsAfterACrash) {
+TEST_F(PrivHelperRestartDecisionTest, restartsAfterACrashWithAnEmptySentinel) {
+  std::string contents;
+  ASSERT_TRUE(folly::readFile(sentinelPath().c_str(), contents));
+  ASSERT_TRUE(contents.empty());
+
   EXPECT_EQ(true, restart());
-  EXPECT_EQ(1, server_.spawnCount());
+
+  ASSERT_EQ(1, server_.spawnCount());
+  EXPECT_EQ(kSentinelArgv, server_.spawns.rlock()->at(0).argv);
 }
 
 TEST_F(PrivHelperRestartDecisionTest, doesNotRestartWithoutRestartArgs) {
@@ -2175,8 +3192,16 @@ TEST_F(PrivHelperRestartDecisionTest, removingTheSentinelDisarms) {
   expectNoRestart();
 }
 
-TEST_F(PrivHelperRestartDecisionTest, anUnparseableSentinelStopsTheRestart) {
-  writeSentinel("} not json {");
+TEST_F(PrivHelperRestartDecisionTest, aSentinelAnyoneCouldHaveWrittenDisarms) {
+  checkUnixError(::chmod(sentinelPath().c_str(), 0660));
+  expectNoRestart();
+}
+
+TEST_F(PrivHelperRestartDecisionTest, doesNotRestartWithoutARelaunchCommand) {
+  auto args = restartArgs();
+  args.relaunchArgv.clear();
+  configure(std::move(args));
+
   expectNoRestart();
 }
 
@@ -2207,7 +3232,6 @@ TEST_F(PrivHelperRestartDecisionTest, relaysTheRestartBudgetToTheNewDaemon) {
 
   const auto spawns = *server_.spawns.rlock();
   ASSERT_EQ(1, spawns.size());
-  EXPECT_EQ(kSentinelArgv, spawns[0].argv);
   EXPECT_THAT(
       spawns[0].env,
       UnorderedElementsAre(
@@ -2219,10 +3243,10 @@ TEST_F(PrivHelperRestartDecisionTest, relaysTheRestartBudgetToTheNewDaemon) {
 }
 
 TEST_F(PrivHelperRestartDecisionTest, replacesARecordedRestartBudget) {
-  writeSentinel(makeSentinelContents(
-      kSentinelNonce,
-      folly::dynamic::object("EDENFS_RESTART_COUNT", "99")(
-          "EDENFS_FIRST_RESTART_AT", "1")));
+  auto args = restartArgs();
+  args.relaunchEnv = {
+      {"EDENFS_RESTART_COUNT", "99"}, {"EDENFS_FIRST_RESTART_AT", "1"}};
+  configure(std::move(args));
 
   ASSERT_EQ(true, restart());
 
@@ -2236,4 +3260,140 @@ TEST_F(PrivHelperRestartDecisionTest, replacesARecordedRestartBudget) {
               "EDENFS_FIRST_RESTART_AT", folly::to<std::string>(kFakeNow)}));
 }
 
-#endif // __APPLE__
+/**
+ * Drives a real server through run(), so that closing the client socket
+ * reproduces the death of edenfs.
+ */
+class PrivHelperRestartRunTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    sentinel_ = std::make_unique<TemporaryFile>("edenfs_restart_armed");
+    // Empty: its existence is the whole signal now. TemporaryFile creates
+    // 0666 & ~umask, which the validating open rejects.
+    writeSentinel("");
+    restrictSentinelToOwner(sentinelPath());
+    server_.now.store(kFakeNow);
+
+    File clientConn;
+    File serverConn;
+    PrivHelperConn::createConnPair(clientConn, serverConn);
+    rawClientConn_ = clientConn.dup();
+    serverThread_ =
+        std::thread([this, conn = std::move(serverConn)]() mutable noexcept {
+          server_.initPartial(std::move(conn), getuid(), getgid());
+          server_.run();
+        });
+    client_ = createTestPrivHelper(std::move(clientConn));
+    clientIoThread_.getEventBase()->runInEventBaseThreadAndWait(
+        [&] { client_->attachEventBase(clientIoThread_.getEventBase()); });
+  }
+
+  ~PrivHelperRestartRunTest() override {
+    killTheDaemon();
+  }
+
+  void armTheServer() {
+    auto args = makeRestartArgs(sentinelPath());
+    // The command travels in the arguments now, so a relaunch has nothing to
+    // spawn without it.
+    args.relaunchArgv = kSentinelArgv;
+    std::move(client_->setRestartArgs(args)).get(1s);
+  }
+
+  /** Closes the connection, as a dying daemon would, and waits for run(). */
+  void killTheDaemon() {
+    rawClientConn_.close();
+    client_.reset();
+    if (serverThread_.joinable()) {
+      serverThread_.join();
+    }
+  }
+
+  void triggerReceiveError() {
+    const std::string malformedHeader(16, '\0');
+    ASSERT_EQ(
+        malformedHeader.size(),
+        folly::writeFull(
+            rawClientConn_.fd(),
+            malformedHeader.data(),
+            malformedHeader.size()));
+    serverThread_.join();
+  }
+
+  std::string sentinelPath() const {
+    return sentinel_->path().string();
+  }
+
+  void writeSentinel(const std::string& contents) {
+    ASSERT_TRUE(folly::writeFile(contents, sentinelPath().c_str()));
+  }
+
+  std::unique_ptr<PrivHelper> client_;
+  File rawClientConn_;
+  PrivHelperRestartTestServer server_;
+  std::thread serverThread_;
+  EventBaseThread clientIoThread_;
+  std::unique_ptr<TemporaryFile> sentinel_;
+};
+
+TEST_F(PrivHelperRestartRunTest, crashRestartsAndLeavesTheMountsAlone) {
+  armTheServer();
+  killTheDaemon();
+
+  EXPECT_EQ(1, server_.spawnCount());
+  // The new daemon detects and replaces the stale mounts itself.
+  EXPECT_FALSE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, receiveErrorDoesNotRestart) {
+  armTheServer();
+  triggerReceiveError();
+
+  EXPECT_EQ(0, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, cleanShutdownSkipsTheRestart) {
+  armTheServer();
+  client_->notifyCleanShutdown("stop");
+  killTheDaemon();
+
+  EXPECT_EQ(0, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, aRemovedSentinelSkipsTheRestart) {
+  // What a SIGKILL leaves behind: the daemon never announced a shutdown, so
+  // the removed sentinel is the only thing saying the kill was deliberate.
+  armTheServer();
+  ASSERT_EQ(0, ::unlink(sentinelPath().c_str()));
+  killTheDaemon();
+
+  EXPECT_EQ(0, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, anUnarmedPrivhelperStillCleansUp) {
+  killTheDaemon();
+
+  EXPECT_EQ(0, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, aFailedSpawnCleansUp) {
+  server_.spawnSucceeds.store(false);
+  armTheServer();
+  killTheDaemon();
+
+  EXPECT_EQ(1, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}
+
+TEST_F(PrivHelperRestartRunTest, anInvalidRestartOwnerStillCleansUp) {
+  server_.restartOwnerValid.store(false);
+  armTheServer();
+  killTheDaemon();
+
+  EXPECT_EQ(0, server_.spawnCount());
+  EXPECT_TRUE(server_.cleanupRan.load());
+}

@@ -76,6 +76,43 @@ impl PushAuthoredBy {
     }
 }
 
+/// Why hooks are being executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookExecutionPurpose {
+    /// Hook outcomes gate a bookmark movement.
+    LandAttempt,
+    /// Hook outcomes are returned for inspection without moving a bookmark.
+    DryRun,
+}
+
+impl HookExecutionPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LandAttempt => "land_attempt",
+            Self::DryRun => "dry_run",
+        }
+    }
+}
+
+/// What to do with rejections from hooks configured as log-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogOnlyRejections {
+    /// Suppress: convert the rejection to an accepted outcome, as on a real
+    /// push (the rejection is recorded to scuba only).
+    Suppress,
+    /// Report the rejection to the caller. For dry runs that preview what a
+    /// hook would do once enforcing; never used on a real push path.
+    Report,
+}
+
+impl LogOnlyRejections {
+    /// Whether a hook configured as log-only should have its rejection
+    /// suppressed under this mode.
+    pub fn suppresses(&self, hook_is_log_only: bool) -> bool {
+        hook_is_log_only && *self == LogOnlyRejections::Suppress
+    }
+}
+
 /// The origin of the changeset.
 ///
 /// In the push-redirection scenario the changeset is initially pushed to a
@@ -509,6 +546,30 @@ pub trait ChangesetHook: Send + Sync {
         maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution, Error>;
 
+    async fn run_with_purpose<'this: 'cs, 'ctx: 'this, 'cs, 'repo: 'cs>(
+        &'this self,
+        ctx: &'ctx CoreContext,
+        repo: &'repo HookRepo,
+        bookmark: &BookmarkKey,
+        changeset: &'cs BonsaiChangeset,
+        cross_repo_push_source: CrossRepoPushSource,
+        push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
+        maybe_pushvars: Option<&'cs Pushvars>,
+    ) -> Result<HookExecution, Error> {
+        let _ = purpose;
+        self.run(
+            ctx,
+            repo,
+            bookmark,
+            changeset,
+            cross_repo_push_source,
+            push_authored_by,
+            maybe_pushvars,
+        )
+        .await
+    }
+
     async fn run_hook<'this: 'cs, 'ctx: 'this, 'cs, 'repo: 'cs>(
         &'this self,
         ctx: &'ctx CoreContext,
@@ -517,6 +578,7 @@ pub trait ChangesetHook: Send + Sync {
         changeset: &'cs BonsaiChangeset,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         maybe_pushvars: Option<&'cs Pushvars>,
         hook_name: &str,
         mut scuba: MononokeScubaSampleBuilder,
@@ -524,13 +586,14 @@ pub trait ChangesetHook: Send + Sync {
         bypass: BypassDecision,
     ) -> Result<HookOutcome, Error> {
         let (stats, result) = self
-            .run(
+            .run_with_purpose(
                 ctx,
                 repo,
                 bookmark,
                 changeset,
                 cross_repo_push_source,
                 push_authored_by,
+                purpose,
                 maybe_pushvars,
             )
             .map_ok(|exec| {
@@ -565,6 +628,7 @@ pub trait ChangesetHook: Send + Sync {
         changesets: Vec<&'cs BonsaiChangeset>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
         maybe_pushvars: Option<&'cs Pushvars>,
         hook_name: &'cs str,
         scuba: MononokeScubaSampleBuilder,
@@ -586,6 +650,7 @@ pub trait ChangesetHook: Send + Sync {
                         cs,
                         cross_repo_push_source,
                         push_authored_by,
+                        purpose,
                         maybe_pushvars,
                         hook_name,
                         scuba.clone(),

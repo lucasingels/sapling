@@ -12,6 +12,7 @@
 #include <folly/Synchronized.h>
 #include <folly/container/EvictingCacheMap.h>
 #include <gtest/gtest_prod.h>
+#include <algorithm>
 #include <array>
 #include <map>
 #include <memory>
@@ -44,10 +45,16 @@ class FsFileContentStore : public FileContentStore {
   explicit FsFileContentStore(
       AbsolutePathPiece localDir,
       bool directFileCreate = false,
-      bool cacheWalFiles = false)
+      bool cacheWalFiles = false,
+      size_t walFileCacheSize = kDefaultWalFileCacheSize,
+      WalFormat walFormat = WalFormat::Version1)
       : localDir_{localDir},
         directFileCreate_{directFileCreate},
-        cacheWalFiles_{cacheWalFiles} {}
+        cacheWalFiles_{cacheWalFiles},
+        walFormat_{walFormat},
+        walFileCache_{std::in_place, walFileCacheSize} {}
+
+  static constexpr size_t kDefaultWalFileCacheSize = 64;
 
   /**
    * Initialize the FileContentStore, acquire the "info" file lock and load the
@@ -287,6 +294,12 @@ class FsFileContentStore : public FileContentStore {
   static constexpr folly::StringPiece kHeaderIdentifierFile{"OVFL"};
   static constexpr uint32_t kHeaderVersion = 1;
   static constexpr size_t kHeaderLength = 64;
+  // Unmarked WAL files use the original record format. Versioned WALs start
+  // with this identifier followed by a big-endian uint32_t version.
+  static constexpr folly::StringPiece kWalHeaderIdentifier{"OVWL"};
+  // Version 2 header: the identifier and big-endian version only.
+  static constexpr uint32_t kWalVersion2 = 2;
+  static constexpr size_t kWalVersion2HeaderLength = 8;
   static constexpr uint32_t kNumShards = 256;
   static constexpr size_t kShardDirPathLength = 2;
 
@@ -372,17 +385,18 @@ class FsFileContentStore : public FileContentStore {
       bool removeOnFailure);
 
   struct CachedWalFile {
-    CachedWalFile(folly::File file, uint64_t size)
-        : file{std::move(file)}, size{size} {}
+    CachedWalFile(folly::File file, uint64_t size, WalFormat format)
+        : file{std::move(file)}, size{size}, format{format} {}
 
     folly::File file;
     uint64_t size;
+    WalFormat format;
   };
 
   using CachedWalFilePtr = std::shared_ptr<CachedWalFile>;
 
   struct WalFileCache {
-    WalFileCache() : entries{64} {}
+    explicit WalFileCache(size_t size) : entries{std::max<size_t>(size, 1)} {}
 
     folly::EvictingCacheMap<InodeNumber, CachedWalFilePtr> entries;
   };
@@ -406,6 +420,12 @@ class FsFileContentStore : public FileContentStore {
   const bool cacheWalFiles_{false};
 
   /**
+   * Format for newly created WAL files. Existing files keep the format
+   * named by their header regardless of this setting.
+   */
+  const WalFormat walFormat_{WalFormat::Version1};
+
+  /**
    * An open file descriptor to the overlay info file.
    *
    * This is primarily used to hold a lock on the overlay for as long as we
@@ -421,7 +441,7 @@ class FsFileContentStore : public FileContentStore {
    */
   folly::File dirFile_;
 
-  folly::Synchronized<WalFileCache> walFileCache_{std::in_place};
+  folly::Synchronized<WalFileCache> walFileCache_;
 };
 
 /**

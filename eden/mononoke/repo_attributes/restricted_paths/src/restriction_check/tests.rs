@@ -24,7 +24,9 @@ use permission_checker::InternalAclProvider;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 
+use super::AccessEnforcementOutcome;
 use super::AuthorizationCheckResult;
+use super::EnforcementDecision;
 use super::PathRestrictionCheckResult;
 use super::SharedFetchHandle;
 use super::SourceRestrictionSummary;
@@ -83,8 +85,54 @@ async fn test_source_enforcement_outcome_denial_permission_request_group_is_dete
         super::source_enforcement_outcome(&handle, &[], &super::PreFilterVariant::Definite).await?;
 
     assert_eq!(
-        outcome.denial_permission_request_group,
-        Some(MononokeIdentity::from_str("REPO_REGION:a_acl")?)
+        outcome.denial_permission_request_group(),
+        Some(&MononokeIdentity::from_str("REPO_REGION:a_acl")?)
+    );
+    Ok(())
+}
+
+// What it tests: a matching exemption only changes an enforced outcome.
+// Expected: enforced outcomes (denied or allowed) become `Exempted`, while
+// `NotEnforced` is unchanged and nothing changes when no exemption matched.
+#[mononoke::test]
+fn test_access_enforcement_outcome_exempt_if() -> Result<()> {
+    let denial_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
+    let denied = AccessEnforcementOutcome::Enforced {
+        denial_permission_request_group: Some(denial_group),
+    };
+    let allowed = AccessEnforcementOutcome::Enforced {
+        denial_permission_request_group: None,
+    };
+
+    assert_eq!(
+        denied.clone().exempt_if(true),
+        AccessEnforcementOutcome::Exempted,
+        "an exemption should exempt an enforced denial",
+    );
+    assert_eq!(
+        allowed.clone().exempt_if(true),
+        AccessEnforcementOutcome::Exempted,
+        "an exemption should exempt an enforced, authorized access",
+    );
+    assert_eq!(
+        AccessEnforcementOutcome::NotEnforced.exempt_if(true),
+        AccessEnforcementOutcome::NotEnforced,
+        "an exemption should not change an access no condition matched",
+    );
+    assert_eq!(
+        denied.clone().exempt_if(false),
+        denied,
+        "without an exemption an enforced denial should be unchanged",
+    );
+    assert_eq!(
+        allowed.clone().exempt_if(false),
+        allowed,
+        "without an exemption an enforced allow should be unchanged",
+    );
+    assert_eq!(
+        AccessEnforcementOutcome::Exempted.denial_permission_request_group(),
+        None,
+        "an exempted access should carry no denial",
     );
     Ok(())
 }
@@ -98,21 +146,17 @@ async fn test_authoritative_source_enforcement_outcome_preserves_error_semantics
     let permission_request_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
     let denied = super::authoritative_sources_enforcement_outcome(vec![
         Err(anyhow::anyhow!("source failed")),
-        Ok(super::AccessEnforcementOutcome {
-            access_enforcement_enabled: true,
+        Ok(AccessEnforcementOutcome::Enforced {
             denial_permission_request_group: Some(permission_request_group.clone()),
         }),
     ])?;
     assert_eq!(
-        denied.denial_permission_request_group,
-        Some(permission_request_group)
+        denied.denial_permission_request_group(),
+        Some(&permission_request_group)
     );
 
     let no_denial = super::authoritative_sources_enforcement_outcome(vec![
-        Ok(super::AccessEnforcementOutcome {
-            access_enforcement_enabled: false,
-            denial_permission_request_group: None,
-        }),
+        Ok(AccessEnforcementOutcome::NotEnforced),
         Err(anyhow::anyhow!("source failed")),
     ]);
     assert!(no_denial.is_err());
@@ -428,6 +472,64 @@ async fn test_absent_rollout_group_never_allowlists(fb: FacebookInit) -> Result<
         "caller has neither ACL access nor an applicable allowlist",
     );
     Ok(())
+}
+
+// What it tests: the logged enforcement decision for every enforcement result,
+// with and without a matching exemption.
+// Expected: the decision carries whether an exemption matched for
+// `no_condition_matched` and `error`, and the exempted outcome maps to
+// `Exempted`.
+#[mononoke::test]
+fn test_enforcement_decision_from_outcome() {
+    let cases = [
+        (
+            Ok(AccessEnforcementOutcome::NotEnforced),
+            false,
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: false,
+            },
+        ),
+        (
+            Ok(AccessEnforcementOutcome::NotEnforced),
+            true,
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: true,
+            },
+        ),
+        (
+            Ok(AccessEnforcementOutcome::Enforced {
+                denial_permission_request_group: None,
+            }),
+            false,
+            EnforcementDecision::Enforced,
+        ),
+        (
+            Ok(AccessEnforcementOutcome::Exempted),
+            true,
+            EnforcementDecision::Exempted,
+        ),
+        (
+            Err(anyhow::anyhow!("source failed")),
+            false,
+            EnforcementDecision::Error {
+                exemption_matched: false,
+            },
+        ),
+        (
+            Err(anyhow::anyhow!("source failed")),
+            true,
+            EnforcementDecision::Error {
+                exemption_matched: true,
+            },
+        ),
+    ];
+    for (outcome, exemption_matched, expected) in cases {
+        assert_eq!(
+            EnforcementDecision::from_outcome(&outcome, exemption_matched),
+            expected,
+            "outcome {outcome:?} with exemption_matched={exemption_matched}",
+        );
+    }
 }
 
 fn path_restriction_check() -> Result<PathRestrictionCheckResult> {

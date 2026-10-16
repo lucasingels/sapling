@@ -11,6 +11,7 @@ import type {Logger} from '../logger';
 import type {ServerPlatform} from '../serverPlatform';
 import type {RepositoryContext} from '../serverTypes';
 
+import fs from 'node:fs';
 import {ensureTrailingPathSep} from 'shared/pathUtils';
 import {mockLogger} from 'shared/testUtils';
 import {defer} from 'shared/utils';
@@ -67,6 +68,13 @@ class SimpleMockRepositoryImpl {
 }
 const SimpleMockRepository = SimpleMockRepositoryImpl as unknown as typeof Repository;
 
+function mockRealpath(impl: (p: string) => string) {
+  return jest
+    .spyOn(fs, 'realpath')
+    .mockImplementation(((p: string, cb: (err: null, resolved: string) => void) =>
+      cb(null, impl(p))) as unknown as typeof fs.realpath);
+}
+
 const ctx: RepositoryContext = {
   cmd: 'sl',
   logger: mockLogger,
@@ -90,6 +98,72 @@ describe('RepositoryCache', () => {
     );
 
     ref.unref();
+  });
+
+  it('canonicalizes cwd via realpath when binding a context to a repo', async () => {
+    // OnDemand: a symlinked cwd resolves to a different canonical path; canonicalizing it avoids the
+    // downstream "... is not under root" abort.
+    const logicalCwd = '/path/to/symlink/cwd';
+    const canonicalCwd = '/path/to/repo/cwd';
+    const realpathSpy = mockRealpath(p => (p === logicalCwd ? canonicalCwd : p));
+
+    const cache = new RepositoryCache(SimpleMockRepository);
+    const symlinkedCtx: RepositoryContext = {...ctx, cwd: logicalCwd};
+    const ref = cache.getOrCreate(symlinkedCtx);
+
+    const repo = await ref.promise;
+    // getRepoInfo (mock) only recognizes the canonical path as a repo, so this proves cwd was
+    // canonicalized before getRepoInfo ran.
+    expect(repo).toEqual(
+      expect.objectContaining({info: expect.objectContaining({repoRoot: '/path/to/repo'})}),
+    );
+    expect(symlinkedCtx.cwd).toBe(canonicalCwd);
+
+    ref.unref();
+    realpathSpy.mockRestore();
+  });
+
+  it('reuses the fast path for a symlinked cwd after caching its canonical path', async () => {
+    const logicalCwd = '/path/to/symlink-root';
+    const canonicalRoot = '/path/to/repo';
+    const realpathSpy = mockRealpath(p => (p === logicalCwd ? canonicalRoot : p));
+
+    const cache = new RepositoryCache(SimpleMockRepository);
+    const ref1 = cache.getOrCreate({...ctx, cwd: logicalCwd});
+    await ref1.promise;
+    expect(realpathSpy).toHaveBeenCalledTimes(1);
+
+    realpathSpy.mockClear();
+    const ref2 = cache.getOrCreate({...ctx, cwd: logicalCwd});
+    const repo2 = await ref2.promise;
+    expect(realpathSpy).not.toHaveBeenCalled();
+    expect(repo2).toEqual(
+      expect.objectContaining({info: expect.objectContaining({repoRoot: canonicalRoot})}),
+    );
+
+    ref1.unref();
+    ref2.unref();
+    realpathSpy.mockRestore();
+  });
+
+  it('does not canonicalize cwd with the native realpath', async () => {
+    // Native realpath uppercases Windows drive letters, which VS Code's `Uri.fsPath` does not.
+    const nativeSpy = jest
+      .spyOn(fs.promises, 'realpath')
+      .mockImplementation((async (p: string) =>
+        p.toUpperCase()) as unknown as typeof fs.promises.realpath);
+    const realpathSpy = mockRealpath(p => p);
+
+    const cache = new RepositoryCache(SimpleMockRepository);
+    const cwdCtx: RepositoryContext = {...ctx, cwd: '/path/to/repo/cwd'};
+    const ref = cache.getOrCreate(cwdCtx);
+    await ref.promise;
+    expect(cwdCtx.cwd).toBe('/path/to/repo/cwd');
+    expect(nativeSpy).not.toHaveBeenCalled();
+
+    ref.unref();
+    nativeSpy.mockRestore();
+    realpathSpy.mockRestore();
   });
 
   it('Gives error for paths without repos', async () => {

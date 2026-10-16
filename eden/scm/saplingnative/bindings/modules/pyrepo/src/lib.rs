@@ -40,6 +40,8 @@ use rsrepo::repo::Repo;
 use rsworkingcopy::workingcopy::WorkingCopy;
 use types::HgId;
 
+mod impl_into;
+
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "repo"].join(".");
     let m = PyModule::new(py, &name)?;
@@ -59,6 +61,8 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
             .iter()
             .collect::<Vec<_>>(),
     )?;
+
+    impl_into::register(py);
 
     Ok(m)
 }
@@ -246,6 +250,19 @@ py_class!(pub class repo |py| {
     @property
     def dot_path(&self) -> PyResult<PyPathBuf> {
         self.inner(py).read().dot_hg_path().try_into().map_pyerr(py)
+    }
+
+    /// Shared Sapling dot dir, resolved from GIT_COMMON_DIR in dotgit mode.
+    @property
+    def shared_dot_path(&self) -> PyResult<PyPathBuf> {
+        self.inner(py).read().shared_dot_hg_path().try_into().map_pyerr(py)
+    }
+
+    /// Shared repository root. For Git worktrees this remains the worktree root:
+    /// GIT_COMMON_DIR might be a bare repo, not a working copy root.
+    @property
+    def shared_root(&self) -> PyResult<PyPathBuf> {
+        self.inner(py).read().shared_path().try_into().map_pyerr(py)
     }
 
     def trywlock(&self, wc_dot_hg: PyPathBuf) -> PyResult<repolock> {

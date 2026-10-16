@@ -22,7 +22,7 @@ import bindings
 from sapling import tracing
 
 from . import bookmarks as bookmod, error, identity, progress, rcutil, util
-from .i18n import _
+from .i18n import _, _n
 from .node import bin, hex, nullid
 
 # If git-store is set, the path in svfs pointing to the git bare repo.
@@ -94,7 +94,7 @@ def isgitpeer(repo):
 def createrepo(ui, url, destpath, submodule=None):
     repo_config = ""
     if url:
-        repo_config += "\n[paths]\ndefault = %s\n" % url
+        repo_config += "\n" + rcutil.formatconfigsection("paths", "default", url)
 
     return setup_repository(
         ui, destpath, create=True, initial_config=repo_config, submodule=submodule
@@ -1005,6 +1005,7 @@ def submodulecheckout(ctx, match=None, force=False, mctx=None):
         def adjust_submodule_node(node, path) -> Optional[bytes]:
             return node
 
+    failures = []
     submodules = [submod for submod in parsesubmodules(ctx) if submod.active]
     if match is not None:
         submodules = [submod for submod in submodules if match(submod.path)]
@@ -1017,8 +1018,76 @@ def submodulecheckout(ctx, match=None, force=False, mctx=None):
             node = adjust_submodule_node(node, submod.path)
             if node is None:
                 continue
-            submod.checkout(node, force=force)
+            try:
+                submod.checkout(node, force=force)
+            except (OSError, error.Abort) as ex:
+                failures.append((submod.path, node, ex))
             value += 1
+    if failures:
+        raise _projectcheckoutabort(failures)
+
+
+def _checkoutgitoutput(ex) -> str:
+    """Return the Git output of a failed submodule checkout."""
+    if isinstance(ex, GitCommandError):
+        return ex.git_output.rstrip()
+    text = ex.strerror if isinstance(ex, OSError) and ex.strerror else str(ex)
+    lines = text.rstrip().splitlines()
+    # The spawn-ext `CommandError` of a failed Git command is "Command exited
+    # with code N", then the command, then the Git output. The spawn-ext tests
+    # pin this format.
+    if len(lines) > 2 and lines[0].startswith("Command exited with code"):
+        return textwrap.dedent("\n".join(lines[2:]))
+    return "\n".join(lines)
+
+
+def _projectcheckoutabort(failures) -> error.Abort:
+    """Return one error for failed project checkouts.
+
+    `failures` is a list of `(path, node, ex)`. `ex` is the error from the Git
+    checkout of `node` at `path`. The error shows the Git output for the first
+    3 projects and counts the remaining projects.
+
+    >>> failures = [
+    ...     ("p%d" % i, bytes([i]) * 20, OSError(1, "error %d" % i))
+    ...     for i in range(1, 6)
+    ... ]
+    >>> print(_projectcheckoutabort(failures).args[0])
+    could not check out 5 projects
+      p1 (0101010101010101010101010101010101010101):
+        error 1
+      p2 (0202020202020202020202020202020202020202):
+        error 2
+      p3 (0303030303030303030303030303030303030303):
+        error 3
+      ... and 2 more projects
+    """
+    MAX_REPORTED_PROJECT_FAILURES = 3
+    msg = _n(
+        "could not check out %d project",
+        "could not check out %d projects",
+        len(failures),
+    ) % len(failures)
+    for path, node, ex in failures[:MAX_REPORTED_PROJECT_FAILURES]:
+        msg += "\n  %s (%s):\n%s" % (
+            path,
+            hex(node),
+            textwrap.indent(_checkoutgitoutput(ex), "    "),
+        )
+    remaining = len(failures) - MAX_REPORTED_PROJECT_FAILURES
+    if remaining > 0:
+        msg += (
+            "\n  "
+            + _n("... and %d more project", "... and %d more projects", remaining)
+            % remaining
+        )
+    return error.Abort(
+        msg,
+        hint=_(
+            "if local changes conflict, commit, stash or remove them and retry, "
+            "or use '@prog@ goto --clean' to discard them"
+        ),
+    )
 
 
 @cached
@@ -1058,6 +1127,7 @@ class Submodule:
         The repo will be created at:
         <parent repo>/.hg/store/gitmodules/<escaped submodule name>
         """
+        # patternlint-disable-next-line poor-choice-of-hash-function
         urldigest = hashlib.sha1(self.url.encode("utf-8")).hexdigest()
         repopath = self.gitmodulesvfs.join("gitmodules", urldigest)
         ident = identity.sniffdir(repopath)
@@ -1270,7 +1340,7 @@ def callgitnorepo(ui, args, gitdir=None):
     if gitdir is not None:
         cmd.append("--git-dir=%s" % gitdir)
     cmd += args
-    return subprocess.run(cmd, capture_output=True)
+    return subprocess.run(cmd, capture_output=True, env=util.shellenviron())
 
 
 def rungit(repo, args):
@@ -1352,6 +1422,7 @@ class gitfilelog:
 def hashobj(kind, text):
     """(bytes, bytes) -> bytes. obtain git SHA1 hash"""
     # git blob format: kind + " " + str(size) + "\0" + text
+    # patternlint-disable-next-line poor-choice-of-hash-function
     return hashlib.sha1(b"%s %d\0%s" % (kind, len(text), text)).digest()
 
 

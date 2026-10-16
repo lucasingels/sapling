@@ -361,7 +361,7 @@ Test extension help:
                      find the creation commit of a tracked path
        dialect       replace terms with more widely used equivalents
        dirsync
-       drop          drop specified changeset from the stack
+       drop          drop specified changesets from the stack
        edensparse    allow sparse EdenFS checkouts
        extdiff       command to allow external programs to compare revisions
        extorder
@@ -377,9 +377,6 @@ Test extension help:
        histedit      interactive history editing
        interactiveui
                      (no help text available)
-       logginghelper
-                     this extension logs different pieces of information that
-                     will be used
        megarepo      provides support for cross repo commit resolution
        morestatus    make status give a bit more context
        myparent

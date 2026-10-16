@@ -7,10 +7,15 @@
 
 #pragma once
 
+#include <folly/Portability.h>
 #include <folly/system/HardwareConcurrency.h>
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <thrift/lib/cpp/concurrency/ThreadManager.h>
@@ -28,6 +33,15 @@
 #include "eden/fs/config/ReaddirPrefetch.h"
 #include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/eden-config.h"
+
+#ifdef EDEN_HAVE_TCC_DISCLAIM_TEAM_ID
+#include "eden/fs/config/facebook/TccDisclaimTeamId.h" // @manual
+#else
+namespace facebook::eden {
+// No fleet signing team in open-source builds; set core:disclaim-tcc-team-id.
+constexpr std::string_view kTccDisclaimTeamId = "";
+} // namespace facebook::eden
+#endif
 
 namespace re2 {
 class RE2;
@@ -198,6 +212,9 @@ class EdenConfig : private ConfigSettingManager {
       kUnspecifiedDefault,
       this};
 
+  /** Allow creating named pipes on Linux. */
+  ConfigSetting<bool> enableFifo{"core:enable-fifo", true, this};
+
   /**
    * How often to check the on-disk lock file to ensure it is still valid.
    * EdenFS will exit if the lock file is no longer valid.
@@ -283,12 +300,53 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Process-wide budget for retrying unhandled synchronous BUS_ADRERR faults
+   * on Linux. Zero disables retries. This setting is ignored on other
+   * platforms.
+   */
+  ConfigSetting<uint32_t> sigbusRetryBudget{
+      "core:sigbus-retry-budget",
+      0,
+      this};
+  /**
    * Similar to the above config, but sets the PrivHelper's priority instead.
    * Leave unset to avoid changing the PrivHelper's priority.
    */
   ConfigSetting<std::optional<int32_t>> privHelperTargetMemoryPriority{
       "core:priv-helper-target-memory-priority",
       std::nullopt,
+      this};
+
+  /**
+   * Keep the Linux cgroup's file-backed LRU below a target by periodically
+   * writing to cgroup v2 memory.reclaim. Only acts when the daemon runs in a
+   * cgroup named edenfs*, which is how systemd cgroup isolation and systemd
+   * lifecycle management place it. It has no effect on macOS or Windows.
+   */
+  ConfigSetting<bool> enableCgroupFileCacheReclaim{
+      "core:enable-cgroup-file-cache-reclaim",
+      false,
+      this};
+
+  /** Target size for active_file plus inactive_file in bytes. */
+  ConfigSetting<uint64_t> cgroupFileCacheTargetBytes{
+      "core:cgroup-file-cache-target-bytes",
+      10ULL * 1024 * 1024 * 1024,
+      this};
+
+  /**
+   * Maximum bytes to request from memory.reclaim in one pass. Zero disables
+   * the cap.
+   */
+  ConfigSetting<uint64_t> cgroupFileCacheMaxReclaimBytes{
+      "core:cgroup-file-cache-max-reclaim-bytes",
+      10ULL * 1024 * 1024 * 1024,
+      this};
+
+  /** How often to check the cgroup's file-backed LRU. */
+  ConfigSetting<std::chrono::nanoseconds> cgroupFileCacheReclaimInterval{
+      "core:cgroup-file-cache-reclaim-interval",
+      std::chrono::seconds{10},
       this};
 
   /**
@@ -359,11 +417,26 @@ class EdenConfig : private ConfigSettingManager {
    * so filesystem access can fail depending on launch context. If true, the
    * daemonizing parent spawns the long-lived daemon with TCC responsibility
    * disclaimed, making the daemon its own responsible process so grants keyed
-   * to its code signature apply deterministically. Only used on macOS.
+   * to its code signature apply deterministically. The daemon additionally
+   * has to be signed by the team that grant is keyed to (see
+   * disclaimTccTeamId); other builds never disclaim regardless of this
+   * setting. Only used on macOS.
    */
   ConfigSetting<bool> disclaimTccResponsibility{
       "core:disclaim-tcc-responsibility",
       true,
+      this};
+
+  /**
+   * Team identifier a macOS code signature must carry for the daemon to
+   * disclaim TCC responsibility (see disclaimTccResponsibility). Defaults to
+   * the fleet release team the MDM PPPC grant is keyed to in Meta builds,
+   * empty otherwise. The privhelper spawn uses the compiled default, see the
+   * TODO in PrivHelperImpl.cpp.
+   */
+  ConfigSetting<std::string> disclaimTccTeamId{
+      "core:disclaim-tcc-team-id",
+      std::string{kTccDisclaimTeamId},
       this};
 
   // [daemon]
@@ -439,6 +512,16 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::chrono::nanoseconds> thriftQueueTimeout{
       "thrift:queue-timeout",
       std::chrono::seconds(30),
+      this};
+
+  /**
+   * How long `streamJournalChanged` waits after a change before notifying a
+   * subscriber, so a burst of changes produces one notification per window
+   * rather than one per change. Zero notifies on every change.
+   */
+  ConfigSetting<std::chrono::nanoseconds> thriftJournalChangedDelay{
+      "thrift:journal-changed-delay",
+      std::chrono::milliseconds(5),
       this};
 
   /**
@@ -589,6 +672,16 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Number of directories whose paths are remembered so that an inode's path
+   * can be built from its parent's instead of walked up to the root. 0
+   * disables the cache. Read when a mount starts.
+   */
+  ConfigSetting<size_t> inodePathCacheSize{
+      "mount:inode-path-cache-size",
+      64,
+      this};
+
+  /**
    * How often inode garbage collection will run.
    *
    * Default to every hour.
@@ -626,32 +719,56 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Whether to fall back to the regular garbage-collection-period cadence
-   * for a mount whose pressure-based GC runs are not reclaiming the inodes
-   * they invalidate (see EdenMount::isPressureGcStalled). This avoids
-   * re-invalidating a large set of stuck inodes at the pressure-derived
-   * rate when doing so has no effect.
+   * Pressure-based GC waits the regular garbage-collection-period before
+   * running again when a run reclaims no more than this percentage of the
+   * inodes it invalidated (see EdenMount::recordPressureGcOutcome). This
+   * avoids re-invalidating a large set of stuck inodes at the pressure-derived
+   * rate when doing so has no effect. Zero disables the check.
    */
-  ConfigSetting<bool> pressureBasedGcBackoff{
-      "mount:pressure-gc-backoff",
-      true,
+  ConfigSetting<uint64_t> pressureBasedGcMinReclaimPercent{
+      "mount:pressure-gc-min-reclaim-percent",
+      10,
       this};
 
   /**
-   * Whether pressure-based GC discovers directories pinned as process
-   * working directories or roots (via the privhelper `scan-pins` mode) so it
-   * can invalidate all other directories while skipping the pinned chains.
-   * Invalidating a pinned directory's entry breaks getcwd() and path
-   * resolution for the pinning process without reclaiming anything, since
-   * the kernel cannot FORGET a pinned inode.
+   * Cancel an inode GC run after this many tree-load failures, and have
+   * pressure-based GC wait the regular garbage-collection-period before
+   * running again. Zero disables the limit.
+   */
+  ConfigSetting<uint64_t> gcMaxTreeLoadFailures{
+      "mount:gc-max-tree-load-failures",
+      10,
+      this};
+
+  /**
+   * Whether pressure-based GC discovers inodes pinned by processes (via the
+   * privhelper `scan-pins` mode) so it can reclaim everything else while
+   * skipping the pinned chains. On Linux (FUSE) pins are the directories
+   * used as working directories or roots: invalidating one's entry breaks
+   * getcwd() and path resolution for the pinning process without reclaiming
+   * anything, since the kernel cannot FORGET a pinned inode. On macOS (NFS)
+   * pins also include files held open or mapped, since EdenFS forgets the
+   * inode itself and the process would get ESTALE.
    *
-   * When disabled, or whenever the scan fails, pressure-based GC skips
-   * invalidating directory entries entirely (file reclamation is
-   * unaffected).
+   * When disabled, or whenever the scan fails, pressure-based GC leaves all
+   * directories alone (file reclamation is unaffected).
    */
   ConfigSetting<bool> pressureBasedGcScanPins{
       "mount:pressure-gc-scan-pins",
       true,
+      this};
+
+  /**
+   * How long pressure-based GC waits for the privhelper's pin scan before
+   * killing it and running with pins unknown. A scan takes well under a
+   * second on an idle machine, but pressure GC runs on machines short of
+   * memory, where everything is slow; a run without pins forgets open files
+   * on NFS, so waiting is the better outcome. The wait is cancelled with GC
+   * itself, so a checkout never sits behind it.
+   */
+  ConfigSetting<std::chrono::nanoseconds> pressureBasedGcPinScanTimeout{
+      "mount:pressure-gc-pin-scan-timeout",
+      std::chrono::seconds{60},
       this};
 
   /**
@@ -780,10 +897,33 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Keep the inode-number-ordered index that readdir builds for a directory
+   * across the requests of one listing, instead of rebuilding it for every
+   * request. The index is dropped once the listing ends or the directory
+   * changes.
+   */
+  ConfigSetting<bool> experimentalReaddirIndexCache{
+      "experimental:readdir-index-cache",
+      true,
+      this};
+
+  /**
    * Specify the interval of periodic accidental unmount recovery.
    */
   ConfigSetting<std::chrono::nanoseconds> accidentalUnmountRecoveryInterval{
       "mount:accidental-unmount-recovery-interval",
+      std::chrono::minutes(0),
+      this};
+
+  /**
+   * Specify the interval of periodic mount health checks.
+   *
+   * Health checks only observe and report; they never mount or unmount
+   * anything. They are therefore safe to enable independently of
+   * accidental-unmount-recovery-interval, which admits remounts.
+   */
+  ConfigSetting<std::chrono::nanoseconds> mountHealthCheckInterval{
+      "mount:mount-health-check-interval",
       std::chrono::minutes(0),
       this};
 
@@ -955,12 +1095,32 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Negotiate FUSE_HANDLE_KILLPRIV_V2, which lets the kernel stop asking for
+   * the security.capability xattr before every write. Only safe while files
+   * in the mount never carry setuid, setgid or sticky bits.
+   */
+  ConfigSetting<bool> experimentalFuseHandleKillPrivV2{
+      "experimental:fuse-handle-killpriv-v2",
+      true,
+      this};
+
+  /**
    * Whether to use io_uring for FUSE request/reply transport instead of
    * traditional /dev/fuse read/write. Requires Linux 6.11+ with
    * CONFIG_FUSE_IO_URING=y. Falls back to /dev/fuse automatically if
    * the kernel doesn't support it.
    */
   ConfigSetting<bool> fuseUseIoUring{"fuse:use-io-uring", false, this};
+
+  /**
+   * How long a /dev/fuse worker thread polls for the next request after
+   * answering one before blocking in read(). Zero disables polling. Read
+   * when a mount starts; a change applies to mounts started afterwards.
+   */
+  ConfigSetting<std::chrono::nanoseconds> fuseBusyPoll{
+      "fuse:busy-poll",
+      std::chrono::microseconds(100),
+      this};
 
   /**
    * Skip the eventfd wakeup when a FUSE io_uring reply is queued from the
@@ -1014,6 +1174,28 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> fuseIoUringDisableIoWait{
       "fuse:io-uring-disable-iowait",
       true,
+      this};
+
+  /**
+   * When the FUSE io_uring transport is enabled, create every io_uring queue
+   * and allocate its buffers before replying to FUSE_INIT, and mount over
+   * /dev/fuse instead if they do not all fit.
+   *
+   * Eden creates one queue per logical CPU, and each ring charges
+   * RLIMIT_MEMLOCK against a limit shared by every process running as this
+   * uid, so a co-tenant can leave room for the first queues but not the rest.
+   * Before the INIT reply is the only point where declining io_uring is still
+   * possible: once the reply advertises FUSE_OVER_IO_URING the kernel blocks
+   * request allocation until the ring is ready, so a later failure hangs the
+   * mount rather than falling back.
+   *
+   * When disabled, each worker thread creates its own queue as it starts,
+   * which keeps that queue's memory NUMA-local to the worker but leaves no way
+   * to recover from a shortfall.
+   */
+  ConfigSetting<bool> fuseIoUringPreCreateQueues{
+      "fuse:io-uring-pre-create-queues",
+      false,
       this};
 
   // [nfs]
@@ -1086,18 +1268,12 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * ========= DEPRECATED: DO NOT USE =========
-   *
-   * Buffer size for read and write requests. Default to 16 KiB.
-   *
-   * 16KiB was determined to offer the best tradeoff of random write speed to
-   * streaming writes on macOS, use the benchmarks/random_writes.cpp before
-   * changing this default value.
-   */
-  ConfigSetting<uint32_t> nfsIoSize{"nfs:iosize", 16 * 1024, this};
-
-  /**
    * Buffer size for read requests. Default to 16 KiB.
+   *
+   * This is both the client's rsize mount option and the read transfer size
+   * EdenFS advertises in its FSINFO reply (rtmax/rtpref), which the client
+   * clamps rsize to. It also drives the advertised dtpref, since READDIR
+   * replies are reads.
    *
    * 16KiB was determined to offer the best tradeoff of random write speed to
    * streaming writes on macOS, use the benchmarks/random_writes.cpp before
@@ -1107,6 +1283,10 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Buffer size for write requests. Default to 16 KiB.
+   *
+   * This is both the client's wsize mount option and the write transfer size
+   * EdenFS advertises in its FSINFO reply (wtmax/wtpref), which the client
+   * clamps wsize to.
    *
    * 16KiB was determined to offer the best tradeoff of random write speed to
    * streaming writes on macOS, use the benchmarks/random_writes.cpp before
@@ -1126,6 +1306,30 @@ class EdenConfig : private ConfigSettingManager {
    * some internal error (like buffer being too small).
    */
   ConfigSetting<bool> useUnixSocket{"nfs:use-uds", false, this};
+
+  /**
+   * Whether the privhelper overrides the filesystem type that statfs reports
+   * for an NFS mount served over a Unix domain socket to "edenfs:". The
+   * override is a private fsctl that macOS 27 answers with a crash report on
+   * every call. Mount table consumers now recognize these mounts by the name
+   * of the nfsd socket, so this can be turned off once the Sapling and
+   * watchman builds that know that name are deployed. Read at daemon start.
+   */
+  ConfigSetting<bool> nfsOverrideFstype{"nfs:override-fstype", true, this};
+
+  /**
+   * Send and receive buffer size of the nfsd socket when it is a Unix domain
+   * socket (nfs:use-uds), 0 to keep the kernel default. Such a socket on
+   * macOS defaults to 8 KiB each way, less than one READ reply, so every
+   * large reply took a partial write, a wait for the client to drain, and a
+   * second write. TCP sockets keep the kernel's buffers and autotuning.
+   * Applied when the socket is accepted, so a change applies to mounts
+   * started afterwards.
+   */
+  ConfigSetting<uint64_t> nfsSocketBufferSize{
+      "nfs:socket-buffer-size",
+      1024 * 1024,
+      this};
 
   /**
    * ========== MACOS ONLY ==========
@@ -1150,16 +1354,18 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint8_t> nfsReadAhead{"nfs:read-ahead", 16, this};
 
   /**
-   * NOTE: This config currently is limited to multiples of 10 deciseconds due
-   * to a bug in the EdenFS mount implementation.
-   *
    * Set the initial retransmit timeout to the specified value. (Normally, the
    * dumbtimer option should be specified when using this option to manually
    * tune the timeout interval). The value is in tenths of a second.
+   *
+   * On macOS with dumbtimer enabled this is the fixed per-request timeout of
+   * the kernel NFS client. For soft mounts the kernel gives up on a request
+   * (ETIMEDOUT to the caller) after at most min(timeo, 30s) once EdenFS is
+   * slow to answer, so 30s is the largest useful value there.
    */
   ConfigSetting<int32_t> nfsRetransmitTimeoutTenthSeconds{
       "nfs:retransmit-timeout-tenths",
-      10,
+      folly::kIsApple ? 300 : 10,
       this};
 
   /**
@@ -1185,40 +1391,22 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Turn off the dynamic retransmit timeout estimator.  This may be useful for
-   * UDP mounts that exhibit high retry rates, since it is possible that the
-   * dynamically estimated timeout interval is too short.
+   * ========== MACOS ONLY ==========
+   *
+   * Turn off the dynamic retransmit timeout estimator and use
+   * nfs:retransmit-timeout-tenths as a fixed request timeout instead.
+   *
+   * The estimator tracks the smoothed RTT of EdenFS replies, which is
+   * sub-millisecond for a local server, so the estimated timeout sits at its
+   * ~80ms floor. Any request that EdenFS answers slowly then trips the timer
+   * repeatedly, and on soft mounts that shrinks the kernel's give-up budget to
+   * a few seconds (or ~1.4s on a busy mount, where 15 retries are burned in
+   * 80ms steps). Enabled by default on macOS for that reason; nullopt leaves
+   * the kernel default (estimator on).
    */
   ConfigSetting<std::optional<bool>> nfsDumbtimer{
       "nfs:dumbtimer",
-      std::nullopt,
-      this};
-
-  /**
-   * Whether we should validate that files on disk match their inode state after
-   * checkout. We won't validate all of the loaded files or even the ones
-   * changed by checkout, but just a handful of the files that were loaded and
-   * changed by checkout. The next few configs control how many files and how
-   * we select them.
-   TODO: This is to collect data for S439820. We can remove this once SEV
-   closed.
-   */
-  ConfigSetting<bool> verifyFilesAfterCheckout{
-      "nfs:verify-files-after-checkout",
-      false,
-      this};
-
-  /**
-   * We aim to invalidate maxNumberOfInvlidationsToVerify on every checkout
-   * operation. If there are less than maxNumberOfInvlidationsToVerify files
-   * invalidated by a checkout operation then we might verify less. But most
-   * operations should verify this many files.
-   TODO: This is to collect data for S439820. We can remove this once SEV
-   closed.
-   */
-  ConfigSetting<size_t> maxNumberOfInvlidationsToVerify{
-      "nfs:max-number-invalidations-to-verify",
-      10,
+      folly::kIsApple ? std::optional<bool>{true} : std::optional<bool>{},
       this};
 
   /**
@@ -1227,6 +1415,34 @@ class EdenConfig : private ConfigSettingManager {
    * used instead.
    */
   ConfigSetting<bool> useReaddirplus{"nfs:use-readdirplus", false, this};
+
+  /**
+   * The number of threads per NFS mount that send directory invalidations
+   * (chmods) to the kernel. Each chmod is a round trip through the kernel
+   * back to EdenFS, so this bounds how fast inode GC can invalidate. GC
+   * orders its own work through per-directory completion, not through the
+   * queue, so more threads only let the chmods of unrelated directories
+   * overlap; checkout's invalidations do not depend on the order either.
+   * The default of one matches the serial executor this replaced; raising it
+   * is believed safe for the reasons above but has not been verified under
+   * load.
+   */
+  ConfigSetting<uint32_t> nfsNumInvalidationThreads{
+      "nfs:num-invalidation-threads",
+      1,
+      this};
+
+  /**
+   * Upper bound on the number of directory invalidations inode GC may have
+   * queued at once on an NFS mount. The queue is shared with checkout's
+   * invalidations, so an unbounded GC queue would delay a checkout by however
+   * many GC invalidations were ahead of it. When the bound is reached the GC
+   * walk waits for the queue to drain before queuing more.
+   */
+  ConfigSetting<uint32_t> nfsMaxQueuedGcInvalidations{
+      "nfs:max-queued-gc-invalidations",
+      1024,
+      this};
 
   /**
    * When set to true, NFS mounts are mounted with the "soft" mount option. This
@@ -1252,71 +1468,63 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> nfsFastPathRPCs{"nfs:fast-path-rpcs", true, this};
 
   /**
-   * How to respond to NFS requests whose AUTH_SYS credential claims root
-   * (uid 0): "off" does nothing, "log" bumps the
-   * nfs.privileged_access.uid_root fb303 counter, "block" logs and
-   * additionally rejects the request (bumping nfs.blocked_access) with an
-   * auth error that clients surface as a permission error. On macOS such
-   * access typically comes from security software crawling the mount. Read
-   * through ReloadableConfig on each request, so it can be changed within
-   * config:reload-interval (or immediately via `eden debug thrift
-   * reloadConfig`) without a daemon restart. Control-plane procedures (NFS
-   * NULL probes, FSSTAT, FSINFO, PATHCONF) and requests without a parsable
-   * AUTH_SYS credential are never affected. AUTH_SYS identities are
-   * client-asserted, so "block" is a mitigation against
-   * well-behaved-but-noisy root processes (e.g. security scanners), not a
-   * security boundary.
+   * Per-uid access policy, "uid:mode", e.g. ["0:log", "89:block"]. A match
+   * bumps nfs.access.uid.<uid> and, per procedure,
+   * nfs.access.uid.<uid>.<procedure>; "block" also rejects requests for
+   * procedures in nfs:access-policy-procedures, bumping nfs.blocked.uid.<uid>
+   * and nfs.blocked_access; "rate_limit" does so for those procedures only
+   * past nfs:access-policy-rate-limit-*. Re-read on every request; AUTH_SYS
+   * ids are client-asserted, so this sheds noisy processes rather than
+   * enforcing a security boundary.
    */
-  ConfigSetting<NfsAccessMode> nfsRootAccessMode{
-      "nfs:root-access-mode",
-      NfsAccessMode::Log,
+  ConfigSetting<std::unordered_map<uint32_t, NfsAccessMode>> nfsUidAccessPolicy{
+      "nfs:uid-access-policy",
+      {{0, NfsAccessMode::Log}},
       this};
 
   /**
-   * Same as nfs:root-access-mode, but for requests whose AUTH_SYS
-   * credential claims the wheel group (primary gid 0 or 0 in the auxiliary
-   * gids, root-equivalent on macOS), tracked by the
-   * nfs.privileged_access.gid_wheel counter. The two modes are independent.
+   * Same as nfs:uid-access-policy, keyed by gid: an entry matches a request
+   * whose AUTH_SYS credential has that gid as its primary gid or among its
+   * auxiliary gids. Evaluated independently of the uid entries, and every
+   * matching entry of either map is counted.
    */
-  ConfigSetting<NfsAccessMode> nfsWheelAccessMode{
-      "nfs:wheel-access-mode",
-      NfsAccessMode::Log,
+  ConfigSetting<std::unordered_map<uint32_t, NfsAccessMode>> nfsGidAccessPolicy{
+      "nfs:gid-access-policy",
+      {{0, NfsAccessMode::Log}},
       this};
 
   /**
-   * Only consulted when nfs:root-access-mode is "rate_limit": the number
-   * of root-claiming requests allowed per
-   * nfs:root-access-rate-limit-window-seconds window before further ones
-   * in that window are rejected the way "block" rejects them. The window
-   * is per mount and per identity class.
+   * The procedures that nfs:uid-access-policy / nfs:gid-access-policy act on,
+   * as lowercase NFSv3 procedure names, e.g. ["readdir", "readdirplus"];
+   * anything else, including other casing, is ignored. Only procedures in
+   * this set are blocked, rate-limited, or consume rate-limit budget; every
+   * other non-exempt request that matches an entry is still counted in
+   * nfs.access.{uid,gid}.<id>, and the policed ones additionally in
+   * nfs.policed.{uid,gid}.<id>. The control-plane procedures (NULL, FSSTAT,
+   * FSINFO, PATHCONF) stay exempt whatever this set holds.
    */
-  ConfigSetting<uint32_t> nfsRootAccessRateLimitCount{
-      "nfs:root-access-rate-limit-count",
+  ConfigSetting<std::unordered_set<std::string>> nfsAccessPolicyProcedures{
+      "nfs:access-policy-procedures",
+      {"readdir", "readdirplus"},
+      this};
+
+  /**
+   * For "rate_limit" entries in nfs:uid-access-policy / nfs:gid-access-policy:
+   * the requests an id may make per
+   * nfs:access-policy-rate-limit-window-seconds before further ones in that
+   * window are rejected the way "block" rejects them. Budgets are per id and
+   * per mount.
+   */
+  ConfigSetting<uint32_t> nfsAccessPolicyRateLimitCount{
+      "nfs:access-policy-rate-limit-count",
       1000,
       this};
 
   /**
-   * The window length, in seconds, for nfs:root-access-rate-limit-count.
+   * The window length, in seconds, for nfs:access-policy-rate-limit-count.
    */
-  ConfigSetting<uint32_t> nfsRootAccessRateLimitWindowSeconds{
-      "nfs:root-access-rate-limit-window-seconds",
-      60,
-      this};
-
-  /**
-   * Same as nfs:root-access-rate-limit-count, for the wheel class (only
-   * consulted when nfs:wheel-access-mode is "rate_limit").
-   */
-  ConfigSetting<uint32_t> nfsWheelAccessRateLimitCount{
-      "nfs:wheel-access-rate-limit-count",
-      1000,
-      this};
-
-  /**
-   * The window length, in seconds, for nfs:wheel-access-rate-limit-count.
-   */
-  ConfigSetting<uint32_t> nfsWheelAccessRateLimitWindowSeconds{
-      "nfs:wheel-access-rate-limit-window-seconds",
+  ConfigSetting<uint32_t> nfsAccessPolicyRateLimitWindowSeconds{
+      "nfs:access-policy-rate-limit-window-seconds",
       60,
       this};
 
@@ -1599,6 +1807,17 @@ class EdenConfig : private ConfigSettingManager {
   // [telemetry]
 
   /**
+   * Whether the daemon sends samples to Scribe at all via the XplatLogger.
+   * Checked on every sample, so it can be flipped in emergency situations. Off
+   * by default in debug builds to avoid pollution but that means it needs to be
+   * enabled for testing telemetry related code changes.
+   */
+  ConfigSetting<bool> enableScribeLogging{
+      "telemetry:enable-scribe-logging",
+      !folly::kIsDebug,
+      this};
+
+  /**
    * Location of scribe_cat binary on the system. If not specified, scribe
    * logging will be disabled.
    */
@@ -1622,15 +1841,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Deprecated. Retained temporarily so older Configerator output remains
-   * accepted while the XplatLogger-only error path rolls out.
-   */
-  ConfigSetting<std::string> errorScribeCategory{
-      "telemetry:error-scribe-category",
-      "",
-      this};
-
-  /**
    * Kill switch for the entire structured error logging feature.
    */
   ConfigSetting<bool> enableErrorLogging{
@@ -1639,11 +1849,44 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Maximum number of error events per minute, per `error_type`, that
+   * `ErrorLogger` admits on this host. Errors above this rate are dropped and
+   * counted; the count is attached to the next admitted event of the same type
+   * as `suppressed_count` in the `extras` column. 0 disables rate limiting.
+   *
+   * The limit is applied before `enableErrorLogging`, so callers that gate
+   * their local log line on the returned outcome are protected even when
+   * Scuba logging is off.
+   */
+  ConfigSetting<uint32_t> errorLogMaxPerMinute{
+      "telemetry:error-log-max-per-minute",
+      6,
+      this};
+
+  /**
+   * Number of error events of a single `error_type` admitted immediately
+   * before `errorLogMaxPerMinute` starts to apply.
+   */
+  ConfigSetting<uint32_t> errorLogBurst{"telemetry:error-log-burst", 10, this};
+
+  /**
    * Whether to upload stack traces to Manifold when logging errors.
    */
   ConfigSetting<bool> enableStackTraceUpload{
       "telemetry:enable-stack-trace-upload",
       false,
+      this};
+
+  /**
+   * Whether to attribute the processes accessing a mount to whatever launched
+   * them (ProcessInfoCache::ReadFuncConfig::attribution). The attribution is
+   * attached to per-process events (currently FetchHeavy) as opaque string
+   * fields so the activity is credited to the client rather than to the
+   * environment EdenFS itself was started under. Read at startup.
+   */
+  ConfigSetting<bool> attributeClientProcesses{
+      "telemetry:attribute-client-processes",
+      true,
       this};
 
   /**
@@ -1716,6 +1959,11 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> enableOBCOnEden{
       "telemetry:enable-obc-on-eden",
       false,
+      this};
+
+  ConfigSetting<bool> aggregateContainerOdsHostnames{
+      "telemetry:aggregate-container-ods-hostnames",
+      true,
       this};
 
   /**
@@ -1808,39 +2056,6 @@ class EdenConfig : private ConfigSettingManager {
       "telemetry:long-running-fs-request-threshold",
       folly::kIsWindows ? std::chrono::nanoseconds(0)
                         : std::chrono::seconds{45},
-      this};
-
-  /**
-   * Whether to enable XplatLogger for edenfs_events telemetry.
-   */
-  ConfigSetting<bool> enableXplatLoggerEvents{
-      "telemetry:enable-xplatlogger-events",
-      false,
-      this};
-
-  /**
-   * Deprecated. ErrorLogger always uses XplatLogger. Retained temporarily so
-   * older Configerator output remains accepted during the rollout.
-   */
-  ConfigSetting<bool> enableXplatLoggerErrors{
-      "telemetry:enable-xplatlogger-errors",
-      false,
-      this};
-
-  /**
-   * Whether to enable XplatLogger for edenfs_rollouts telemetry.
-   */
-  ConfigSetting<bool> enableXplatLoggerRollouts{
-      "telemetry:enable-xplatlogger-rollouts",
-      false,
-      this};
-
-  /**
-   * Whether to enable XplatLogger for edenfs_cli_usage telemetry.
-   */
-  ConfigSetting<bool> enableXplatLoggerCliUsage{
-      "telemetry:enable-xplatlogger-cli-usage",
-      false,
       this};
 
   // [experimental]
@@ -2017,6 +2232,16 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * When true, a forced checkout that replaces a directory with a file removes
+   * the local-only files inside it so the replacement can succeed. When false,
+   * the directory is left in place and reported as DIRECTORY_NOT_EMPTY.
+   */
+  ConfigSetting<bool> forceCheckoutRemovesLocalOnly{
+      "experimental:force-checkout-removes-local-only",
+      true,
+      this};
+
+  /**
    * Master gate for pressure-based inode GC on FUSE.
    * When enabled, FUSE TTLs and GC cutoffs are dynamically computed based
    * on total inode count.
@@ -2027,9 +2252,22 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Whether NFS inode GC answers its own invalidation chmod with a stale
+   * handle error, which makes the macOS client drop the directory's cached
+   * names at once, and forgets the directory's children at that moment. When
+   * disabled, the chmod is answered normally and the children are forgotten
+   * once it has succeeded, as before the stale reply; the client then keeps
+   * the names it has cached until a stale file handle sends it back to
+   * EdenFS. A fallback for the stale reply misbehaving, not a mode to run in.
+   */
+  ConfigSetting<bool> nfsGcStaleReply{
+      "experimental:nfs-gc-stale-reply",
+      true,
+      this};
+
+  /**
    * Whether to use systemd for EdenFS lifecycle management
-   * (start/stop/restart). Only used in the CLI, including here to get rid of
-   * warnings.
+   * (start/stop/restart).
    */
   ConfigSetting<bool> systemdManagedLifecycle{
       "experimental:systemd-managed-lifecycle",
@@ -2047,28 +2285,11 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Whether to place EdenFS in a dedicated systemd cgroup via systemd-run.
-   * Only used in the CLI, including here to get rid of warnings.
    */
   ConfigSetting<bool> systemdCgroupIsolation{
       "experimental:systemd-cgroup-isolation",
       false,
       this};
-
-  /**
-   * Controls the "user.oomd_avoid" xattr the CLI writes on edenfs.slice, which
-   * asks fb-oomd to avoid killing EdenFS under memory pressure.
-   *
-   * -1 (default): leave the xattr untouched, i.e. skip setxattr completely.
-   *    Preserves existing behavior on hosts that have not opted in.
-   *  0: write "0", explicitly opting back in to oomd kills. This differs from
-   *    -1, which leaves any existing value in place.
-   *  1: write "1", asking oomd to spare edenfs.slice.
-   *
-   * Any other value is rejected and logged as an error by the CLI.
-   *
-   * Only used in the CLI, including here to get rid of warnings.
-   */
-  ConfigSetting<int32_t> oomdAvoid{"experimental:oomd_avoid", -1, this};
 
   // [coroutines]
 
@@ -2096,15 +2317,6 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableCoroutinesPhase9{
       "coroutines:enable-phase9",
-      false,
-      this};
-
-  /**
-   * Controls whether EdenFS uses phase 4 coroutine implementations
-   * (readdir and VirtualInode attribute fetching coroutine paths).
-   */
-  ConfigSetting<bool> enableCoroutinesPhase4{
-      "coroutines:enable-phase4",
       false,
       this};
 
@@ -2164,11 +2376,13 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Number of bytes worth of data to keep in memory.
+   * Number of bytes worth of data to keep in memory. The budget must exceed
+   * the largest tree by a comfortable margin, or a repeated walk of a working
+   * set just larger than the budget misses on every lookup.
    */
   ConfigSetting<size_t> inMemoryTreeCacheSize{
       "treecache:cache-size",
-      40 * 1024 * 1024,
+      128 * 1024 * 1024,
       this};
 
   /**
@@ -2182,9 +2396,21 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Number of shards for the tree cache. Higher number means lower lock
-   * contention, but less perfect eviction.
+   * contention, but the byte budget and minimum-items floor are split per
+   * shard, so a tree larger than its shard's slice cannot stay cached.
    */
-  ConfigSetting<uint64_t> treeCacheShards{"treecache:shards", 16, this};
+  ConfigSetting<uint64_t> treeCacheShards{"treecache:shards", 1, this};
+
+  /**
+   * Whether glob and prefetch requests bypass the in-memory tree cache and
+   * the in-memory tree aux data cache. Those requests walk far more trees than
+   * the caches can hold, so caching their trees only evicts what other callers
+   * have warm.
+   */
+  ConfigSetting<bool> treeCacheBypassGlobAndPrefetch{
+      "treecache:bypass-glob-and-prefetch",
+      true,
+      this};
 
   // [notifications]
 
@@ -2275,16 +2501,7 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Kill switch for predictive prefetch profiles feature.
-   */
-  ConfigSetting<bool> enablePredictivePrefetchProfiles{
-      "prefetch-profiles:predictive-prefetching-enabled",
-      true,
-      this};
-
-  /**
-   * Used to control file access logging for predictive prefetch
-   * profiles.
+   * Used to control file access logging.
    */
   ConfigSetting<bool> logFileAccesses{
       "prefetch-profiles:file-access-logging-enabled",
@@ -2302,17 +2519,6 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint32_t> logFileAccessesSamplingDenominator{
       "prefetch-profiles:file-access-logging-sampling-denominator",
       0,
-      this};
-
-  // [predictive-prefetch-profiles]
-
-  /**
-   * The number of globs to use for a predictive prefetch profile,
-   * 1500 by default.
-   */
-  ConfigSetting<uint32_t> predictivePrefetchProfileSize{
-      "predictive-prefetch-profiles:size",
-      1500,
       this};
 
   // [redirections]
@@ -2390,6 +2596,16 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Remove the overlay data of unlinked inodes on the overlay GC thread once
+   * the kernel forgets them, instead of on the FsChannel thread handling the
+   * forget.
+   */
+  ConfigSetting<bool> overlayBackgroundInodeRemoval{
+      "overlay:background-inode-removal",
+      true,
+      this};
+
+  /**
    * When true, write a newly created overlay file directly instead of
    * creating a temporary file and renaming it into place. A torn write
    * leaves a partial file, which is safe here because an inode is only
@@ -2414,14 +2630,40 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * How many directories' WAL files to keep open at once when
+   * experimental:overlay-cache-wal-files is on. A directory not in the
+   * cache pays an open and a close for its next append.
+   */
+  ConfigSetting<size_t> overlayWalFileCacheSize{
+      "overlay:wal-file-cache-size",
+      64,
+      this};
+
+  /**
    * Floor on the WAL compaction probability denominator: a directory's WAL
    * is compacted with probability 1/max(this, multiplier * entries), so
    * small directories are compacted far less often. 0 restores the
    * previous 1/(multiplier * max(entries, 10)) behavior.
+   *
+   * A compaction rewrites the directory's record through a temporary file
+   * and a rename on the request path, under the parent's contents lock, so
+   * it should stay rare for directories that see steady churn; replaying a
+   * hundred WAL entries when the directory is next loaded costs well under a
+   * millisecond.
    */
   ConfigSetting<uint64_t> experimentalOverlayWalMinCompactionThreshold{
       "experimental:overlay-wal-min-compaction-threshold",
-      50,
+      100,
+      this};
+
+  /**
+   * Require the renamed entry in the destination snapshot before writing.
+   * Disabling this guard restores the legacy full rewrite, which can lose the
+   * moved child when the snapshots omit it.
+   */
+  ConfigSetting<bool> experimentalOverlayRenameRequireDestination{
+      "experimental:overlay-rename-require-destination",
+      true,
       this};
 
   /**
@@ -2450,7 +2692,21 @@ class EdenConfig : private ConfigSettingManager {
    * Determines if EdenFS should use Write-Ahead Logging (WAL) for overlay
    * directory writes. Only applies to Legacy and LegacyDev catalog types.
    */
-  ConfigSetting<bool> overlayUseWal{"overlay:use-wal", false, this};
+  ConfigSetting<bool> overlayUseWal{"overlay:use-wal", true, this};
+
+  /**
+   * Write new overlay WAL files in the versioned format. Existing WAL files
+   * are always read according to their on-disk format. Snapshot at mount
+   * creation; disabling this setting does not disable versioned WAL reads.
+   *
+   * Rollout invariant: only enable once every EdenFS binary that could run
+   * against the overlay can read versioned WALs. A binary that predates the
+   * reader sees the `OVWL` header as a torn v1 frame, reports a parse error,
+   * and heals the directory by rewriting its base without the WAL, which
+   * silently drops the pending mutations. Turning this flag back off does
+   * not rewrite existing versioned WALs.
+   */
+  ConfigSetting<bool> overlayWalWriteV2{"overlay:wal-write-v2", false, this};
 
   /**
    * Persist an upper bound on allocated inode numbers so an unclean startup
@@ -2460,6 +2716,15 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> overlayInodeReservation{
       "overlay:inode-reservation",
       true,
+      this};
+
+  /**
+   * Whether mmap accesses to the inode metadata table should recover from
+   * synchronous SIGBUS faults. Snapshot at Overlay initialization.
+   */
+  ConfigSetting<bool> overlayUseSigbusProtection{
+      "overlay:use-sigbus-protection",
+      false,
       this};
 
   /**
@@ -2600,22 +2865,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls whether EdenFS uses EdenAPI to make suffix queries
-   */
-  ConfigSetting<bool> enableEdenAPISuffixQuery{
-      "glob:use-edenapi-suffix-query",
-      false,
-      this};
-
-  /**
-   * Allowed suffix queries for offloading to EdenAPI
-   */
-  ConfigSetting<std::unordered_set<std::string>> allowedSuffixQueries{
-      "glob:allowed-suffix-queries",
-      {},
-      this};
-
-  /**
    * When true, maintain previous behavior where we sort/dedupe list of file ids
    * when prefetching.
    */
@@ -2632,6 +2881,31 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint32_t> globRecursiveAsyncDepth{
       "glob:recursive-async-depth",
       3,
+      this};
+
+  /**
+   * Whether GlobMatcher memoizes failed backtracking states. Disabling this is
+   * an emergency rollback mechanism; the backtracking step limit remains
+   * active to keep pathological matches bounded.
+   */
+  ConfigSetting<bool> globEnableFailureMemoization{
+      "glob:enable-failure-memoization",
+      true,
+      this};
+
+  /**
+   * Maximum number of failed backtracking states retained by one match.
+   * Matching continues without retaining new states after reaching this cap.
+   */
+  ConfigSetting<size_t> globMaxMemoizedFailureStates{
+      "glob:max-memoized-failure-states",
+      65'536,
+      this};
+
+  /** Maximum number of recursive backtracking attempts made by one match. */
+  ConfigSetting<size_t> globMaxBacktrackingSteps{
+      "glob:max-backtracking-steps",
+      100'000,
       this};
 
   // [doctor]
@@ -2810,6 +3084,16 @@ class EdenConfig : private ConfigSettingManager {
       std::chrono::seconds(1),
       this};
 
+  /**
+   * Whether to resend a batch whose ScribeD write timed out on the client.
+   * ScribeD may already have accepted the batch, so resending can duplicate
+   * rows, while dropping it can lose them.
+   */
+  ConfigSetting<bool> xplatLoggerRetryTimedOutWrites{
+      "xplat-logger:retry-timed-out-writes",
+      true,
+      this};
+
   // [acl]
   // Path-based ACL settings
 
@@ -2821,6 +3105,15 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> restrictedTreeTtlSeconds{
       "acl:restricted-tree-ttl-seconds",
       65,
+      this};
+
+  /**
+   * Interval at which EdenFS rechecks restricted tree roots that are hidden
+   * from their parent's listing in omitted mode. Set to 0 to disable.
+   */
+  ConfigSetting<std::chrono::nanoseconds> restrictedRootRefreshInterval{
+      "acl:restricted-root-refresh-interval",
+      std::chrono::seconds(0),
       this};
 
   /**

@@ -7,6 +7,7 @@
 
 //! Connection management.
 
+use std::collections::HashMap;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::net::IpAddr;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -36,6 +37,7 @@ use tupperware_api_tupperware_srclients::make_TupperwareReadOnlyService_srclient
 const SCS_PORT_NAME: &str = "thrift";
 const SCSC_ADMIN_ENABLED_ENV: &str = "SCSC_ADMIN_ENABLED";
 const SCSC_CLIENT_CORRELATOR_ENV: &str = "SCSC_CLIENT_CORRELATOR";
+const SCSC_EXTRA_HEADERS_ENV: &str = "SCSC_EXTRA_HEADERS";
 
 #[derive(clap::Args)]
 pub(super) struct ConnectionArgs {
@@ -57,6 +59,14 @@ pub(super) struct ConnectionArgs {
     /// Serialized Crypto Auth Token (CAT) to use for authentication.
     #[clap(long, global = true, env = "SCSC_CAT")]
     cat: Option<String>,
+    #[clap(long, global = true, conflicts_with = "disable_partial_responses")]
+    /// Ask the server for partial responses to restricted-path denials
+    /// instead of whole-request failures.
+    enable_partial_responses: bool,
+    #[clap(long, global = true)]
+    /// Ask the server to fail restricted-path denials instead of returning
+    /// partial responses.
+    disable_partial_responses: bool,
 }
 
 /// Get the IP address and port for a task handle.
@@ -107,6 +117,19 @@ fn client_correlator_override() -> Option<String> {
     }
 }
 
+/// Test/admin-only hook: comma-separated `name=value` request headers.
+fn extra_headers_override() -> HashMap<String, String> {
+    if std::env::var_os(SCSC_ADMIN_ENABLED_ENV).is_none() {
+        return HashMap::new();
+    }
+    std::env::var(SCSC_EXTRA_HEADERS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 impl ConnectionArgs {
     pub(super) fn host(&self) -> Option<&str> {
         self.host.as_deref()
@@ -149,19 +172,35 @@ impl ConnectionArgs {
 
         if let Some(ref host_str) = host {
             if disable_sr {
-                return ScsClientHostBuilder::new()
+                let builder = ScsClientHostBuilder::new()
                     .with_client_correlator(client_correlator_override())
-                    .build_from_host_port(fb, host_str);
+                    .with_extra_headers(extra_headers_override());
+                let builder = if self.enable_partial_responses {
+                    builder.with_partial_responses_opt_in()
+                } else if self.disable_partial_responses {
+                    builder.with_partial_responses_opt_out()
+                } else {
+                    builder
+                };
+                return builder.build_from_host_port(fb, host_str);
             }
         }
 
-        ScsClientBuilder::new(fb, self.client_id.clone())
+        let builder = ScsClientBuilder::new(fb, self.client_id.clone())
             .with_tier(&self.tier)
             .with_repo(repo.map(|r| r.to_string()))
             .with_host_and_port(host)?
             .with_processing_timeout(self.processing_timeout)
             .with_cat(self.cat.clone())
             .with_client_correlator(client_correlator_override())
-            .build()
+            .with_extra_headers(extra_headers_override());
+        let builder = if self.enable_partial_responses {
+            builder.with_partial_responses_opt_in()
+        } else if self.disable_partial_responses {
+            builder.with_partial_responses_opt_out()
+        } else {
+            builder
+        };
+        builder.build()
     }
 }

@@ -18,12 +18,11 @@ import {useCallback, useState} from 'react';
 import {useContextMenu} from 'shared/ContextMenu';
 import {basename, dirname, guessPathSep, pathsAreIdentical} from 'shared/utils';
 import {defaultWorktreesDir, pickWorktreeDirName} from 'shared/worktreePaths';
+import {worktreeListEnabled, worktreeMutationsSupported} from './CheckedOutElsewhere';
 import serverAPI from './ClientToServerAPI';
 import {Row} from './ComponentUtils';
 import css from './CwdSelector.module.css';
 import {DropdownField, DropdownFields} from './DropdownFields';
-import {Internal} from './Internal';
-import {useFailsafeFeatureFlagSync} from './featureFlags';
 import {T, t} from './i18n';
 import {AddWorktreeOperation} from './operations/AddWorktreeOperation';
 import {RemoveWorktreeOperation} from './operations/RemoveWorktreeOperation';
@@ -33,22 +32,9 @@ import platform from './platform';
 import {applicationinfo, repositoryInfo, worktreeInfoData} from './serverAPIState';
 import {useModal} from './useModal';
 
-function useWorktreesEnabled(): boolean {
-  const worktreesEnabled = useFailsafeFeatureFlagSync(Internal.featureFlags?.Worktrees);
-  const info = useAtomValue(repositoryInfo);
-
-  // Show worktrees wherever `sl worktree` can host them: EdenFS checkouts, or git-backed
-  // repos where it delegates to `git worktree`. GitHub is still excluded for EdenFS.
-  return (
-    worktreesEnabled &&
-    info?.worktreesSupported === true &&
-    !(info?.isEdenFs === true && info?.codeReviewSystem.type === 'github')
-  );
-}
-
 /** Top-bar button, next to the branches button, showing the same worktree info as the repo dropdown. */
 export function WorktreeButton() {
-  const enabled = useWorktreesEnabled();
+  const enabled = useAtomValue(worktreeListEnabled);
   if (!enabled) {
     return null;
   }
@@ -74,7 +60,7 @@ export function WorktreeButton() {
 }
 
 export function WorktreeSection({dismiss}: {dismiss: () => unknown}) {
-  const enabled = useWorktreesEnabled();
+  const enabled = useAtomValue(worktreeListEnabled);
   if (!enabled) {
     return null;
   }
@@ -98,6 +84,7 @@ export function WorktreeSection({dismiss}: {dismiss: () => unknown}) {
 function WorktreeDropdown({dismiss}: {dismiss: () => unknown}) {
   const info = useAtomValue(repositoryInfo);
   const worktreeInfo = useAtomValue(worktreeInfoData);
+  const canMutate = useAtomValue(worktreeMutationsSupported);
   const repoRoot = info?.repoRoot ?? '';
   const runOperation = useRunOperation();
   const showModal = useModal();
@@ -128,6 +115,7 @@ function WorktreeDropdown({dismiss}: {dismiss: () => unknown}) {
         wt={wt}
         wtBasename={wtBasename}
         hasLabel={hasLabel}
+        canMutate={canMutate}
         runOperation={runOperation}
         showModal={showModal}
         dismiss={dismiss}
@@ -138,11 +126,13 @@ function WorktreeDropdown({dismiss}: {dismiss: () => unknown}) {
   return (
     <div className={css.worktreeSection} data-testid="worktree-section">
       {sortedWorktrees.map(wt => renderWorktreeRow(wt))}
-      <AddWorktreeButton
-        dismiss={dismiss}
-        repoRoot={sortedWorktrees.find(wt => wt.role === 'main')?.path ?? repoRoot}
-        existingWorktreePaths={allWorktrees.map(wt => wt.path)}
-      />
+      {canMutate && (
+        <AddWorktreeButton
+          dismiss={dismiss}
+          repoRoot={sortedWorktrees.find(wt => wt.role === 'main')?.path ?? repoRoot}
+          existingWorktreePaths={allWorktrees.map(wt => wt.path)}
+        />
+      )}
     </div>
   );
 }
@@ -153,6 +143,7 @@ function WorktreeRowWithHover({
   wt,
   wtBasename,
   hasLabel,
+  canMutate,
   runOperation,
   showModal,
   dismiss,
@@ -162,6 +153,7 @@ function WorktreeRowWithHover({
   wt: WorktreeEntry;
   wtBasename: string;
   hasLabel: boolean;
+  canMutate: boolean;
   runOperation: ReturnType<typeof useRunOperation>;
   showModal: ReturnType<typeof useModal>;
   dismiss: () => unknown;
@@ -186,34 +178,36 @@ function WorktreeRowWithHover({
         <Badge className={css.activeBadge}>Active</Badge>
       ) : (
         <div className={css.worktreeActions}>
-          <Tooltip title={t('Rename this worktree')}>
-            <Button
-              icon
-              data-testid="worktree-rename-button"
-              onClick={async () => {
-                dismiss();
-                const result = await showModal<string | undefined>({
-                  type: 'custom',
-                  title: <T>Rename Worktree</T>,
-                  icon: 'worktree',
-                  component: ({returnResultAndDismiss}) => (
-                    <RenameWorktreeModal
-                      returnResultAndDismiss={returnResultAndDismiss}
-                      currentLabel={wt.label ?? ''}
-                      wtBasename={wtBasename}
-                    />
-                  ),
-                });
-                if (result !== undefined) {
-                  await runOperation(
-                    new RenameWorktreeOperation(wt.path, result || undefined),
-                    true,
-                  );
-                }
-              }}>
-              <Icon icon="edit" />
-            </Button>
-          </Tooltip>
+          {canMutate && (
+            <Tooltip title={t('Rename this worktree')}>
+              <Button
+                icon
+                data-testid="worktree-rename-button"
+                onClick={async () => {
+                  dismiss();
+                  const result = await showModal<string | undefined>({
+                    type: 'custom',
+                    title: <T>Rename Worktree</T>,
+                    icon: 'worktree',
+                    component: ({returnResultAndDismiss}) => (
+                      <RenameWorktreeModal
+                        returnResultAndDismiss={returnResultAndDismiss}
+                        currentLabel={wt.label ?? ''}
+                        wtBasename={wtBasename}
+                      />
+                    ),
+                  });
+                  if (result !== undefined) {
+                    await runOperation(
+                      new RenameWorktreeOperation(wt.path, result || undefined),
+                      true,
+                    );
+                  }
+                }}>
+                <Icon icon="edit" />
+              </Button>
+            </Tooltip>
+          )}
           <Tooltip
             title={
               isBasecamp ? t('Open this worktree in a new tile') : t('Switch to this worktree')
@@ -234,7 +228,7 @@ function WorktreeRowWithHover({
               <Icon icon="arrow-swap" />
             </Button>
           </Tooltip>
-          {wt.role === 'main' ? (
+          {!canMutate ? null : wt.role === 'main' ? (
             <Tooltip title={t('The main worktree cannot be removed')}>
               <Button icon disabled data-testid="worktree-remove-button">
                 <Icon icon="trash" />
@@ -339,7 +333,10 @@ function AddWorktreeButton({
     if (result != null) {
       // Creating a worktree never opens or switches to it: the worktree panel is
       // the way in, and the operation list already shows the progress.
-      await runOperation(new AddWorktreeOperation(result.destPath, result.label || undefined), true);
+      await runOperation(
+        new AddWorktreeOperation(result.destPath, result.label || undefined),
+        true,
+      );
     }
   }, [dismiss, showModal, runOperation, defaultDestForLabel]);
 

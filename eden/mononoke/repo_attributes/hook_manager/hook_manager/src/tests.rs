@@ -59,10 +59,12 @@ use crate::CheckedBypassIdentities;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
+use crate::HookExecutionPurpose;
 use crate::HookManager;
 use crate::HookOutcome;
 use crate::HookRejectionInfo;
 use crate::HookRepo;
+use crate::LogOnlyRejections;
 use crate::PushAuthoredBy;
 use crate::Pushvars;
 use crate::add_log_only_bypass_columns;
@@ -102,6 +104,39 @@ fn always_accepting_changeset_hook() -> Box<dyn ChangesetHook> {
 fn always_rejecting_changeset_hook() -> Box<dyn ChangesetHook> {
     let f: fn() -> HookExecution = default_rejection;
     Box::new(FnChangesetHook::new(f))
+}
+
+struct DryRunAwareChangesetHook;
+
+#[async_trait]
+impl ChangesetHook for DryRunAwareChangesetHook {
+    async fn run<'this: 'cs, 'ctx: 'this, 'cs, 'repo: 'cs>(
+        &'this self,
+        _ctx: &'ctx CoreContext,
+        _repo: &'repo HookRepo,
+        _bookmark: &BookmarkKey,
+        _changeset: &'cs BonsaiChangeset,
+        _cross_repo_push_source: CrossRepoPushSource,
+        _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
+    ) -> Result<HookExecution, Error> {
+        Ok(default_rejection())
+    }
+
+    async fn run_with_purpose<'this: 'cs, 'ctx: 'this, 'cs, 'repo: 'cs>(
+        &'this self,
+        _ctx: &'ctx CoreContext,
+        _repo: &'repo HookRepo,
+        _bookmark: &BookmarkKey,
+        _changeset: &'cs BonsaiChangeset,
+        _cross_repo_push_source: CrossRepoPushSource,
+        _push_authored_by: PushAuthoredBy,
+        purpose: HookExecutionPurpose,
+        _maybe_pushvars: Option<&'cs Pushvars>,
+    ) -> Result<HookExecution, Error> {
+        assert_eq!(purpose, HookExecutionPurpose::DryRun);
+        Ok(HookExecution::accepted())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,7 +386,9 @@ async fn run_changeset_hooks(
             None,
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
             None,
+            LogOnlyRejections::Suppress,
         )
         .await
         .unwrap();
@@ -383,7 +420,9 @@ async fn run_file_hooks(
             None,
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
             None,
+            LogOnlyRejections::Suppress,
         )
         .await
         .unwrap();
@@ -416,6 +455,38 @@ async fn test_changeset_hook_accepted(fb: FacebookInit) {
 }
 
 #[mononoke::fbinit_test]
+async fn test_changeset_hook_receives_execution_purpose(fb: FacebookInit) {
+    let ctx = CoreContext::test_mock(fb);
+    let mut hook_manager = setup_hook_manager(fb, hashmap! {}, hashmap! {}).await;
+    hook_manager.register_changeset_hook(
+        "hook1",
+        Box::new(DryRunAwareChangesetHook),
+        Default::default(),
+        None,
+    );
+    let bookmark = BookmarkKey::new("bm1").unwrap();
+    hook_manager.set_hooks_for_bookmark(bookmark.clone().into(), vec!["hook1".to_string()]);
+
+    let outcomes = hook_manager
+        .run_changesets_hooks_for_bookmark(
+            &ctx,
+            &[default_changeset()],
+            &bookmark,
+            None,
+            CrossRepoPushSource::NativeToThisRepo,
+            PushAuthoredBy::User,
+            HookExecutionPurpose::DryRun,
+            None,
+            LogOnlyRejections::Suppress,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].get_execution(), &HookExecution::accepted());
+}
+
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_rejected(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn ChangesetHook>> = hashmap! {
@@ -429,6 +500,66 @@ async fn test_changeset_hook_rejected(fb: FacebookInit) {
         "hook1".to_string() => default_rejection()
     };
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
+}
+
+#[mononoke::fbinit_test]
+async fn test_log_only_rejection_reported_per_mode(fb: FacebookInit) {
+    let ctx = CoreContext::test_mock(fb);
+    let mut hook_manager = setup_hook_manager(
+        ctx.fb,
+        hashmap! {"bm1".to_string() => vec!["hook1".to_string()]},
+        hashmap! {},
+    )
+    .await;
+    hook_manager.register_changeset_hook(
+        "hook1",
+        always_rejecting_changeset_hook(),
+        HookConfig {
+            log_only: true,
+            ..Default::default()
+        },
+        None,
+    );
+    let changeset = default_changeset();
+    let bookmark = BookmarkKey::new("bm1").unwrap();
+
+    let outcomes = hook_manager
+        .run_changesets_hooks_for_bookmark(
+            &ctx,
+            std::slice::from_ref(&changeset),
+            &bookmark,
+            None,
+            CrossRepoPushSource::NativeToThisRepo,
+            PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
+            None,
+            LogOnlyRejections::Suppress,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !outcomes[0].get_execution().is_rejected(),
+        "a log-only rejection must be reported as accepted on a real push"
+    );
+
+    let outcomes = hook_manager
+        .run_changesets_hooks_for_bookmark(
+            &ctx,
+            std::slice::from_ref(&changeset),
+            &bookmark,
+            None,
+            CrossRepoPushSource::NativeToThisRepo,
+            PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
+            None,
+            LogOnlyRejections::Report,
+        )
+        .await
+        .unwrap();
+    assert!(
+        outcomes[0].get_execution().is_rejected(),
+        "LogOnlyRejections::Report must surface the underlying log-only rejection"
+    );
 }
 
 #[mononoke::fbinit_test]
@@ -932,7 +1063,9 @@ async fn test_unauthorized_bypass_file_hook_annotates_each_path(fb: FacebookInit
             Some(&bypass_pushvars()),
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
             None,
+            LogOnlyRejections::Suppress,
         )),
     )
     .await
@@ -1386,7 +1519,9 @@ impl BypassScenario {
                 self.pushvars.as_ref(),
                 CrossRepoPushSource::NativeToThisRepo,
                 PushAuthoredBy::User,
+                HookExecutionPurpose::LandAttempt,
                 None,
+                LogOnlyRejections::Suppress,
             )),
         )
         .await
@@ -1638,7 +1773,9 @@ async fn test_bypass_resolves_author_email_to_group_unixname(fb: FacebookInit) {
             None,
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            HookExecutionPurpose::LandAttempt,
             None,
+            LogOnlyRejections::Suppress,
         )),
     )
     .await

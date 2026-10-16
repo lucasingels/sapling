@@ -10,6 +10,8 @@
 #include <folly/logging/xlog.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <limits>
 
 #include "eden/fs/utils/StaticAssert.h"
 
@@ -50,6 +52,26 @@ TEST(ImportPriorityTest, format) {
 TEST(ImportPriorityTest, minimum_value_cannot_be_deprioritized) {
   auto minimum = ImportPriority::minimumValue();
   EXPECT_EQ(minimum, minimum.adjusted(-1));
+}
+
+TEST(ImportPriorityTest, large_positive_adjustment_saturates_within_class) {
+  auto low = ImportPriority{ImportPriority::Class::Low};
+  auto largestOffset = low.adjusted((int64_t{1} << 60) - 1);
+  EXPECT_EQ(ImportPriority::Class::Low, largestOffset.getClass());
+
+  auto beyondOffsetRange = low.adjusted(int64_t{1} << 60);
+  EXPECT_EQ(ImportPriority::Class::Low, beyondOffsetRange.getClass());
+  EXPECT_EQ(largestOffset, beyondOffsetRange);
+
+  auto maxAdjustment = low.adjusted(std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(ImportPriority::Class::Low, maxAdjustment.getClass());
+  EXPECT_EQ(largestOffset, maxAdjustment);
+  EXPECT_LT(maxAdjustment, ImportPriority{ImportPriority::Class::Normal});
+
+  auto constructed =
+      ImportPriority(ImportPriority::Class::Normal, int64_t{1} << 60);
+  EXPECT_EQ(ImportPriority::Class::Normal, constructed.getClass());
+  EXPECT_LT(constructed, ImportPriority{ImportPriority::Class::High});
 }
 
 } // namespace

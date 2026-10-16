@@ -12,6 +12,7 @@ use ::manifest::Entry;
 use anyhow::Error;
 use anyhow::Result;
 use anyhow::bail;
+use blobrepo_hg::AclFileValidation;
 use blobrepo_hg::ChangesetHandle;
 use blobrepo_hg::CreateChangeset;
 use context::CoreContext;
@@ -38,6 +39,7 @@ use mercurial_types::blobs::ChangesetMetadata;
 use mercurial_types::subtree::HgSubtreeChanges;
 use mononoke_types::BonsaiChangeset;
 use scuba_ext::MononokeScubaSampleBuilder;
+use thiserror::Error;
 use wirepack::TreemanifestEntry;
 
 use crate::Repo;
@@ -48,6 +50,14 @@ use crate::upload_blobs::UploadableHgBlob;
 pub type Filelogs = HashMap<HgNodeKey, <Filelog as UploadableHgBlob>::Value>;
 pub type Manifests = HashMap<HgNodeKey, <TreemanifestEntry as UploadableHgBlob>::Value>;
 pub type UploadedChangesets = HashMap<HgChangesetId, ChangesetHandle>;
+
+/// An uploaded changeset contains shallow subtree copies while
+/// manifest-altering subtree changes are disabled.
+#[derive(Debug, Error)]
+#[error(
+    "Changeset {0} contains shallow subtree copies, which are not supported: use a deep subtree copy instead"
+)]
+pub struct ShallowSubtreeCopyRejected(pub HgChangesetId);
 
 type HgBlobFuture = BoxFuture<'static, Result<(Entry<HgManifestId, HgFileNodeId>, RepoPath)>>;
 type HgBlobStream = BoxStream<'static, Result<(Entry<HgManifestId, HgFileNodeId>, RepoPath)>>;
@@ -296,6 +306,16 @@ pub async fn upload_changeset(
 
     let subtree_changes = if let Some(subtree) = cs_metadata.extra.get(b"subtree".as_slice()) {
         let subtree_changes = HgSubtreeChanges::from_json(subtree)?;
+        if !subtree_changes.copies.is_empty()
+            && !justknobs::eval(
+                "scm/mononoke:enable_manifest_altering_subtree_changes",
+                None,
+                Some(repo.repo_identity().name()),
+            )
+        {
+            STATS::rejected_shallow_subtree_copy.add_value(1);
+            return Err(ShallowSubtreeCopyRejected(node).into());
+        }
         let hg_cs_ids = subtree_changes.source_changeset_ids();
         let sources = hg_cs_ids
             .into_iter()
@@ -325,6 +345,12 @@ pub async fn upload_changeset(
         // XXX pass content blobs to CreateChangeset here
         cs_metadata,
         upload_to_blobstore_only: bonsai.is_some(),
+        // A supplied bonsai comes from a mirror upload, which replicates
+        // changesets that were already validated when first created.
+        acl_file_validation: bonsai.is_none().then(|| AclFileValidation {
+            restricted_paths: repo.restricted_paths_arc(),
+            repo_name: repo.repo_identity().name().to_string(),
+        }),
     };
     let restricted_paths = repo
         .repo_derived_data_arc()

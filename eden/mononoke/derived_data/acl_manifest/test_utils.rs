@@ -229,7 +229,7 @@ pub(crate) async fn derive_untopologically(
         .await?)
 }
 
-/// Pre-derive AclManifest's dependencies (BSSM V3 + Fsnodes) so that
+/// Pre-derive AclManifest's dependencies (BSSM V3 + ContentManifests) so that
 /// subsequent blobstore counter snapshots only measure AclManifest derivation.
 pub(crate) async fn derive_deps(
     ctx: &CoreContext,
@@ -237,13 +237,13 @@ pub(crate) async fn derive_deps(
     cs_id: ChangesetId,
 ) -> Result<()> {
     use basename_suffix_skeleton_manifest_v3::RootBssmV3DirectoryId;
-    use fsnodes::RootFsnodeId;
+    use content_manifest_derivation::RootContentManifestId;
 
     repo.repo_derived_data()
         .derive::<RootBssmV3DirectoryId>(ctx, cs_id, DerivationPriority::LOW)
         .await?;
     repo.repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
+        .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
         .await?;
     Ok(())
 }
@@ -333,6 +333,34 @@ pub(crate) async fn load_entries(
         })
         .try_collect()
         .await
+}
+
+/// Load the directory entry for `path`, relative to the root manifest.
+pub(crate) async fn directory_entry_at_path(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    root_id: &AclManifestId,
+    path: &[&str],
+) -> Result<Option<AclManifestDirectoryEntry>> {
+    if path.is_empty() {
+        anyhow::bail!("directory_entry_at_path requires a non-empty path");
+    }
+    let mut current_id = *root_id;
+    let mut current_entry = None;
+
+    for component in path {
+        let Some((_, entry)) = load_entries(ctx, repo, &current_id)
+            .await?
+            .into_iter()
+            .find(|(name, _)| name.as_ref() == component.as_bytes())
+        else {
+            return Ok(None);
+        };
+        current_id = entry.id;
+        current_entry = Some(entry);
+    }
+
+    Ok(current_entry)
 }
 
 // ---------------------------------------------------------------------------

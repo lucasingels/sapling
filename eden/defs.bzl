@@ -1,6 +1,18 @@
 # This file contains macros that are shared across Eden.
 
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
 load("@prelude//utils:buckconfig.bzl", "read_bool")
+
+# Command aliases and GDB inferiors must use the same daemon sanitizer policy.
+DAEMON_TSAN_OPTIONS = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    lambda sanitizer: (
+        'halt_on_error=1:second_deadlock_stack=1:suppressions="$(location //eden/integration/helpers:tsan_suppressions)"'
+        if sanitizer and "thread" in sanitizer
+        else ""
+    ),
+)
 
 def get_oss_suffix():
     """Build rule suffix to use for open-source-specific build targets."""
@@ -45,6 +57,7 @@ def get_test_env_and_deps(suffix = ""):
     """
 
     env_to_target = get_dev_env_to_target(suffix)
+    env_to_target["EDENFS_SERVER_BINARY"] = env_to_target.pop("EDENFS_SERVER_PATH")
 
     if read_bool("fbcode", "mode_mac_enabled", False):
         env_to_target.update({
@@ -53,15 +66,12 @@ def get_test_env_and_deps(suffix = ""):
             "EDENFS_FSCK": "//eden/fs/inodes/fscatalog:eden_fsck",
             "EDENFS_TAKEOVER_TOOL": "//eden/integration/helpers:takeover_tool",
             "EDEN_HG_BINARY": "//scm/telemetry/hg:hg",
-            "HG_REAL_BIN": "//eden/scm:hg",
         })
     elif read_bool("fbcode", "mode_win_enabled", False):
         suffix = get_oss_suffix()
         env_to_target.update({
             "EDENFS_CHECK_WINDOWS_RENAME": "//eden/integration/helpers:check_windows_rename",
             "EDENFS_READ_REPARSE_BUFFER": "//eden/integration/helpers:read_reparse_buffer",
-            "EDEN_HG_BINARY": "//eden/scm:hg",
-            "HG_REAL_BIN": "//eden/scm:hg",
         })
     else:
         env_to_target.update({
@@ -70,7 +80,6 @@ def get_test_env_and_deps(suffix = ""):
             "EDENFS_FSCK": "//eden/fs/inodes/fscatalog:eden_fsck",
             "EDENFS_TAKEOVER_TOOL": "//eden/integration/helpers:takeover_tool",
             "EDEN_HG_BINARY": "//scm/telemetry/hg:hg",
-            "HG_REAL_BIN": "//eden/scm:hg",
         })
 
     env_to_target.update({
@@ -79,12 +88,14 @@ def get_test_env_and_deps(suffix = ""):
         "EDENFSCTL_RUST_PATH": "//eden/fs/cli_rs/edenfsctl:edenfsctl",
         "EDENFS_FAKE_EDENFS": "//eden/integration/helpers:fake_edenfs",
         "EDENFS_SNAPSHOTS": "//eden/test-data:snapshots",
+        "EDEN_TSAN_SUPPRESSIONS": "//eden/scm/tests:tsan_suppressions",
         "HG_ETC_MERCURIAL": "//eden/scm/fb/staticfiles:etc_mercurial",
         "MKSCRATCH_BIN": "//eden/scm/exec/scratch:scratch",
     })
 
     envs = {
         "CHGDISABLE": "1",
+        "EDENFS_DAEMON_TSAN_OPTIONS": DAEMON_TSAN_OPTIONS,
         "EDENFS_SUFFIX": suffix,
     }
     deps = []
@@ -92,6 +103,17 @@ def get_test_env_and_deps(suffix = ""):
     for name, dep in sorted(env_to_target.items()):
         envs[name] = "$(location %s)" % dep
         deps.append(dep)
+
+    edenfs = "//eden/integration/helpers:edenfs{}_with_sanitizer_env".format(suffix)
+    envs["EDENFS_SERVER_PATH"] = "$(exe_target %s)" % edenfs
+    deps.append(edenfs)
+    deps.append("//eden/integration/helpers:tsan_suppressions")
+
+    hg = "//eden/scm/tests:sl_with_sanitizer_env"
+    envs["HG_REAL_BIN"] = "$(exe_target %s)" % hg
+    if read_bool("fbcode", "mode_win_enabled", False):
+        envs["EDEN_HG_BINARY"] = envs["HG_REAL_BIN"]
+    deps.append(hg)
 
     # This one needs to be $(exe_target) since it's a command_alias.
     edenfsctl = "//eden/fs/cli_rs:edenfsctl-run{}".format(suffix)

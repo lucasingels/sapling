@@ -11,10 +11,14 @@
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
 #include "eden/fs/inodes/test/OverlayTestUtil.h"
 
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <fmt/format.h>
 #include <folly/Exception.h>
 #include <folly/Expected.h>
 #include <folly/FileUtil.h>
 #include <folly/Range.h>
+#include <folly/ScopeGuard.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/logging/test/TestLogHandler.h>
 #include <folly/synchronization/Baton.h>
@@ -24,19 +28,29 @@
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <optional>
+#include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <thread>
+#include <tuple>
 
 #include "eden/common/testharness/TempFile.h"
+#include "eden/common/utils/Bug.h"
 #include "eden/common/utils/SpawnedProcess.h"
+#include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/config/TomlFileConfigSource.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
+#include "eden/fs/inodes/InodeMetadata.h"
+#include "eden/fs/inodes/InodeTable.h"
 #include "eden/fs/inodes/OverlayFile.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/fscatalog/InodePath.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
 #include "eden/fs/model/TestOps.h"
-#include "eden/fs/service/PrettyPrinters.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/test/CapturingXplatLogger.h"
@@ -748,6 +762,29 @@ TEST_P(RawOverlayTest, max_inode_number_is_1_if_overlay_is_empty) {
   EXPECT_EQ(2_ino, overlay->allocateInodeNumber());
 }
 
+// An unclean restart rediscovers the next inode number by scanning the
+// overlay, so numbers above the highest referenced one get handed out again.
+// Metadata records for those numbers belong to inodes that no longer exist,
+// and a new inode must not inherit them.
+TEST_P(RawOverlayTest, uncleanRestartDropsMetadataAboveNextInodeNumber) {
+  auto ino = overlay->allocateInodeNumber();
+  auto record = [] {
+    return InodeMetadata{S_IFLNK | 0755, 0, 0, InodeTimestamps{}};
+  };
+  // The root is the highest inode number the scan finds, so its record is
+  // the last one that must survive.
+  overlay->getInodeMetadataTable()->populateIfNotSet(kRootNodeId, record);
+  overlay->getInodeMetadataTable()->populateIfNotSet(ino, record);
+  ASSERT_TRUE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+
+  recreate(OverlayRestartMode::UNCLEAN);
+
+  EXPECT_TRUE(
+      overlay->getInodeMetadataTable()->getOptional(kRootNodeId).has_value());
+  EXPECT_FALSE(overlay->getInodeMetadataTable()->getOptional(ino).has_value());
+  EXPECT_EQ(ino, overlay->allocateInodeNumber());
+}
+
 TEST_P(RawOverlayTest, allocateInodeNumbers) {
   // Allocate a range of 5 inode numbers starting from 2
   auto start = overlay->allocateInodeNumbers(5);
@@ -1425,9 +1462,11 @@ TEST(PlainOverlayTest, no_semaphore_allows_concurrent_fsck) {
 
 namespace {
 
-// Initialize a fully-functional Overlay with WAL enabled and return the
-// underlying FsFileContentStore so tests can poke the WAL directly.
+// Initialize an Overlay with configurable WAL behavior and return the
+// underlying FsFileContentStore so tests can inspect WAL persistence.
 struct WalLifecycleOverlay {
+  // Overlay borrows this logger, so it must outlive the overlay.
+  std::unique_ptr<ErrorLogger> errorLogger;
   std::shared_ptr<Overlay> overlay;
   FsFileContentStore* store{nullptr};
   EdenStatsPtr stats;
@@ -1436,21 +1475,28 @@ struct WalLifecycleOverlay {
 WalLifecycleOverlay makeWalLifecycleOverlay(
     const AbsolutePath& dir,
     CaseSensitivity caseSensitive = kPathMapDefaultCaseSensitive,
-    uint64_t walMinCompactionThreshold = 0) {
+    uint64_t walMinCompactionThreshold = 0,
+    bool cacheWalFiles = true,
+    bool useWal = true,
+    bool writeWalV2 = false) {
   auto rawConfig = EdenConfig::createTestEdenConfig();
-  rawConfig->overlayUseWal.setValue(true, ConfigSourceType::CommandLine);
+  rawConfig->overlayUseWal.setValue(useWal, ConfigSourceType::CommandLine);
+  rawConfig->overlayWalWriteV2.setValue(
+      writeWalV2, ConfigSourceType::CommandLine);
+  rawConfig->experimentalOverlayCacheWalFiles.setValue(
+      cacheWalFiles, ConfigSourceType::CommandLine);
   rawConfig->experimentalOverlayWalMinCompactionThreshold.setValue(
       walMinCompactionThreshold, ConfigSourceType::CommandLine);
   auto reloadable = std::make_shared<ReloadableConfig>(rawConfig);
   auto stats = makeRefPtr<EdenStats>();
-  auto noopErrorLogger = makeTestErrorLogger();
+  auto errorLogger = std::make_unique<ErrorLogger>(makeTestErrorLogger());
   auto overlay = Overlay::create(
       dir,
       caseSensitive,
       kInodeCatalogType,
       kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
-      /*errorLogger=*/noopErrorLogger,
+      /*errorLogger=*/*errorLogger,
       stats.copy(),
       *rawConfig);
   overlay->initialize(reloadable).get();
@@ -1460,10 +1506,30 @@ WalLifecycleOverlay makeWalLifecycleOverlay(
   OverlayTestHelper::setWalCompactionRng(*overlay, [] { return 1u; });
   auto* store =
       dynamic_cast<FsFileContentStore*>(overlay->getRawFileContentStore());
-  return {std::move(overlay), store, std::move(stats)};
+  return {std::move(errorLogger), std::move(overlay), store, std::move(stats)};
+}
+
+/// Return the temporary base-file path used when saving an overlay directory.
+boost::filesystem::path overlayDirTempFilePath(
+    const boost::filesystem::path& root,
+    InodeNumber inode) {
+  return root / "sharded_tmp" / fmt::format("{:02x}", inode.get() % 256) /
+      std::to_string(inode.get());
 }
 
 } // namespace
+
+TEST(OverlayWalLifecycleTest, writeFailureKeepsErrorLoggerAlive) {
+  folly::test::TemporaryDirectory tmp("eden_wal_write_failure");
+  auto bundle = makeWalLifecycleOverlay(canonicalPath(tmp.path().string()));
+  const auto parent = bundle.overlay->allocateInodeNumber();
+  const auto blocker = overlayDirTempFilePath(tmp.path(), parent);
+  ASSERT_TRUE(boost::filesystem::create_directory(blocker));
+  DirContents content(kPathMapDefaultCaseSensitive);
+  EXPECT_THROW(
+      bundle.overlay->saveOverlayDir(parent, content), std::system_error);
+  bundle.overlay->close();
+}
 
 TEST(OverlayWalLifecycleTest, saveOverlayDirRemovesExistingWal) {
   folly::test::TemporaryDirectory tmp("eden_wal_lifecycle");
@@ -1628,14 +1694,14 @@ TEST(WalCompactionTest, nonWalCatalogDoesNotInvokeRng) {
   auto overlay = Overlay::create(
       path,
       kPathMapDefaultCaseSensitive,
-      InodeCatalogType::InMemory,
+      InodeCatalogType::LegacyEphemeral,
       kInodeCatalogOptions,
       makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       makeRefPtr<EdenStats>(),
       *config);
   // RNG that would always compact — but canHaveWalFiles() is false for
-  // InMemory, so the RNG must never be called and no compaction may run.
+  // LegacyEphemeral, so the RNG must never be called and no compaction may run.
   size_t rngCalls = 0;
   OverlayTestHelper::setWalCompactionRng(*overlay, [&] {
     ++rngCalls;
@@ -1649,6 +1715,23 @@ TEST(WalCompactionTest, nonWalCatalogDoesNotInvokeRng) {
   }
 
   EXPECT_EQ(0u, rngCalls);
+}
+
+TEST(PlainOverlayTest, inMemoryRequiresWindows) {
+  folly::test::TemporaryDirectory testDir;
+  auto noopErrorLogger = makeTestErrorLogger();
+  EXPECT_THROW_RE(
+      Overlay::create(
+          canonicalPath(testDir.path().string()),
+          kPathMapDefaultCaseSensitive,
+          InodeCatalogType::InMemory,
+          kInodeCatalogOptions,
+          makeTestEdenFsEventsLogger(),
+          /*errorLogger=*/noopErrorLogger,
+          makeRefPtr<EdenStats>(),
+          *EdenConfig::createTestEdenConfig()),
+      std::runtime_error,
+      "InMemory overlay type is only supported on Windows");
 }
 
 TEST(WalCompactionTest, hardCapForcesCompactionEvenWhenRngMisses) {
@@ -1724,6 +1807,88 @@ TEST(OverlayLoadWalTest, loadAppliesDelta) {
   EXPECT_FALSE(bundle.store->hasWal(parent));
 
   bundle.overlay->close();
+}
+
+// A WAL ADD the Overlay cannot represent, because its inode number was never
+// allocated or its mode has bits DirEntry cannot hold, is dropped from the
+// merged directory instead of aborting on the DirEntry or visitDirEntries
+// checks. The drop counts as a parse error, so the base is rewritten and the
+// WAL removed.
+class OverlayLoadCorruptWalTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    bundle_ = makeWalLifecycleOverlay(canonicalPath(tmp_.path().string()));
+    ASSERT_NE(nullptr, bundle_.store);
+    parent_ = bundle_.overlay->allocateInodeNumber();
+    DirContents base(kPathMapDefaultCaseSensitive);
+    base.emplace(
+        "a"_pc, S_IFREG | 0644, bundle_.overlay->allocateInodeNumber());
+    bundle_.overlay->saveOverlayDir(parent_, base);
+  }
+
+  void TearDown() override {
+    bundle_.overlay->close();
+  }
+
+  void appendAdd(PathComponentPiece name, int32_t mode, uint64_t inodeNumber) {
+    overlay::OverlayEntry entry;
+    entry.mode() = mode;
+    entry.inodeNumber() = inodeNumber;
+    bundle_.store->appendWalEntry(parent_, WalOpType::ADD, name, &entry);
+  }
+
+  void expectOnlyBaseEntrySurvives() {
+    auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+    EXPECT_EQ(1u, loaded.size());
+    EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+    EXPECT_FALSE(bundle_.store->hasWal(parent_));
+  }
+
+  folly::test::TemporaryDirectory tmp_{"eden_wal_load_corrupt"};
+  WalLifecycleOverlay bundle_;
+  InodeNumber parent_;
+};
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithUnallocatedInodeNumber) {
+  appendAdd(
+      "bogus"_pc,
+      S_IFREG | 0644,
+      bundle_.overlay->getMaxInodeNumber().get() + 1000);
+  expectOnlyBaseEntrySurvives();
+}
+
+TEST_F(OverlayLoadCorruptWalTest, dropsAddWithInvalidMode) {
+  appendAdd(
+      "bogus"_pc,
+      0x0f000000 | S_IFREG | 0644,
+      bundle_.overlay->allocateInodeNumber().get());
+  expectOnlyBaseEntrySurvives();
+}
+
+// fsck folds WAL entries into the base file without being able to check
+// their modes, so the base is validated the same way: an entry with a mode
+// DirEntry cannot hold is dropped and the base rewritten without it.
+TEST_F(OverlayLoadCorruptWalTest, dropsBaseEntryWithInvalidMode) {
+  overlay::OverlayEntry good;
+  good.mode() = S_IFREG | 0644;
+  good.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayEntry bad;
+  bad.mode() = 0x0f000000 | S_IFREG | 0644;
+  bad.inodeNumber() = bundle_.overlay->allocateInodeNumber().get();
+  overlay::OverlayDir dir;
+  dir.entries()->emplace("a", good);
+  dir.entries()->emplace("bogus", bad);
+  auto* catalog = bundle_.overlay->getRawInodeCatalog();
+  catalog->saveOverlayDir(parent_, std::move(dir));
+
+  auto loaded = bundle_.overlay->loadOverlayDir(parent_);
+  EXPECT_EQ(1u, loaded.size());
+  EXPECT_NE(loaded.end(), loaded.find("a"_pc));
+
+  auto rewritten = catalog->loadOverlayDir(parent_);
+  ASSERT_TRUE(rewritten.has_value());
+  EXPECT_EQ(1u, rewritten->entries()->size());
+  EXPECT_EQ(1u, rewritten->entries()->count("a"));
 }
 
 TEST(OverlayLoadWalTest, collapsedAddRemoveIsApplied) {
@@ -1956,6 +2121,628 @@ TEST(WalRenameTest, sameDirRenameAppendsBothEntries) {
   bundle.overlay->close();
 }
 
+/// Checks variable-length object IDs through WAL-backed directory mutations.
+class OverlayWalObjectIdTest
+    : public ::testing::TestWithParam<std::tuple<size_t, bool>> {
+ protected:
+  enum class Mutation {
+    Add,
+    RenameWithinDirectory,
+    RenameAcrossDirectories,
+    RenameOverExistingEntry,
+    RenameCaseOnly,
+  };
+
+  void verifyMutation(Mutation mutation, const AbsolutePath& dir) {
+    const auto [idSize, cacheWalFiles] = GetParam();
+    const bool crossDirectory = mutation == Mutation::RenameAcrossDirectories;
+    const bool caseOnly = mutation == Mutation::RenameCaseOnly;
+    const auto caseSensitivity =
+        caseOnly ? CaseSensitivity::Insensitive : CaseSensitivity::Sensitive;
+    const auto srcName = "source"_pc;
+    const auto dstName = caseOnly ? "SOURCE"_pc : "target"_pc;
+    constexpr auto kMode = S_IFREG | 0640;
+    constexpr auto kAclState = AclRootState::RestrictedAclRoot;
+    std::string idBytes(idSize, '\x85');
+    idBytes[idSize / 2] = '\0';
+    const ObjectId id{folly::ByteRange{folly::StringPiece{idBytes}}};
+
+    auto bundle = makeWalLifecycleOverlay(
+        dir,
+        caseSensitivity,
+        0,
+        cacheWalFiles,
+        /*useWal=*/true,
+        /*writeWalV2=*/true);
+    ASSERT_NE(nullptr, bundle.store);
+    const auto src = bundle.overlay->allocateInodeNumber();
+    const auto dst =
+        crossDirectory ? bundle.overlay->allocateInodeNumber() : src;
+    const auto child = bundle.overlay->allocateInodeNumber();
+    DirContents srcContent(caseSensitivity);
+    DirContents separateDstContent(caseSensitivity);
+    auto& dstContent = crossDirectory ? separateDstContent : srcContent;
+    if (mutation != Mutation::Add) {
+      srcContent.emplace(srcName, kMode, child, id, kAclState);
+    }
+    bundle.overlay->saveOverlayDir(src, srcContent);
+    if (crossDirectory) {
+      bundle.overlay->saveOverlayDir(dst, dstContent);
+    }
+
+    // Exercise a nonempty WAL, including a conflicting destination record.
+    if (!caseOnly) {
+      const auto replaced = bundle.overlay->allocateInodeNumber();
+      auto [it, inserted] =
+          dstContent.emplace(dstName, S_IFREG | 0600, replaced);
+      ASSERT_TRUE(inserted);
+      bundle.overlay->addChild(dst, *it, dstContent);
+      if (mutation != Mutation::RenameOverExistingEntry) {
+        dstContent.erase(dstName);
+        bundle.overlay->removeChild(dst, dstName, dstContent);
+      }
+    }
+    const auto sentinel = bundle.overlay->allocateInodeNumber();
+    auto [sentinelIt, inserted] =
+        dstContent.emplace("sentinel"_pc, S_IFREG | 0644, sentinel);
+    ASSERT_TRUE(inserted);
+    bundle.overlay->addChild(dst, *sentinelIt, dstContent);
+    ASSERT_TRUE(bundle.store->hasWal(dst));
+
+    if (mutation != Mutation::Add) {
+      srcContent.erase(srcName);
+    }
+    dstContent.erase(dstName);
+    auto [childIt, childInserted] =
+        dstContent.emplace(dstName, kMode, child, id, kAclState);
+    ASSERT_TRUE(childInserted);
+    if (mutation == Mutation::Add) {
+      bundle.overlay->addChild(dst, *childIt, dstContent);
+    } else {
+      bundle.overlay->renameChild(
+          src, dst, srcName, dstName, srcContent, dstContent);
+    }
+    EXPECT_TRUE(bundle.store->hasWal(dst));
+
+    const auto later = bundle.overlay->allocateInodeNumber();
+    auto [laterIt, laterInserted] =
+        dstContent.emplace("later"_pc, S_IFREG | 0644, later);
+    ASSERT_TRUE(laterInserted);
+    bundle.overlay->addChild(dst, *laterIt, dstContent);
+    bundle.overlay->close();
+
+    auto reopened =
+        makeWalLifecycleOverlay(dir, caseSensitivity, 0, cacheWalFiles);
+    auto loaded = reopened.overlay->loadOverlayDir(dst);
+    ASSERT_EQ(3u, loaded.size());
+    auto loadedChild = loaded.find(dstName);
+    ASSERT_NE(loaded.end(), loadedChild);
+    EXPECT_EQ(dstName.view(), loadedChild->first.view());
+    EXPECT_EQ(child, loadedChild->second.getInodeNumber());
+    ASSERT_FALSE(loadedChild->second.isMaterialized());
+    EXPECT_EQ(id, loadedChild->second.getObjectId());
+    EXPECT_EQ(kMode, loadedChild->second.getInitialMode());
+    EXPECT_EQ(kAclState, loadedChild->second.aclRootState());
+    EXPECT_EQ(sentinel, loaded.at("sentinel"_pc).getInodeNumber());
+    EXPECT_EQ(later, loaded.at("later"_pc).getInodeNumber());
+    if (crossDirectory) {
+      EXPECT_TRUE(reopened.overlay->loadOverlayDir(src).empty());
+    } else if (!caseOnly) {
+      EXPECT_EQ(loaded.end(), loaded.find(srcName));
+    }
+    reopened.overlay->close();
+  }
+
+  void runMutation(Mutation mutation) {
+    folly::test::TemporaryDirectory tmp("eden_wal_object_id");
+    verifyMutation(mutation, canonicalPath(tmp.path().string()));
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    ObjectIdBoundaries,
+    OverlayWalObjectIdTest,
+    ::testing::Combine(::testing::Values(255u, 256u, 262u), ::testing::Bool()),
+    [](const ::testing::TestParamInfo<OverlayWalObjectIdTest::ParamType>&
+           info) {
+      return "Bytes" + std::to_string(std::get<0>(info.param)) +
+          (std::get<1>(info.param) ? "Cached" : "Uncached");
+    });
+
+TEST_P(OverlayWalObjectIdTest, addPreservesObjectIdAcrossRestart) {
+  runMutation(Mutation::Add);
+}
+
+TEST_P(
+    OverlayWalObjectIdTest,
+    sameDirectoryRenamePreservesObjectIdAcrossRestart) {
+  runMutation(Mutation::RenameWithinDirectory);
+}
+
+TEST_P(
+    OverlayWalObjectIdTest,
+    crossDirectoryRenamePreservesObjectIdAcrossRestart) {
+  runMutation(Mutation::RenameAcrossDirectories);
+}
+
+TEST_P(
+    OverlayWalObjectIdTest,
+    renameOverExistingEntryPreservesObjectIdAcrossRestart) {
+  runMutation(Mutation::RenameOverExistingEntry);
+}
+
+TEST_P(OverlayWalObjectIdTest, caseOnlyRenamePreservesObjectIdAcrossRestart) {
+  runMutation(Mutation::RenameCaseOnly);
+}
+
+TEST(OverlayWalFormatTest, oversizedObjectIdRewritesVersion1WalDirectory) {
+  folly::test::TemporaryDirectory tmp("eden_wal_format_fallback");
+  const auto dir = canonicalPath(tmp.path().string());
+  auto version1 = makeWalLifecycleOverlay(dir);
+  ASSERT_NE(nullptr, version1.store);
+  const auto src = version1.overlay->allocateInodeNumber();
+  const auto dst = version1.overlay->allocateInodeNumber();
+  const auto child = version1.overlay->allocateInodeNumber();
+  const auto sentinel = version1.overlay->allocateInodeNumber();
+  const ObjectId id{std::string(262, '\x85')};
+  DirContents srcContent(CaseSensitivity::Sensitive);
+  srcContent.emplace("source"_pc, S_IFREG | 0644, child, id);
+  DirContents dstContent(CaseSensitivity::Sensitive);
+  version1.overlay->saveOverlayDir(src, srcContent);
+  version1.overlay->saveOverlayDir(dst, dstContent);
+  auto [sentinelIt, inserted] =
+      dstContent.emplace("sentinel"_pc, S_IFREG | 0644, sentinel);
+  ASSERT_TRUE(inserted);
+  version1.overlay->addChild(dst, *sentinelIt, dstContent);
+  ASSERT_TRUE(version1.store->hasWal(dst));
+  version1.overlay->close();
+
+  // The 262-byte ID cannot be appended to dst's headerless v1 WAL, so the
+  // rename falls back to a full rewrite of dst, which retires that WAL.
+  auto enabled = makeWalLifecycleOverlay(
+      dir,
+      CaseSensitivity::Sensitive,
+      0,
+      true,
+      /*useWal=*/true,
+      /*writeWalV2=*/true);
+  srcContent.erase("source"_pc);
+  dstContent.emplace("target"_pc, S_IFREG | 0644, child, id);
+  enabled.overlay->renameChild(
+      src, dst, "source"_pc, "target"_pc, srcContent, dstContent);
+  EXPECT_FALSE(enabled.store->hasWal(dst));
+
+  // The next mutation starts a fresh WAL in the configured v2 format.
+  const auto later = enabled.overlay->allocateInodeNumber();
+  auto [laterIt, laterInserted] =
+      dstContent.emplace("later"_pc, S_IFREG | 0644, later);
+  ASSERT_TRUE(laterInserted);
+  enabled.overlay->addChild(dst, *laterIt, dstContent);
+  std::string walBytes;
+  ASSERT_TRUE(
+      folly::readFile(
+          (dir + RelativePathPiece{FsFileContentStore::getWalPath(dst)})
+              .c_str(),
+          walBytes));
+  EXPECT_EQ("OVWL", walBytes.substr(0, 4));
+  enabled.overlay->close();
+
+  auto reopened = makeWalLifecycleOverlay(dir);
+  const auto loaded = reopened.overlay->loadOverlayDir(dst);
+  ASSERT_EQ(3u, loaded.size());
+  EXPECT_EQ(id, loaded.at("target"_pc).getObjectId());
+  EXPECT_EQ(child, loaded.at("target"_pc).getInodeNumber());
+  EXPECT_EQ(sentinel, loaded.at("sentinel"_pc).getInodeNumber());
+  EXPECT_EQ(later, loaded.at("later"_pc).getInodeNumber());
+  EXPECT_TRUE(reopened.overlay->loadOverlayDir(src).empty());
+  reopened.overlay->close();
+}
+
+namespace {
+
+/// Preserve the real catalog's I/O while injecting a WAL cleanup failure.
+class FailingWalRemovalCatalog : public FsInodeCatalog {
+ public:
+  FailingWalRemovalCatalog(FsFileContentStore* store, InodeNumber failedParent)
+      : FsInodeCatalog{store}, failedParent_{failedParent} {}
+
+  void removeWal(InodeNumber parent) override {
+    if (parent == failedParent_) {
+      ++failedRemovals_;
+      throw std::system_error{EIO, std::generic_category()};
+    }
+    FsInodeCatalog::removeWal(parent);
+  }
+
+  /// Normal compaction swallows removeWal errors, so the injected failure
+  /// is otherwise invisible to the test.
+  size_t failedRemovals() const {
+    return failedRemovals_;
+  }
+
+ private:
+  const InodeNumber failedParent_;
+  size_t failedRemovals_{0};
+};
+
+} // namespace
+
+/// Checks that a rename survives a restart when the destination's WAL cannot
+/// be removed after compaction rewrites its base file, leaving a stale WAL to
+/// be re-merged on load.
+class OverlayWalCleanupFailureTest
+    : public ::testing::TestWithParam<std::tuple<WalOpType, bool>> {
+ protected:
+  void verifyRename() {
+    const auto [priorOp, crossDirectory] = GetParam();
+    const auto dir = canonicalPath(tmp_.path().string());
+    auto bundle = makeWalLifecycleOverlay(dir);
+    ASSERT_NE(nullptr, bundle.store);
+    const auto src = bundle.overlay->allocateInodeNumber();
+    const auto dst =
+        crossDirectory ? bundle.overlay->allocateInodeNumber() : src;
+    const auto child = bundle.overlay->allocateInodeNumber();
+    const ObjectId id{std::string(20, '\x85')};
+    DirContents srcContent(CaseSensitivity::Sensitive);
+    DirContents separateDstContent(CaseSensitivity::Sensitive);
+    auto& dstContent = crossDirectory ? separateDstContent : srcContent;
+    srcContent.emplace("source"_pc, S_IFREG | 0644, child, id);
+    bundle.overlay->saveOverlayDir(src, srcContent);
+    if (crossDirectory) {
+      bundle.overlay->saveOverlayDir(dst, dstContent);
+    }
+
+    const auto priorChild = bundle.overlay->allocateInodeNumber();
+    const ObjectId priorId{std::string(20, '\x42')};
+    auto [priorIt, priorInserted] =
+        dstContent.emplace("target"_pc, S_IFREG | 0600, priorChild, priorId);
+    ASSERT_TRUE(priorInserted);
+    if (priorOp == WalOpType::MATERIALIZE) {
+      bundle.overlay->saveOverlayDir(dst, dstContent);
+    } else {
+      bundle.overlay->addChild(dst, *priorIt, dstContent);
+    }
+    if (priorOp == WalOpType::REMOVE) {
+      dstContent.erase("target"_pc);
+      bundle.overlay->removeChild(dst, "target"_pc, dstContent);
+    } else if (priorOp == WalOpType::MATERIALIZE) {
+      priorIt->second.setMaterialized();
+      bundle.overlay->materializeChild(dst, "target"_pc, dstContent);
+    }
+    const auto sentinel = bundle.overlay->allocateInodeNumber();
+    auto [sentinelIt, sentinelInserted] =
+        dstContent.emplace("sentinel"_pc, S_IFREG | 0644, sentinel);
+    ASSERT_TRUE(sentinelInserted);
+    bundle.overlay->addChild(dst, *sentinelIt, dstContent);
+    ASSERT_TRUE(bundle.store->hasWal(dst));
+
+    auto failingCatalog =
+        std::make_unique<FailingWalRemovalCatalog>(bundle.store, dst);
+    auto* const failingCatalogPtr = failingCatalog.get();
+    OverlayTestHelper::setInodeCatalog(
+        *bundle.overlay, std::move(failingCatalog));
+    // removeWal is only reached through compaction, which
+    // makeWalLifecycleOverlay disables by default. Force every append to
+    // compact so the rename rewrites the base file and then fails to clear the
+    // WAL.
+    OverlayTestHelper::setWalCompactionRng(*bundle.overlay, [] { return 0u; });
+    srcContent.erase("source"_pc);
+    dstContent.erase("target"_pc);
+    dstContent.emplace("target"_pc, S_IFREG | 0644, child, id);
+    bundle.overlay->renameChild(
+        src, dst, "source"_pc, "target"_pc, srcContent, dstContent);
+    EXPECT_GE(failingCatalogPtr->failedRemovals(), 1u);
+    EXPECT_TRUE(bundle.store->hasWal(dst));
+    bundle.overlay->close();
+
+    auto reopened = makeWalLifecycleOverlay(dir);
+    const auto loadedSrc = reopened.overlay->loadOverlayDir(src);
+    const auto loadedDst = reopened.overlay->loadOverlayDir(dst);
+    const auto preservesChild = [&](const DirContents& content,
+                                    PathComponentPiece name) {
+      const auto it = content.find(name);
+      return it != content.end() && it->second.getInodeNumber() == child &&
+          !it->second.isMaterialized() && it->second.getObjectId() == id;
+    };
+    EXPECT_TRUE(preservesChild(loadedDst, "target"_pc));
+    EXPECT_EQ(loadedSrc.end(), loadedSrc.find("source"_pc));
+    const auto loadedSentinel = loadedDst.find("sentinel"_pc);
+    ASSERT_NE(loadedDst.end(), loadedSentinel);
+    EXPECT_EQ(sentinel, loadedSentinel->second.getInodeNumber());
+    reopened.overlay->close();
+  }
+
+ private:
+  folly::test::TemporaryDirectory tmp_{"eden_wal_cleanup_failure"};
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    ConflictingWal,
+    OverlayWalCleanupFailureTest,
+    ::testing::Combine(
+        ::testing::Values(
+            WalOpType::ADD,
+            WalOpType::REMOVE,
+            WalOpType::MATERIALIZE),
+        ::testing::Bool()),
+    [](const ::testing::TestParamInfo<OverlayWalCleanupFailureTest::ParamType>&
+           info) {
+      std::string name;
+      switch (std::get<0>(info.param)) {
+        case WalOpType::ADD:
+          name = "Add";
+          break;
+        case WalOpType::REMOVE:
+          name = "Remove";
+          break;
+        case WalOpType::MATERIALIZE:
+          name = "Materialize";
+          break;
+        default:
+          name = "Unknown";
+          break;
+      }
+      return name +
+          (std::get<1>(info.param) ? "CrossDirectory" : "SameDirectory");
+    });
+
+TEST_P(OverlayWalCleanupFailureTest, renamePreservesChildWhenWalCleanupFails) {
+  verifyRename();
+}
+
+namespace {
+
+enum class WalV2Scenario {
+  AppendFailure,
+  AppendFailureDuringDeferral,
+  MissingBaseSuccess,
+  SourceRemoveFailure,
+  AddWithoutWal,
+};
+
+constexpr std::string_view kWalAppendFailure{"injected WAL append failure"};
+
+/// Delegate persistence to the real catalog except at one selected boundary.
+class FailingWalAppendCatalog : public FsInodeCatalog {
+ public:
+  FailingWalAppendCatalog(
+      FsFileContentStore* store,
+      InodeNumber source,
+      InodeNumber destination,
+      WalV2Scenario scenario)
+      : FsInodeCatalog{store},
+        source_{source},
+        destination_{destination},
+        scenario_{scenario} {}
+
+  uint64_t appendWalEntry(
+      InodeNumber parent,
+      WalOpType op,
+      PathComponentPiece name,
+      const overlay::OverlayEntry* entry) override {
+    if (parent == destination_ && op == WalOpType::ADD &&
+        (scenario_ == WalV2Scenario::AppendFailure ||
+         scenario_ == WalV2Scenario::AppendFailureDuringDeferral)) {
+      fail();
+    }
+    if (parent == source_ && op == WalOpType::REMOVE &&
+        scenario_ == WalV2Scenario::SourceRemoveFailure) {
+      fail();
+    }
+    return FsInodeCatalog::appendWalEntry(parent, op, name, entry);
+  }
+
+ private:
+  [[noreturn]] static void fail() {
+    throw std::system_error{
+        EIO, std::generic_category(), std::string{kWalAppendFailure}};
+  }
+
+  /// Parents whose destination checkpoint and source removal are observed.
+  const InodeNumber source_;
+  const InodeNumber destination_;
+  /// The selected fault; success scenarios delegate every operation.
+  const WalV2Scenario scenario_;
+};
+
+} // namespace
+
+/**
+ * With v2 WALs an oversized object ID is an ordinary append. Checks that the
+ * entry survives a reopen, and what survives on each side of the append when
+ * it fails, including under checkout deferral and with the base missing.
+ */
+class OverlayWalVersion2Test : public ::testing::TestWithParam<WalV2Scenario> {
+ protected:
+  void verifyRecovery() {
+    const auto scenario = GetParam();
+    const bool add = scenario == WalV2Scenario::AddWithoutWal;
+    const bool defer = scenario == WalV2Scenario::AppendFailureDuringDeferral;
+    const bool missingBase =
+        defer || scenario == WalV2Scenario::MissingBaseSuccess;
+    const bool expectFailure =
+        !add && scenario != WalV2Scenario::MissingBaseSuccess;
+    const bool destinationPersisted =
+        !expectFailure || scenario == WalV2Scenario::SourceRemoveFailure;
+    const auto dir = canonicalPath(tmp_.path().string());
+    auto bundle = makeWalLifecycleOverlay(
+        dir,
+        CaseSensitivity::Sensitive,
+        0,
+        true,
+        /*useWal=*/true,
+        /*writeWalV2=*/true);
+    ASSERT_NE(nullptr, bundle.store);
+    const auto src = bundle.overlay->allocateInodeNumber();
+    const auto dst = bundle.overlay->allocateInodeNumber();
+    const auto child = bundle.overlay->allocateInodeNumber();
+    const auto prior = bundle.overlay->allocateInodeNumber();
+    const auto sentinel = bundle.overlay->allocateInodeNumber();
+    const auto later = bundle.overlay->allocateInodeNumber();
+    std::string idBytes(256, '\x85');
+    idBytes[idBytes.size() / 2] = '\0';
+    const ObjectId id{folly::ByteRange{folly::StringPiece{idBytes}}};
+    const ObjectId priorId{std::string(20, '\x42')};
+    const ObjectId sentinelId{std::string(20, '\x43')};
+    const ObjectId laterId{std::string(20, '\x44')};
+    constexpr auto kMode = S_IFREG | 0640;
+    constexpr auto kAclState = AclRootState::RestrictedAclRoot;
+    DirContents srcContent(CaseSensitivity::Sensitive);
+    DirContents dstContent(CaseSensitivity::Sensitive);
+
+    if (!add) {
+      srcContent.emplace("source"_pc, kMode, child, id, kAclState);
+      bundle.overlay->saveOverlayDir(src, srcContent);
+    }
+    if (!missingBase) {
+      bundle.overlay->saveOverlayDir(dst, dstContent);
+    }
+    if (!add) {
+      auto [priorIt, priorInserted] =
+          dstContent.emplace("target"_pc, S_IFREG | 0600, prior, priorId);
+      ASSERT_TRUE(priorInserted);
+      bundle.overlay->addChild(dst, *priorIt, dstContent);
+      auto [sentinelIt, sentinelInserted] = dstContent.emplace(
+          "sentinel"_pc, S_IFREG | 0644, sentinel, sentinelId);
+      ASSERT_TRUE(sentinelInserted);
+      bundle.overlay->addChild(dst, *sentinelIt, dstContent);
+    }
+    ASSERT_EQ(!add, bundle.store->hasWal(dst));
+    ASSERT_EQ(
+        !missingBase, bundle.overlay->getRawInodeCatalog()->hasOverlayDir(dst));
+
+    OverlayTestHelper::setInodeCatalog(
+        *bundle.overlay,
+        std::make_unique<FailingWalAppendCatalog>(
+            bundle.store, src, dst, scenario));
+    srcContent.erase("source"_pc);
+    dstContent.erase("target"_pc);
+    auto [targetIt, targetInserted] =
+        dstContent.emplace("target"_pc, kMode, child, id, kAclState);
+    ASSERT_TRUE(targetInserted);
+    bool failed = false;
+    {
+      if (defer) {
+        bundle.overlay->enterCheckoutDeferral();
+      }
+      SCOPE_EXIT {
+        if (defer) {
+          bundle.overlay->exitCheckoutDeferral();
+        }
+      };
+      try {
+        if (add) {
+          bundle.overlay->addChild(dst, *targetIt, dstContent);
+        } else {
+          bundle.overlay->renameChild(
+              src, dst, "source"_pc, "target"_pc, srcContent, dstContent);
+        }
+      } catch (const std::system_error& error) {
+        failed = true;
+        EXPECT_EQ(std::error_code(EIO, std::generic_category()), error.code());
+        EXPECT_NE(
+            std::string::npos,
+            std::string{error.what()}.find(kWalAppendFailure));
+      }
+    }
+    EXPECT_EQ(expectFailure, failed);
+    // Nothing compacts here, so the destination keeps its WAL whether the
+    // append succeeded or failed, and that WAL is in the v2 layout.
+    if (!add) {
+      ASSERT_TRUE(bundle.store->hasWal(dst));
+      std::string walBytes;
+      ASSERT_TRUE(
+          folly::readFile(
+              (dir + RelativePathPiece{FsFileContentStore::getWalPath(dst)})
+                  .c_str(),
+              walBytes));
+      EXPECT_EQ("OVWL", walBytes.substr(0, 4));
+    }
+
+    if (add) {
+      auto [laterIt, laterInserted] =
+          dstContent.emplace("later"_pc, S_IFREG | 0644, later, laterId);
+      ASSERT_TRUE(laterInserted);
+      bundle.overlay->addChild(dst, *laterIt, dstContent);
+      ASSERT_TRUE(bundle.store->hasWal(dst));
+    }
+    bundle.overlay->close();
+
+    auto reopened = makeWalLifecycleOverlay(
+        dir, CaseSensitivity::Sensitive, 0, true, /*useWal=*/!add);
+    const auto loadedDst = reopened.overlay->loadOverlayDir(dst);
+    ASSERT_EQ(2u, loadedDst.size());
+    if (destinationPersisted) {
+      expectEntry(loadedDst, "target"_pc, child, id, kMode, kAclState);
+    } else {
+      expectEntry(loadedDst, "target"_pc, prior, priorId, S_IFREG | 0600);
+    }
+    if (add) {
+      expectEntry(loadedDst, "later"_pc, later, laterId, S_IFREG | 0644);
+      EXPECT_FALSE(reopened.store->hasWal(dst));
+    } else {
+      expectEntry(
+          loadedDst, "sentinel"_pc, sentinel, sentinelId, S_IFREG | 0644);
+      const auto loadedSrc = reopened.overlay->loadOverlayDir(src);
+      if (expectFailure) {
+        ASSERT_EQ(1u, loadedSrc.size());
+        expectEntry(loadedSrc, "source"_pc, child, id, kMode, kAclState);
+      } else {
+        EXPECT_TRUE(loadedSrc.empty());
+      }
+    }
+    reopened.overlay->close();
+  }
+
+ private:
+  static void expectEntry(
+      const DirContents& content,
+      PathComponentPiece name,
+      InodeNumber inode,
+      const ObjectId& id,
+      mode_t mode,
+      AclRootState aclState = AclRootState::Unknown) {
+    const auto entry = content.find(name);
+    ASSERT_NE(content.end(), entry);
+    EXPECT_EQ(inode, entry->second.getInodeNumber());
+    ASSERT_FALSE(entry->second.isMaterialized());
+    EXPECT_EQ(id, entry->second.getObjectId());
+    EXPECT_EQ(mode, entry->second.getInitialMode());
+    EXPECT_EQ(aclState, entry->second.aclRootState());
+  }
+
+  folly::test::TemporaryDirectory tmp_{"eden_wal_v2"};
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    PersistenceBoundaries,
+    OverlayWalVersion2Test,
+    ::testing::Values(
+        WalV2Scenario::AppendFailure,
+        WalV2Scenario::AppendFailureDuringDeferral,
+        WalV2Scenario::MissingBaseSuccess,
+        WalV2Scenario::SourceRemoveFailure,
+        WalV2Scenario::AddWithoutWal),
+    [](const ::testing::TestParamInfo<WalV2Scenario>& info) {
+      switch (info.param) {
+        case WalV2Scenario::AppendFailure:
+          return "AppendFailure";
+        case WalV2Scenario::AppendFailureDuringDeferral:
+          return "AppendFailureDuringDeferral";
+        case WalV2Scenario::MissingBaseSuccess:
+          return "MissingBaseSuccess";
+        case WalV2Scenario::SourceRemoveFailure:
+          return "SourceRemoveFailure";
+        case WalV2Scenario::AddWithoutWal:
+          return "AddWithoutWal";
+      }
+      return "Unknown";
+    });
+
+TEST_P(OverlayWalVersion2Test, preservesRecoveryState) {
+  verifyRecovery();
+}
+
 TEST(WalRenameTest, caseInsensitiveCaseOnlyRenameAppendsReplacementAdd) {
   folly::test::TemporaryDirectory tmp("eden_wal_rename_case_only");
   auto dir = canonicalPath(tmp.path().string());
@@ -2015,33 +2802,190 @@ TEST(WalRenameTest, crossDirRenameAppendsToBothWals) {
   bundle.overlay->close();
 }
 
-TEST(WalRenameTest, fallbackOnMissingDstEntry) {
-  folly::test::TemporaryDirectory tmp("eden_wal_rename_fallback");
-  auto dir = canonicalPath(tmp.path().string());
+TEST(WalRenameTest, missingDestinationReportsCallerBug) {
+  for (const bool useWal : {false, true}) {
+    for (const bool sameParent : {false, true}) {
+      SCOPED_TRACE(fmt::format("useWal={}, sameParent={}", useWal, sameParent));
+      EdenBugDisabler disableEdenBugCrash;
+      folly::test::TemporaryDirectory tmp(
+          "eden_wal_rename_missing_destination");
+      const auto dir = canonicalPath(tmp.path().string());
+      auto bundle = makeWalLifecycleOverlay(
+          dir,
+          kPathMapDefaultCaseSensitive,
+          /*walMinCompactionThreshold=*/0,
+          /*cacheWalFiles=*/true,
+          useWal);
+      const auto src = bundle.overlay->allocateInodeNumber();
+      const auto dst = sameParent ? src : bundle.overlay->allocateInodeNumber();
+      const auto child = bundle.overlay->allocateInodeNumber();
+      DirContents content(kPathMapDefaultCaseSensitive);
+      content.emplace("source"_pc, S_IFREG | 0644, child);
+      bundle.overlay->saveOverlayDir(src, content);
+      DirContents postSrc(kPathMapDefaultCaseSensitive);
+      DirContents postDst(kPathMapDefaultCaseSensitive);
+      if (!sameParent) {
+        bundle.overlay->saveOverlayDir(dst, postDst);
+      }
+
+      EXPECT_THROW_RE(
+          bundle.overlay->renameChild(
+              src, dst, "source"_pc, "target"_pc, postSrc, postDst),
+          std::runtime_error,
+          "rename destination 'target' is missing");
+      EXPECT_FALSE(bundle.store->hasWal(src));
+      EXPECT_FALSE(bundle.store->hasWal(dst));
+      bundle.overlay->close();
+
+      auto reopened = makeWalLifecycleOverlay(
+          dir,
+          kPathMapDefaultCaseSensitive,
+          /*walMinCompactionThreshold=*/0,
+          /*cacheWalFiles=*/true,
+          useWal);
+      const auto loaded = reopened.overlay->loadOverlayDir(src);
+      ASSERT_EQ(1u, loaded.size());
+      const auto source = loaded.find("source"_pc);
+      ASSERT_NE(loaded.end(), source);
+      EXPECT_EQ(child, source->second.getInodeNumber());
+      if (!sameParent) {
+        EXPECT_TRUE(reopened.overlay->loadOverlayDir(dst).empty());
+      }
+      reopened.overlay->close();
+    }
+  }
+}
+
+TEST(WalRenameTest, missingDestinationGuardCanBeDisabledAfterReload) {
+  EdenBugDisabler disableEdenBugCrash;
+  for (const bool useWal : {false, true}) {
+    SCOPED_TRACE(fmt::format("useWal={}", useWal));
+    folly::test::TemporaryDirectory tmp("eden_wal_rename_rollback");
+    const auto dir = canonicalPath(tmp.path().string());
+    const auto configPath = dir + "dynamic.rc"_pc;
+    constexpr std::string_view kDisabled{
+        "[experimental]\noverlay-rename-require-destination=false\n"};
+    constexpr std::string_view kEnabled{
+        "[experimental]\noverlay-rename-require-destination=true\n"};
+    ASSERT_TRUE(folly::writeFile(kEnabled, configPath.c_str()));
+
+    auto rawConfig = std::make_shared<EdenConfig>(
+        ConfigVariables{},
+        dir,
+        dir,
+        EdenConfig::SourceVector{std::make_shared<TomlFileConfigSource>(
+            configPath, ConfigSourceType::Dynamic)});
+    rawConfig->overlayUseWal.setValue(useWal, ConfigSourceType::CommandLine);
+    rawConfig->overlayFilePreallocPoolSize.setValue(
+        0, ConfigSourceType::Default, true);
+    rawConfig->overlayDirPreallocPoolSize.setValue(
+        0, ConfigSourceType::Default, true);
+    auto reloadable = std::make_shared<ReloadableConfig>(rawConfig);
+    auto errorLogger = makeTestErrorLogger();
+    auto overlay = Overlay::create(
+        dir,
+        kPathMapDefaultCaseSensitive,
+        kInodeCatalogType,
+        kInodeCatalogOptions,
+        makeTestEdenFsEventsLogger(),
+        errorLogger,
+        makeRefPtr<EdenStats>(),
+        *rawConfig);
+    overlay->initialize(reloadable).get();
+
+    const auto src = overlay->allocateInodeNumber();
+    const auto dst = overlay->allocateInodeNumber();
+    const auto child = overlay->allocateInodeNumber();
+    DirContents srcContent(kPathMapDefaultCaseSensitive);
+    srcContent.emplace("source"_pc, S_IFREG | 0644, child);
+    overlay->saveOverlayDir(src, srcContent);
+    DirContents dstContent(kPathMapDefaultCaseSensitive);
+    overlay->saveOverlayDir(dst, dstContent);
+    DirContents postSrc(kPathMapDefaultCaseSensitive);
+
+    EXPECT_THROW_RE(
+        overlay->renameChild(
+            src, dst, "source"_pc, "target"_pc, postSrc, dstContent),
+        std::runtime_error,
+        "rename destination 'target' is missing");
+    ASSERT_TRUE(folly::writeFile(kDisabled, configPath.c_str()));
+    reloadable->maybeReload();
+    EXPECT_EQ(
+        "false",
+        reloadable->getEdenConfig()->getValueByFullKey(
+            "experimental:overlay-rename-require-destination"));
+    EXPECT_NO_THROW(overlay->renameChild(
+        src, dst, "source"_pc, "target"_pc, postSrc, dstContent));
+
+    ASSERT_TRUE(folly::writeFile(kEnabled, configPath.c_str()));
+    reloadable->maybeReload();
+    EXPECT_EQ(
+        "true",
+        reloadable->getEdenConfig()->getValueByFullKey(
+            "experimental:overlay-rename-require-destination"));
+    EXPECT_THROW_RE(
+        overlay->renameChild(
+            src, dst, "source"_pc, "target"_pc, postSrc, dstContent),
+        std::runtime_error,
+        "rename destination 'target' is missing");
+    overlay->close();
+
+    auto reopened = makeWalLifecycleOverlay(
+        dir,
+        kPathMapDefaultCaseSensitive,
+        /*walMinCompactionThreshold=*/0,
+        /*cacheWalFiles=*/true,
+        useWal);
+    EXPECT_TRUE(reopened.overlay->loadOverlayDir(src).empty());
+    EXPECT_TRUE(reopened.overlay->loadOverlayDir(dst).empty());
+    reopened.overlay->close();
+  }
+}
+
+TEST(WalRenameTest, destinationCompactionWriteFailurePreservesSource) {
+  folly::test::TemporaryDirectory tmp("eden_wal_rename_compaction_failure");
+  const auto dir = canonicalPath(tmp.path().string());
   auto bundle = makeWalLifecycleOverlay(dir);
-  ASSERT_NE(nullptr, bundle.store);
-
-  auto srcParent = bundle.overlay->allocateInodeNumber();
-  auto dstParent = bundle.overlay->allocateInodeNumber();
-  auto childIno = bundle.overlay->allocateInodeNumber();
+  const auto src = bundle.overlay->allocateInodeNumber();
+  const auto dst = bundle.overlay->allocateInodeNumber();
+  const auto child = bundle.overlay->allocateInodeNumber();
+  const ObjectId id{std::string(20, '\x42')};
   DirContents srcContent(kPathMapDefaultCaseSensitive);
-  srcContent.emplace("old"_pc, S_IFREG | 0644, childIno);
-  bundle.overlay->saveOverlayDir(srcParent, srcContent);
+  srcContent.emplace("source"_pc, S_IFREG | 0644, child, id);
+  bundle.overlay->saveOverlayDir(src, srcContent);
   DirContents dstContent(kPathMapDefaultCaseSensitive);
-  bundle.overlay->saveOverlayDir(dstParent, dstContent);
+  bundle.overlay->saveOverlayDir(dst, dstContent);
+  dstContent.emplace("target"_pc, S_IFREG | 0644, child, id);
 
-  // dstContent does not contain "new" — renameChild must fall back to
-  // the dual-saveOverlayDir path. No WAL files should be left behind
-  // since saveOverlayDir runs clearWalAfterFullWrite.
-  DirContents postSrc(kPathMapDefaultCaseSensitive);
-  DirContents postDst(kPathMapDefaultCaseSensitive);
-  bundle.overlay->renameChild(
-      srcParent, dstParent, "old"_pc, "new"_pc, postSrc, postDst);
-
-  EXPECT_FALSE(bundle.store->hasWal(srcParent));
-  EXPECT_FALSE(bundle.store->hasWal(dstParent));
-
+  // A directory at the temporary file path makes only the destination's
+  // compaction write fail, even when the test runs with elevated privileges.
+  const auto blocker = overlayDirTempFilePath(tmp.path(), dst);
+  ASSERT_TRUE(boost::filesystem::create_directory(blocker));
+  OverlayTestHelper::setWalCompactionRng(*bundle.overlay, [] { return 0u; });
+  srcContent.erase("source"_pc);
+  EXPECT_THROW(
+      bundle.overlay->renameChild(
+          src, dst, "source"_pc, "target"_pc, srcContent, dstContent),
+      std::system_error);
+  EXPECT_TRUE(bundle.store->hasWal(dst));
+  EXPECT_FALSE(bundle.store->hasWal(src));
   bundle.overlay->close();
+  ASSERT_TRUE(boost::filesystem::remove(blocker));
+
+  auto reopened = makeWalLifecycleOverlay(dir);
+  const auto loadedSrc = reopened.overlay->loadOverlayDir(src);
+  const auto loadedDst = reopened.overlay->loadOverlayDir(dst);
+  ASSERT_EQ(1u, loadedSrc.size());
+  ASSERT_EQ(1u, loadedDst.size());
+  const auto source = loadedSrc.find("source"_pc);
+  ASSERT_NE(loadedSrc.end(), source);
+  EXPECT_EQ(child, source->second.getInodeNumber());
+  EXPECT_EQ(id, source->second.getObjectId());
+  const auto target = loadedDst.find("target"_pc);
+  ASSERT_NE(loadedDst.end(), target);
+  EXPECT_EQ(child, target->second.getInodeNumber());
+  EXPECT_EQ(id, target->second.getObjectId());
+  reopened.overlay->close();
 }
 
 TEST(WalRenameTest, fallsBackWhenWalDisabled) {

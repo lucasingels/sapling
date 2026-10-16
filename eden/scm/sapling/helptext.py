@@ -1681,6 +1681,10 @@ Controls recording of commit mutation metadata.
     Set to true to automatically convert obsmarkers to mutation metadata during
     automigration at the start of pull.
 
+``allow-divergence``
+    Set to true to allow operations to deliberately create divergence by
+    rewriting or rebasing onto obsolete commits. (default: False)
+
 ``pager``
 ---------
 
@@ -2048,6 +2052,7 @@ have a definite end point.
 ----------
 
 ``evolution.allowdivergence``
+    Deprecated alias for ``mutation.allow-divergence``; still honored.
     Default to False, when True allow creating divergence when performing
     rebase of obsolete changesets.
 
@@ -2365,12 +2370,14 @@ User interface controls.
     Allow to prompt the user. (default: True)
 
 ``interface``
-    Select the default interface for interactive features (default: text).
-    Possible values are 'text' and 'curses'.
+    Select the default interface for interactive features.
+    Possible values are 'text', 'curses', and 'repl'. If unset, the default
+    is 'repl' when Sapling is run by a coding agent, 'text' when TERM is unset
+    or set to 'dumb', and 'curses' otherwise.
 
 ``interface.chunkselector``
     Select the interface for change recording (e.g. :prog:`commit -i`).
-    Possible values are 'text' and 'curses'.
+    Possible values are 'text', 'curses', and 'repl'.
     This config overrides the interface specified by ui.interface.
 
 ``logtemplate``

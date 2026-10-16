@@ -10,16 +10,21 @@
 #include <sys/types.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <typeinfo>
 #include <unordered_set>
+#include <utility>
 
 #include <fb303/ServiceData.h>
+#include <fb303/ThreadCachedServiceData.h>
 #include <fmt/format.h>
 #include <folly/Conv.h>
+#include <folly/Exception.h>
+#include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/Portability.h>
 #include <folly/String.h>
@@ -34,13 +39,12 @@
 #include <folly/futures/Future.h>
 #include <folly/logging/Logger.h>
 #include <folly/logging/xlog.h>
+#include <folly/portability/Fcntl.h>
 #include <folly/stop_watch.h>
-#include <re2/re2.h>
 #include <thrift/lib/cpp/util/EnumUtils.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 
 #include "ThriftGetObjectImpl.h"
-#include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/telemetry/Tracing.h"
 #include "eden/common/utils/Bug.h"
@@ -48,6 +52,7 @@
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/common/utils/StatTimes.h"
 #include "eden/common/utils/String.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/fuse/FuseChannel.h"
@@ -65,25 +70,23 @@
 #include "eden/fs/journal/JournalDelta.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/model/BlobAuxData.h"
-#include "eden/fs/model/GlobEntry.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/model/git/TopLevelIgnores.h"
+#include "eden/fs/nfs/NfsServer.h"
 #include "eden/fs/nfs/Nfsd3.h"
 #ifdef _WIN32
 #include "eden/fs/notifications/Notifier.h"
+#include "eden/fs/prjfs/PrjfsChannel.h" // @manual
 #endif
 #include "eden/fs/privhelper/PrivHelper.h"
-#include "eden/fs/prjfs/PrjfsChannel.h"
 #include "eden/fs/rust/redirect_ffi/include/ffi.h"
 #include "eden/fs/rust/redirect_ffi/src/lib.rs.h"
 #include "eden/fs/service/EdenServer.h"
-#include "eden/fs/service/ThriftGetObjectImpl.h"
 #include "eden/fs/service/ThriftGlobImpl.h"
 #include "eden/fs/service/ThriftPermissionChecker.h"
 #include "eden/fs/service/ThriftUtil.h"
-#include "eden/fs/service/UsageService.h"
 #include "eden/fs/service/gen-cpp2/eden_constants.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/service/gen-cpp2/streamingeden_constants.h"
@@ -93,11 +96,9 @@
 #include "eden/fs/store/FilteredBackingStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/store/ObjectStore.h"
-#include "eden/fs/store/PathLoader.h"
 #include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/StatsFetchContext.h"
 #include "eden/fs/store/TreeCache.h"
-#include "eden/fs/store/TreeLookupProcessor.h"
 #include "eden/fs/store/filter/GlobFilter.h"
 #include "eden/fs/store/sl/SaplingBackingStore.h"
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
@@ -353,11 +354,6 @@ bool mountIsUsingFilteredFS(const EdenMountHandle& mount) {
              ->getRepoBackingStoreType() == BackingStoreType::FILTEREDHG;
 }
 
-bool isValidSearchRoot(const PathString& searchRoot) {
-  return searchRoot.empty() || (searchRoot == ".") || (searchRoot == "html") ||
-      (searchRoot == "www/html") || (searchRoot == "www\\html");
-}
-
 std::string resolveRootId(
     std::string rootId,
     const RootIdOptions& rootIdOptions,
@@ -409,9 +405,9 @@ class ThriftFetchContext : public ObjectFetchContext {
  public:
   explicit ThriftFetchContext(
       OptionalProcessId pid,
-      folly::StringPiece endpoint,
+      CauseDetail endpoint,
       Cause cause)
-      : pid_(pid), endpoint_(endpoint), cause_(cause) {}
+      : pid_(pid), endpoint_(std::move(endpoint)), cause_(cause) {}
 
   OptionalProcessId getClientPid() const override {
     return pid_;
@@ -422,7 +418,7 @@ class ThriftFetchContext : public ObjectFetchContext {
   }
 
   std::optional<std::string_view> getCauseDetail() const override {
-    return endpoint_;
+    return endpoint_.asStringView();
   }
 
   const std::unordered_map<std::string, std::string>* FOLLY_NULLABLE
@@ -456,7 +452,7 @@ class ThriftFetchContext : public ObjectFetchContext {
 
  private:
   OptionalProcessId pid_;
-  std::string_view endpoint_;
+  CauseDetail endpoint_;
   Cause cause_;
   std::unordered_map<std::string, std::string> requestInfo_;
 };
@@ -465,14 +461,13 @@ class PrefetchFetchContext : public StatsFetchContext {
  public:
   explicit PrefetchFetchContext(
       OptionalProcessId pid,
-      std::string_view endpoint,
+      CauseDetail endpoint,
       bool enablePrefetchStats)
       : StatsFetchContext(
             pid,
             ObjectFetchContext::Cause::Prefetch,
-            endpoint,
+            std::move(endpoint),
             nullptr),
-        endpoint_(endpoint),
         enablePrefetchStats_(enablePrefetchStats) {}
 
   ImportPriority getPriority() const override {
@@ -490,7 +485,6 @@ class PrefetchFetchContext : public StatsFetchContext {
   }
 
  private:
-  std::string_view endpoint_;
   bool enablePrefetchStats_;
 };
 
@@ -526,11 +520,13 @@ class ThriftRequestScope {
         itcLogger_(logger),
         thriftFetchContext_{makeRefPtr<ThriftFetchContext>(
             pid,
-            sourceLocation_.function_name(),
+            ObjectFetchContext::StaticCauseDetail::fromSourceLocation(
+                sourceLocation_),
             fetchCause)},
         prefetchFetchContext_{makeRefPtr<PrefetchFetchContext>(
             pid,
-            sourceLocation_.function_name(),
+            ObjectFetchContext::StaticCauseDetail::fromSourceLocation(
+                sourceLocation_),
             enablePrefetchStats)},
         handler_(serviceHandler) {
     if (auto handler = handler_.lock()) {
@@ -646,49 +642,6 @@ ImmediateFuture<ReturnType> wrapImmediateFuture(
 }
 
 /**
- * Lives as long as a suffix glob request and primarily exists to record logging
- * and telemetry.
- */
-class SuffixGlobRequestScope {
- public:
-  SuffixGlobRequestScope(SuffixGlobRequestScope&&) = delete;
-  SuffixGlobRequestScope& operator=(SuffixGlobRequestScope&&) = delete;
-
-  SuffixGlobRequestScope(
-      std::string globberLogString,
-      std::shared_ptr<ServerState> serverState,
-      bool isLocal,
-      const ObjectFetchContextPtr& context)
-      : globberLogString_{std::move(globberLogString)},
-        serverState_{std::move(serverState)},
-        isLocal_{isLocal},
-        context_{context.copy()} {}
-
-  ~SuffixGlobRequestScope() {
-    // Logging completion time for the request
-    auto elapsed = itcTimer_.elapsed();
-    auto duration = std::chrono::duration<double>{elapsed}.count();
-    std::string client_cmdline = getClientCmdline(serverState_, context_);
-    XLOGF(
-        DBG4,
-        "EdenFS asked to evaluate suffix glob by caller '{}'{}: duration={}s",
-        client_cmdline,
-        globberLogString_,
-        duration);
-    serverState_->getEdenFsEventsLogger()->logEvent(
-        SuffixGlob{
-            duration, globberLogString_, std::move(client_cmdline), isLocal_});
-  }
-
- private:
-  std::string globberLogString_;
-  std::shared_ptr<ServerState> serverState_;
-  bool isLocal_;
-  ObjectFetchContextPtr context_;
-  folly::stop_watch<std::chrono::microseconds> itcTimer_ = {};
-}; // namespace
-
-/**
  * Lives as long as a glob files request and primarily exists to record logging
  * and telemetry.
  */
@@ -697,77 +650,35 @@ class GlobFilesRequestScope {
   GlobFilesRequestScope(GlobFilesRequestScope&&) = delete;
   GlobFilesRequestScope& operator=(GlobFilesRequestScope&&) = delete;
 
-  explicit GlobFilesRequestScope(
+  GlobFilesRequestScope(
       std::shared_ptr<ServerState> serverState,
-      bool isOffloadable,
       std::string logString,
       const ObjectFetchContextPtr& context)
       : serverState_{std::move(serverState)},
-        isOffloadable_{isOffloadable},
-        logString_{logString},
+        logString_{std::move(logString)},
         context_{context.copy()} {}
 
   ~GlobFilesRequestScope() {
-    // Logging completion time for the request
     auto elapsed = itcTimer_.elapsed();
     auto duration = std::chrono::duration<double>{elapsed}.count();
-    XLOGF(
-        DBG4,
-        "EdenFS completed globFiles request in {}s using {}{}",
-        duration,
-        (local ? "Local" : "SaplingRemoteAPI"),
-        (fallback ? " Fallback" : ""));
-
-    // Log if this request is an expensive request
+    XLOGF(DBG4, "EdenFS completed globFiles request in {}s", duration);
     if (duration >= EXPENSIVE_GLOB_FILES_DURATION) {
       std::string client_cmdline = getClientCmdline(serverState_, context_);
-
       serverState_->getEdenFsEventsLogger()->logEvent(
           ExpensiveGlob{
-              duration, logString_, std::move(client_cmdline), local});
+              duration,
+              logString_,
+              std::move(client_cmdline),
+              /*is_local=*/true});
     }
-    if (local) {
-      if (isOffloadable_) {
-        serverState_->getStats()->addDuration(
-            &ThriftStats::globFilesLocalOffloadableDuration, elapsed);
-      } else {
-        serverState_->getStats()->addDuration(
-            &ThriftStats::globFilesLocalDuration, elapsed);
-      }
-      serverState_->getStats()->increment(&ThriftStats::globFilesLocal);
-    } else {
-      if (fallback) {
-        serverState_->getStats()->addDuration(
-            &ThriftStats::globFilesSaplingRemoteAPIFallbackDuration, elapsed);
-        serverState_->getStats()->increment(
-            &ThriftStats::globFilesSaplingRemoteAPIFallback);
-      } else {
-        serverState_->getStats()->addDuration(
-            &ThriftStats::globFilesSaplingRemoteAPISuccessDuration, elapsed);
-        serverState_->getStats()->increment(
-            &ThriftStats::globFilesSaplingRemoteAPISuccess);
-      }
-    }
-    XLOG(DBG4, "End of globFiles");
-  }
-
-  void setLocal(bool isLocal) {
-    local = isLocal;
-  }
-
-  void setFallback(bool isFallback) {
-    fallback = isFallback;
   }
 
  private:
-  bool local = true;
-  bool fallback = false;
   std::shared_ptr<ServerState> serverState_;
-  bool isOffloadable_;
   std::string logString_;
   ObjectFetchContextPtr context_;
   folly::stop_watch<std::chrono::microseconds> itcTimer_ = {};
-}; // namespace
+};
 #undef EDEN_MICRO
 
 RelativePath relpathFromUserPath(StringPiece userPath) {
@@ -792,58 +703,6 @@ facebook::eden::InodePtr inodeFromUserPath(
     const ObjectFetchContextPtr& context) {
   auto relPath = relpathFromUserPath(rootRelativePath);
   return mount.getInodeSlow(relPath, context).get();
-}
-
-bool shouldUseSaplingRemoteAPI(
-    bool useSaplingRemoteAPISuffixes,
-    const GlobParams& params) {
-  // The following parameters will default to local lookup
-  // Commands related to prefetching or the working copy
-  //   - prefetchFiles
-  //   - suppressFileList
-  // - searchRoot - root is always the repository root
-  // - predictiveGlob - This pathway only accepts suffixes
-  // - listOnlyFiles - Only files will be returned
-  // Ignore
-  //   - prefetchMetadata, it is explicitly called
-  // out as having no effect
-  //   - sync, not used globFiles. If sync behavior is desired
-  //   use synchronizeWorkingCopy
-
-  // Handle unsupported flags
-  if (*params.prefetchFiles() || *params.suppressFileList()) {
-    XLOGF(
-        DBG3,
-        "globFiles request cannot be offloaded to SaplingRemoteAPI due to prefetching: prefetchFiles={}, suppressFileList={}. Falling back to local pathway",
-        *params.prefetchFiles(),
-        *params.suppressFileList());
-    useSaplingRemoteAPISuffixes = false;
-  } else if (params.predictiveGlob()) {
-    XLOG(
-        DBG3,
-        "globFiles request cannot be offloaded to SaplingRemoteAPI due to predictiveGlob, falling back to local pathway");
-    useSaplingRemoteAPISuffixes = false;
-  } else if (!(*params.listOnlyFiles())) {
-    XLOG(
-        DBG3,
-        "globFiles request cannot be offloaded to SaplingRemoteAPI due to asking for files and directories, falling back to local pathway");
-    useSaplingRemoteAPISuffixes = false;
-  }
-
-  return useSaplingRemoteAPISuffixes;
-}
-
-bool checkAllowedQuery(
-    const std::vector<std::string>& suffixes,
-    const std::unordered_set<std::string>& allowedSuffixes) {
-  for (auto& suffix : suffixes) {
-    if (!allowedSuffixes.contains(suffix)) {
-      XLOGF(DBG4, "Suffix {} is not in allowed suffixes", suffix);
-      return false;
-    }
-  }
-  XLOGF(DBG4, "All suffixes allowed");
-  return true;
 }
 
 } // namespace
@@ -1004,14 +863,12 @@ EdenServiceHandler::initThriftRequestActivityBuffer() {
 
 EdenServiceHandler::EdenServiceHandler(
     std::vector<std::string> originalCommandLine,
-    EdenServer* server,
-    std::unique_ptr<UsageService> usageService)
+    EdenServer* server)
     : BaseService{kServiceName},
       originalCommandLine_{std::move(originalCommandLine)},
       server_{server},
       streamJournalChangedShuttingDown_{
           std::make_shared<std::atomic<bool>>(false)},
-      usageService_{std::move(usageService)},
       thriftRequestActivityBuffer_(initThriftRequestActivityBuffer()),
       thriftRequestTraceBus_(
           TraceBus<ThriftRequestTraceEvent>::create(
@@ -1091,12 +948,15 @@ folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_mount(
                    ->mount(std::move(initialConfig), *argument->readOnly())
                    .unit();
              }).thenError([this](const folly::exception_wrapper& ex) {
-               XLOGF(ERR, "Error: {}", ex.what());
+               auto outcome = ErrorLogOutcome::Disabled;
                ex.with_exception([&](const std::exception& e) {
-                 server_->getServerState()->getErrorLogger().log(
+                 outcome = server_->getServerState()->getErrorLogger().log(
                      EdenErrorInfo::thrift(
                          ErrorArg::fromExceptionWithoutTrace(e), "mount"));
                });
+               if (outcome != ErrorLogOutcome::RateLimited) {
+                 XLOGF(ERR, "Error: {}", ex.what());
+               }
                throw newEdenError(ex);
              }))
       .semi();
@@ -1158,6 +1018,16 @@ void EdenServiceHandler::listMounts(std::vector<MountInfo>& results) {
 #ifdef __linux__
       if (auto* fuseChannel = dynamic_cast<FuseChannel*>(fsChannel)) {
         info.fuseTransport() = fuseChannel->getTransportName();
+      }
+#endif
+#ifndef _WIN32
+      if (dynamic_cast<Nfsd3*>(fsChannel) != nullptr) {
+        // Every NFS mount shares the running mountd's transport.
+        if (auto& nfsServer = server_->getServerState()->getNfsServer()) {
+          info.nfsTransport() =
+              nfsServer->getMountdAddr().getFamily() == AF_UNIX ? "unix"
+                                                                : "tcp";
+        }
       }
 #endif
     }
@@ -1749,6 +1619,9 @@ EdenServiceHandler::streamJournalChanged(
     apache::thrift::ServerStreamPublisher<JournalPosition> publisher;
     std::shared_ptr<std::atomic<bool>> disconnected;
     std::shared_ptr<std::atomic<bool>> shuttingDown;
+    // Set while a delayed notification is scheduled; further changes in the
+    // window are covered by it.
+    std::atomic<bool> notifyPending{false};
 
     explicit Publisher(
         apache::thrift::ServerStreamPublisher<JournalPosition> publisher,
@@ -1780,15 +1653,49 @@ EdenServiceHandler::streamJournalChanged(
       std::move(disconnected),
       std::move(shuttingDown));
 
+  // The position value sent below is intentionally undefined and should not
+  // be used. Instead, the subscriber should call getCurrentJournalPosition or
+  // getFilesChangedSince.
+  auto notify = [](Publisher& stream) {
+    if (stream.disconnected->load() || stream.shuttingDown->load()) {
+      return;
+    }
+    JournalPosition pos;
+    stream.publisher.next(pos);
+  };
+
   // Register onJournalChange with the journal subsystem, and assign
   // the subscriber id into the handle so that the callbacks can consume it.
+  // folly's timekeeper resolves microseconds, so a configured delay below
+  // that takes the immediate path rather than a sleep of zero.
+  const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(
+      server_->getServerState()
+          ->getEdenConfig()
+          ->thriftJournalChangedDelay.getValue());
+  auto executor = server_->getServerState()->getThreadPool();
   handle->emplace(mountHandle.getEdenMount().getJournal().registerSubscriber(
-      [stream = std::move(stream)]() mutable {
-        JournalPosition pos;
-        // The value is intentionally undefined and should not be used. Instead,
-        // the subscriber should call getCurrentJournalPosition or
-        // getFilesChangedSince.
-        stream->publisher.next(pos);
+      [stream = std::move(stream), notify, delay = delay, executor]() mutable {
+        if (delay.count() == 0) {
+          notify(*stream);
+          return;
+        }
+        // A write burst can change the journal tens of thousands of times a
+        // second. One notification at the end of the window covers all of
+        // them, since the subscriber reads the journal position itself.
+        if (stream->notifyPending.exchange(true)) {
+          return;
+        }
+        folly::futures::sleep(delay)
+            .via(executor.get())
+            // The thread pool has no keep-alive support, so the task itself
+            // holds the executor until it has run.
+            .thenTry([stream, notify, executor](folly::Try<folly::Unit>&&) {
+              // Reset on every outcome. If the executor refused the task at
+              // shutdown the flag would otherwise stay set and starve the
+              // subscriber of every later notification.
+              stream->notifyPending.store(false);
+              notify(*stream);
+            });
       }));
 
   return std::move(streamAndPublisher.first);
@@ -2580,7 +2487,7 @@ ImmediateFuture<folly::Unit> diffBetweenRoots(
     const RootId& toRoot,
     const CheckoutConfig& checkoutConfig,
     const std::shared_ptr<ObjectStore>& objectStore,
-    folly::CancellationToken cancellation,
+    const folly::CancellationToken& cancellation,
     const ObjectFetchContextPtr& fetchContext,
     DiffCallback* callback) {
   auto diffContext = std::make_unique<DiffContext>(
@@ -2790,7 +2697,7 @@ bool isPathIncluded(
     const std::vector<RelativePath>& excludedRoots,
     const std::vector<std::string>& includedSuffixes,
     const std::vector<std::string>& excludedSuffixes,
-    RelativePath path,
+    const RelativePath& path,
     dtype_t type) {
   if (!includedRoots.empty()) {
     bool included = false;
@@ -3323,28 +3230,20 @@ EdenServiceHandler::semifuture_startFileAccessMonitor(
 
   constexpr std::string_view FAM_TMP_OUTPUT_DIR = "/tmp/edenfs/fam/";
 
-  // Get the current time
-  std::time_t nowTime =
-      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-
-  // Create a character string to format the date and time
-  char datetimeString[20];
-  std::strftime(
-      datetimeString,
-      sizeof(datetimeString),
-      "%Y%m%d_%H%M%S",
-      std::localtime(&nowTime));
-
-  // form the path to tmp file
-  std::string tmpPath =
-      fmt::format("{}fam_{}.out", FAM_TMP_OUTPUT_DIR, datetimeString);
+  std::string tmpPath = fmt::format("{}fam_XXXXXX", FAM_TMP_OUTPUT_DIR);
+  const auto outputFd = mkstemp(tmpPath.data());
+  folly::checkUnixError(outputFd, "failed to create FAM output file");
+  folly::File outputFile(outputFd, /*ownsFd=*/true);
+  folly::checkUnixError(
+      fcntl(outputFd, F_SETFD, FD_CLOEXEC), "setting FAM output close-on-exec");
 
   auto fut = ImmediateFuture<pid_t>(
       server_->getServerState()->getPrivHelper()->startFam(
           *params->paths(),
           tmpPath,
           params->specifiedOutputPath().value_or(tmpPath),
-          *params->shouldUpload_ref()));
+          *params->shouldUpload_ref(),
+          std::move(outputFile)));
   return wrapImmediateFuture(
              std::move(helper),
              std::move(fut).thenValue(
@@ -3659,7 +3558,7 @@ EdenServiceHandler::semifuture_getEntryInformationImpl(
                    return applyToVirtualInode(
                        mountHandle.getRootInode(),
                        *paths,
-                       [](const VirtualInode& inode, RelativePath) {
+                       [](const VirtualInode& inode, const RelativePath&) {
                          return inode.getDtype();
                        },
                        mountHandle.getObjectStorePtr(),
@@ -3860,7 +3759,7 @@ EdenServiceHandler::semifuture_getFileInformationImpl(
                        [mountHandle,
                         lastCheckoutTime,
                         fetchContext = fetchContext.copy()](
-                           const VirtualInode& inode, RelativePath) {
+                           const VirtualInode& inode, const RelativePath&) {
                          return inode
                              .stat(
                                  lastCheckoutTime,
@@ -4359,7 +4258,7 @@ EdenServiceHandler::getEntryAttributesImpl(
 
 namespace {
 bool dtypeMatchesRequestScope(
-    VirtualInode inode,
+    const VirtualInode& inode,
     AttributesRequestScope reqScope) {
   if (reqScope == AttributesRequestScope::TREES_AND_FILES) {
     return true;
@@ -4642,7 +4541,7 @@ EdenServiceHandler::semifuture_setPathObjectId(
       DBG1, *params->mountPoint(), toLogArg(object_strings));
 
   if (auto requestInfo = params->requestInfo()) {
-    helper->getThriftFetchContext().updateRequestInfo(std::move(*requestInfo));
+    helper->getThriftFetchContext().updateRequestInfo(*requestInfo);
   }
   ObjectFetchContextPtr context = helper->getFetchContext().copy();
   return wrapImmediateFuture(
@@ -4851,123 +4750,11 @@ EdenServiceHandler::semifuture_ensureMaterialized(
 folly::SemiFuture<std::unique_ptr<Glob>>
 EdenServiceHandler::semifuture_predictiveGlobFiles(
     std::unique_ptr<GlobParams> params) {
-  auto isBackground = *params->background();
-  // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-  auto task = folly::coro::co_invoke(
-      [self = shared_from_this()](std::unique_ptr<GlobParams> p)
-          -> folly::coro::Task<std::unique_ptr<Glob>> {
-        co_return co_await self->co_predictiveGlobFilesImpl(std::move(p));
-      },
-      std::move(params));
-
-  if (server_->usingThriftSerialExecution()) {
-    // Already globally serialized — just handle background detach.
-    if (isBackground) {
-      folly::futures::detachOn(
-          server_->getServerState()->getThreadPool().get(),
-          std::move(task).semi());
-      return ImmediateFuture<std::unique_ptr<Glob>>(std::make_unique<Glob>())
-          .semi();
-    }
-    return std::move(task).semi();
-  }
-
-  // Pin all coroutine resumptions to a SerialExecutor so CPU work
-  // between co_await points is serialized, matching the futures path.
-  // Without co_withExecutor, the coroutine would escape the serial
-  // executor after the first external co_await (e.g. getTopUsedDirs),
-  // allowing concurrent fan-out from multiple requests.
-  folly::Executor::KeepAlive<> serial = folly::SerialExecutor::create(
-      server_->getServer()->getThreadManager().get());
-  auto pinned = folly::coro::co_withExecutor(serial, std::move(task));
-  if (isBackground) {
-    folly::futures::detachOn(serial, std::move(pinned).start());
-    return ImmediateFuture<std::unique_ptr<Glob>>(std::make_unique<Glob>())
-        .semi();
-  }
-  return std::move(pinned).start();
+  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *params->mountPoint());
+  XLOG(WARN, "predictiveGlobFiles is deprecated and no longer prefetches");
+  return folly::makeSemiFuture(std::make_unique<Glob>());
 }
 
-folly::coro::now_task<std::unique_ptr<Glob>>
-EdenServiceHandler::co_predictiveGlobFilesImpl(
-    std::unique_ptr<GlobParams> params) {
-  auto mountHandle = lookupMount(params->mountPoint());
-  if (!params->revisions().value().empty()) {
-    params->revisions() =
-        resolveRootsWithLastFilter(params->revisions().value(), mountHandle);
-  }
-  ThriftGlobImpl globber{*params};
-  auto requestContext = getRequestContext();
-  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
-      DBG3, false, requestContext, *params->mountPoint(), globber.logString());
-
-  /* set predictive glob fetch parameters */
-  auto& serverState = server_->getServerState();
-  auto numResults =
-      serverState->getEdenConfig()->predictivePrefetchProfileSize.getValue();
-  auto user = folly::StringPiece{serverState->getUserInfo().getUsername()};
-  auto backingStore = mountHandle.getObjectStore().getBackingStore();
-  auto repo_optional = backingStore->getRepoName();
-  if (repo_optional == std::nullopt) {
-    auto& r = *backingStore.get();
-    throw std::runtime_error(
-        folly::to<std::string>(
-            "mount must use SaplingBackingStore, type is ", typeid(r).name()));
-  }
-
-  auto repo = repo_optional.value();
-  auto os = getOperatingSystemName();
-
-  std::optional<std::string> sandcastleAlias;
-  std::optional<uint64_t> startTime;
-  std::optional<uint64_t> endTime;
-  auto scAliasEnv = std::getenv("SANDCASTLE_ALIAS");
-  sandcastleAlias = scAliasEnv ? std::make_optional(std::string(scAliasEnv))
-                               : sandcastleAlias;
-
-  const auto& predictiveGlob = params->predictiveGlob().as_const();
-  if (predictiveGlob.has_value()) {
-    numResults = predictiveGlob->numTopDirectories().value_or(numResults);
-    user = predictiveGlob->user().has_value() ? predictiveGlob->user().value()
-                                              : user;
-    repo = predictiveGlob->repo().has_value() ? predictiveGlob->repo().value()
-                                              : repo;
-    os = predictiveGlob->os().has_value() ? predictiveGlob->os().value() : os;
-    startTime = predictiveGlob->startTime().has_value()
-        ? predictiveGlob->startTime().value()
-        : startTime;
-    endTime = predictiveGlob->endTime().has_value()
-        ? predictiveGlob->endTime().value()
-        : endTime;
-  }
-
-  auto& fetchContext = helper->getPrefetchFetchContext();
-
-  co_await folly::coro::co_reschedule_on_current_executor;
-
-  auto globs = co_await usageService_->getTopUsedDirs(
-      user,
-      repo,
-      numResults,
-      os,
-      startTime,
-      endTime,
-      std::move(sandcastleAlias));
-
-  auto resultTry = co_await co_awaitTry(globber.glob(
-      mountHandle.getEdenMountPtr(),
-      serverState,
-      std::move(globs),
-      fetchContext.copy()));
-  if (resultTry.hasException()) {
-    XLOGF(
-        ERR,
-        "Error fetching predictive file globs: {}",
-        folly::exceptionStr(resultTry.exception()));
-    resultTry.exception().throw_exception();
-  }
-  co_return std::move(resultTry.value());
-}
 folly::SemiFuture<std::unique_ptr<Glob>>
 EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
   auto isBackground = *params->background();
@@ -5026,351 +4813,14 @@ EdenServiceHandler::co_globFilesImpl(std::unique_ptr<GlobParams> params) {
       context,
       server_->getServerState());
 
-  std::unique_ptr<SuffixGlobRequestScope> suffixGlobRequestScope;
-  auto edenConfig = server_->getServerState()->getEdenConfig();
+  GlobFilesRequestScope globFilesRequestScope{
+      server_->getServerState(), globber.logString(*params->globs()), context};
 
-  // Offload suffix queries to EdenAPI
-  bool useSaplingRemoteAPISuffixes = shouldUseSaplingRemoteAPI(
-      edenConfig->enableEdenAPISuffixQuery.getValue(), *params);
-
-  // Matches **/*.suffix
-  // Captures the .suffix
-  static const re2::RE2 suffixRegex("\\*\\*/\\*(\\.[A-z0-9]+)");
-  std::vector<std::string> suffixGlobs;
-  std::vector<std::string> nonSuffixGlobs;
-
-  // Copying to new vectors, since we want to keep the original around
-  // in case we need to fall back to the legacy pathway
-  for (const auto& glob : *params->globs()) {
-    std::string capture;
-    if (re2::RE2::FullMatch(glob, suffixRegex, &capture)) {
-      suffixGlobs.push_back(capture);
-    } else {
-      nonSuffixGlobs.push_back(glob);
-    }
-  }
-
-  bool requestIsOffloadable = !suffixGlobs.empty() && nonSuffixGlobs.empty() &&
-      isValidSearchRoot(*params->searchRoot());
-
-  // Allow only specific queries that have been determined to operate faster
-  // when offloaded
-  requestIsOffloadable = requestIsOffloadable &&
-      checkAllowedQuery(suffixGlobs,
-                        edenConfig->allowedSuffixQueries.getValue());
-
-  auto globFilesRequestScope = std::make_shared<GlobFilesRequestScope>(
+  co_return co_await globber.glob(
+      mountHandle.getEdenMountPtr(),
       server_->getServerState(),
-      requestIsOffloadable,
-      globber.logString(*params->globs()),
-      context);
-
-  if (requestIsOffloadable) {
-    XLOG(
-        DBG4,
-        "globFiles request is only suffix globs, can be offloaded to EdenAPI");
-    auto suffixGlobLogString = globber.logString(suffixGlobs);
-    suffixGlobRequestScope = std::make_unique<SuffixGlobRequestScope>(
-        suffixGlobLogString,
-        server_->getServerState(),
-        !useSaplingRemoteAPISuffixes,
-        context);
-  }
-
-  std::unique_ptr<Glob> result;
-
-  if (useSaplingRemoteAPISuffixes && requestIsOffloadable) {
-    XLOG(DBG4, "globFiles request offloaded to EdenAPI");
-    globFilesRequestScope->setLocal(false);
-
-    auto searchRoot = params->searchRoot().value();
-    size_t pos = 0;
-    while ((pos = searchRoot.find('\\', pos)) != std::string::npos) {
-      searchRoot.replace(pos, 1, "/");
-    }
-
-    auto revisions = params->revisions().value();
-    auto& store = mountHandle.getObjectStore();
-    auto edenMount = mountHandle.getEdenMountPtr();
-    auto rootInode = mountHandle.getRootInode();
-    auto wantDtype = params->wantDtype().value();
-    auto includeDotfiles = params->includeDotfiles().value();
-
-    std::vector<std::string> prefixes;
-    if (!searchRoot.empty() && searchRoot != ".") {
-      prefixes.push_back(searchRoot);
-    }
-
-    // Wrap the entire offload path so that failures at any stage — initial
-    // glob fetch, per-revision root tree fetch, per-entry dtype resolution, or
-    // a DT_UNKNOWN dtype in the final result — fall back to local globbing.
-    bool needFallback = false;
-    try {
-      // Get glob results — either local or per-revision
-      std::vector<BackingStore::GetGlobFilesResult> globResults;
-      if (revisions.empty()) {
-        globResults = co_await getLocalGlobResults(
-            edenMount,
-            server_->getServerState(),
-            includeDotfiles,
-            suffixGlobs,
-            prefixes,
-            rootInode,
-            context.copy());
-      } else {
-        std::vector<folly::coro::Task<BackingStore::GetGlobFilesResult>>
-            globTasks;
-        globTasks.reserve(revisions.size());
-        for (auto& id : revisions) {
-          globTasks.push_back(
-              folly::coro::co_invoke(
-                  [](std::shared_ptr<ObjectStore> s,
-                     RootId rootId,
-                     std::vector<std::string> sg,
-                     std::vector<std::string> px,
-                     ObjectFetchContextPtr ctx)
-                      -> folly::coro::Task<BackingStore::GetGlobFilesResult> {
-                    co_return co_await s->getGlobFiles(rootId, sg, px, ctx);
-                  },
-                  edenMount->getObjectStore(),
-                  store.parseRootId(id),
-                  suffixGlobs,
-                  prefixes,
-                  context.copy()));
-        }
-        globResults =
-            co_await folly::coro::collectAllRange(std::move(globTasks));
-      }
-
-      // Process glob results into GlobEntries. Run per-glob-result work
-      // (root-tree fetch + per-entry dtype resolution) as parallel tasks so
-      // root-tree fetches and entry resolution across glob results overlap.
-      std::vector<folly::coro::Task<std::vector<GlobEntry>>> perGlobTasks;
-      perGlobTasks.reserve(globResults.size());
-      for (auto& glob : globResults) {
-        std::string originId = store.renderRootId(glob.rootId);
-        perGlobTasks.push_back(
-            folly::coro::co_invoke(
-                [](BackingStore::GetGlobFilesResult g,
-                   std::string oid,
-                   std::shared_ptr<EdenMount> em,
-                   TreeInodePtr ri,
-                   bool wantDt,
-                   bool includeDotfilesFlag,
-                   ObjectFetchContextPtr ctx)
-                    -> folly::coro::Task<std::vector<GlobEntry>> {
-                  // Fetch the root tree lazily on the first remote entry that
-                  // needs it — skips the fetch for empty or all-filtered glob
-                  // results.
-                  std::shared_ptr<const Tree> rootTree;
-
-                  std::vector<folly::coro::Task<GlobEntry>> entryTasks;
-                  std::vector<GlobEntry> entries;
-                  for (auto& entry : g.globFiles) {
-                    if (!includeDotfilesFlag) {
-                      bool skip_due_to_dotfile = false;
-                      auto rp = RelativePath(std::string_view{entry});
-                      for (auto component : rp.components()) {
-                        if (string_view{component.view()}.starts_with(".")) {
-                          XLOGF(
-                              DBG5,
-                              "Skipping dotfile: {} in {}",
-                              component.view(),
-                              entry);
-                          skip_due_to_dotfile = true;
-                          break;
-                        }
-                      }
-                      if (skip_due_to_dotfile) {
-                        continue;
-                      }
-                    }
-
-                    if (wantDt) {
-                      if (g.isLocal) {
-                        entryTasks.push_back(
-                            folly::coro::co_invoke(
-                                [](TreeInodePtr rootI,
-                                   std::string e,
-                                   std::string originIdCopy,
-                                   ObjectFetchContextPtr fetchCtx)
-                                    -> folly::coro::Task<GlobEntry> {
-                                  auto childTry = co_await co_awaitTry(
-                                      rootI->co_getChildRecursive(
-                                          RelativePathPiece{e}, fetchCtx));
-                                  if (childTry.hasException()) {
-                                    XLOGF(
-                                        ERR,
-                                        "Error for getting file dtypes for local file {}: {}",
-                                        e,
-                                        childTry.exception().what());
-                                    co_return GlobEntry{
-                                        std::move(e),
-                                        DT_UNKNOWN,
-                                        std::move(originIdCopy)};
-                                  }
-                                  InodePtr child = std::move(childTry.value());
-                                  co_return GlobEntry{
-                                      std::move(e),
-                                      static_cast<OsDtype>(child->getType()),
-                                      std::move(originIdCopy)};
-                                },
-                                ri,
-                                std::string{entry},
-                                std::string{oid},
-                                ctx.copy()));
-                      } else {
-                        if (!rootTree) {
-                          auto treeResult =
-                              co_await em->getObjectStore()->co_getRootTree(
-                                  g.rootId, ctx.copy());
-                          rootTree = std::move(treeResult.tree);
-                        }
-                        entryTasks.push_back(
-                            folly::coro::co_invoke(
-                                [](std::shared_ptr<const Tree> tree,
-                                   std::string e,
-                                   std::string originIdCopy,
-                                   std::shared_ptr<ObjectStore> objStore,
-                                   ObjectFetchContextPtr fetchCtx)
-                                    -> folly::coro::Task<GlobEntry> {
-                                  auto treeEntryTry = co_await co_awaitTry(
-                                      co_getTreeOrTreeEntry(
-                                          tree,
-                                          RelativePath{folly::StringPiece{e}},
-                                          objStore,
-                                          fetchCtx.copy()));
-                                  if (treeEntryTry.hasException()) {
-                                    XLOGF(
-                                        ERR,
-                                        "Error for getting file dtypes for remote file {}: {}",
-                                        e,
-                                        treeEntryTry.exception().what());
-                                    co_return GlobEntry{
-                                        std::move(e),
-                                        DT_UNKNOWN,
-                                        std::move(originIdCopy)};
-                                  }
-                                  auto treeEntry =
-                                      std::move(treeEntryTry.value());
-                                  TreeEntry* treeEntryPtr =
-                                      std::get_if<TreeEntry>(&treeEntry);
-                                  if (!treeEntryPtr) {
-                                    EDEN_BUG()
-                                        << "Received a Tree when expecting TreeEntry for path "
-                                        << e;
-                                  }
-                                  auto dtype = treeEntryPtr->getDtype();
-                                  co_return GlobEntry{
-                                      std::move(e),
-                                      static_cast<OsDtype>(dtype),
-                                      std::move(originIdCopy)};
-                                },
-                                rootTree,
-                                std::string{entry},
-                                std::string{oid},
-                                em->getObjectStore(),
-                                ctx.copy()));
-                      }
-                    } else {
-                      entries.push_back(
-                          GlobEntry{std::move(entry), DT_UNKNOWN, oid});
-                    }
-                  }
-
-                  if (!entryTasks.empty()) {
-                    auto resolved = co_await folly::coro::collectAllRange(
-                        std::move(entryTasks));
-                    for (auto& ge : resolved) {
-                      entries.push_back(std::move(ge));
-                    }
-                  }
-                  co_return entries;
-                },
-                std::move(glob),
-                std::move(originId),
-                edenMount,
-                rootInode,
-                wantDtype,
-                includeDotfiles,
-                context.copy()));
-      }
-
-      // Collect results from all glob results in parallel.
-      std::vector<GlobEntry> globEntries;
-      auto perGlobResults =
-          co_await folly::coro::collectAllRange(std::move(perGlobTasks));
-      for (auto& entries : perGlobResults) {
-        for (auto& ge : entries) {
-          globEntries.push_back(std::move(ge));
-        }
-      }
-
-      // Build the Glob result
-      XLOGF(DBG5, "Building Glob with searchroot {}", searchRoot);
-      result = std::make_unique<Glob>();
-      std::sort(
-          globEntries.begin(),
-          globEntries.end(),
-          [](const GlobEntry& a, const GlobEntry& b) {
-            return a.file < b.file;
-          });
-      for (GlobEntry& globEntry : globEntries) {
-        StringPiece filePath{globEntry.file};
-        if (!searchRoot.empty() && searchRoot != ".") {
-          if (!filePath.startsWith(searchRoot) ||
-              filePath.size() <= searchRoot.size() ||
-              !detail::isDirSeparator(filePath[searchRoot.size()])) {
-            continue;
-          }
-          filePath = filePath.subpiece(searchRoot.size() + 1);
-        }
-        result->matchingFiles().value().emplace_back(
-            PathComponent::storage_type{filePath.data(), filePath.size()});
-        if (wantDtype) {
-          if (globEntry.dType == DT_UNKNOWN) {
-            // Triggers the outer catch below and falls back to local globbing,
-            // matching the original futures chain's .thenError(...) behavior.
-            throw newEdenError(
-                ENOENT,
-                EdenErrorType::POSIX_ERROR,
-                "could not get Dtype for file ",
-                globEntry.file);
-          }
-          result->dtypes().value().emplace_back(globEntry.dType);
-        }
-        result->originHashes().value().emplace_back(globEntry.originId);
-      }
-      XLOG(
-          DBG5,
-          "Glob successfully created, returning SaplingRemoteAPI results");
-    } catch (const std::exception& ex) {
-      XLOGF(
-          ERR,
-          "Encountered error when evaluating globFiles: {}\n Using local globFiles",
-          ex.what());
-      globFilesRequestScope->setFallback(true);
-      needFallback = true;
-    }
-
-    if (needFallback) {
-      result = co_await globber.glob(
-          mountHandle.getEdenMountPtr(),
-          server_->getServerState(),
-          std::move(*params->globs()),
-          context.copy());
-    }
-  } else {
-    // Path 2/3: SaplingRemoteAPI not offloadable or not enabled
-    XLOG(DBG3, "Using local globFiles");
-    result = co_await globber.glob(
-        mountHandle.getEdenMountPtr(),
-        server_->getServerState(),
-        std::move(*params->globs()),
-        context.copy());
-  }
-
-  co_return result;
+      std::move(*params->globs()),
+      context.copy());
 }
 folly::coro::Task<void> EdenServiceHandler::co_prefetchFiles(
     std::unique_ptr<PrefetchParams> params) {
@@ -7182,6 +6632,7 @@ void EdenServiceHandler::getStatInfo(
     result.mountPointJournalInfo() = mountPointJournalInfo;
   }
 
+  fb303::ThreadCachedServiceData::get()->publishStats();
   auto counters = fb303::ServiceData::get()->getCounters();
   if (statsMask & eden_constants::STATS_COUNTERS_) {
     // Get the counters and set number of inodes unloaded by periodic unload
@@ -7246,6 +6697,30 @@ void EdenServiceHandler::getStatInfo(
 void EdenServiceHandler::flushStatsNow() {
   auto helper = INSTRUMENT_THRIFT_CALL(DBG3);
   server_->flushStatsNow();
+}
+
+void EdenServiceHandler::getCounters(std::map<std::string, int64_t>& result) {
+  fb303::ThreadCachedServiceData::get()->publishStats();
+  fb303::BaseService::getCounters(result);
+}
+
+void EdenServiceHandler::getRegexCounters(
+    std::map<std::string, int64_t>& result,
+    std::unique_ptr<std::string> regex) {
+  fb303::ThreadCachedServiceData::get()->publishStats();
+  fb303::BaseService::getRegexCounters(result, std::move(regex));
+}
+
+void EdenServiceHandler::getSelectedCounters(
+    std::map<std::string, int64_t>& result,
+    std::unique_ptr<std::vector<std::string>> keys) {
+  fb303::ThreadCachedServiceData::get()->publishStats();
+  fb303::BaseService::getSelectedCounters(result, std::move(keys));
+}
+
+int64_t EdenServiceHandler::getCounter(std::unique_ptr<std::string> key) {
+  fb303::ThreadCachedServiceData::get()->publishStats();
+  return fb303::BaseService::getCounter(std::move(key));
 }
 
 folly::SemiFuture<Unit>

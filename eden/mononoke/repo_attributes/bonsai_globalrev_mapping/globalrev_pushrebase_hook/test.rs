@@ -76,9 +76,6 @@ struct Repo {
 
     #[facet]
     bookmarks: dyn Bookmarks,
-
-    #[facet]
-    sql_bookmarks: dbbookmarks::SqlBookmarks,
 }
 
 #[mononoke::fbinit_test]
@@ -105,7 +102,6 @@ async fn pushrebase_assigns_globalrevs(fb: FacebookInit) -> Result<(), Error> {
     let book = bookmark(ctx, repo, "master").set_to(cs1).await?;
 
     let hooks = [GlobalrevPushrebaseHook::new(
-        ctx.clone(),
         repo.bonsai_globalrev_mapping_arc(),
         repo.repo_identity().id(),
         None,
@@ -245,7 +241,6 @@ async fn test_pushrebase_race_assigns_monotonic_globalrevs(fb: FacebookInit) -> 
 
     let hooks = [
         GlobalrevPushrebaseHook::new(
-            ctx.clone(),
             repo.bonsai_globalrev_mapping_arc(),
             repo.repo_identity().id(),
             None,

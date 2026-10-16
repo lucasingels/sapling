@@ -43,6 +43,7 @@ class FuseDispatcherImpl : public FuseDispatcher {
 
   void forget(InodeNumber ino, unsigned long nlookup) override;
   ImmediateFuture<uint64_t> open(InodeNumber ino, int flags) override;
+  ImmediateFuture<folly::Unit> release(InodeNumber ino, uint64_t fh) override;
   ImmediateFuture<std::string> readlink(
       InodeNumber ino,
       bool kernelCachesReadlink,
@@ -164,6 +165,12 @@ class FuseDispatcherImpl : public FuseDispatcher {
    * lookups.
    */
   uint64_t computeNegativeEntryTtl() const;
+
+  /**
+   * The reply for a name that does not exist: inode number 0 with the
+   * negative-entry TTL, which the kernel caches as a negative dentry.
+   */
+  fuse_entry_out negativeLookupEntry() const;
 
   // The EdenMount associated with this dispatcher.
   EdenMount* const mount_;

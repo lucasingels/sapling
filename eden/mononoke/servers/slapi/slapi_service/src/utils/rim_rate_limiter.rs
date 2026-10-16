@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-//! RIM-backed rate limiting on the EdenAPI QPS path. Supports both comparison
+//! RIM-backed rate limiting on the EdenAPI request path. Supports both comparison
 //! against the legacy rate limiter and authoritative enforcement. RIM failures
 //! always fail open.
 //!
@@ -22,14 +22,21 @@ use tokio::time::timeout;
 use tracing::debug;
 use tracing::warn;
 
-const RIM_RESOURCE_QPS: &str = "qps";
 const RIM_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RimQpsDecision {
+pub(crate) enum RimDecision {
     Allow,
     Reject,
     FailOpen,
+}
+
+pub(crate) fn tenancy_path(tenant: &TenantInfo, region: Option<&str>) -> Option<Vec<String>> {
+    let mut path = tenant.tenancy_path()?;
+    if let Some(region) = region {
+        path.insert(2, region.to_owned());
+    }
+    Some(path)
 }
 
 /// Call once at server startup. Failures are logged and swallowed so RIM
@@ -52,71 +59,71 @@ pub(crate) fn init(rim_backend: RimBackend) {
     }
 }
 
-pub(crate) async fn check_qps(
+pub(crate) async fn check_rate_limit(
     ctx: &CoreContext,
-    tenant: &TenantInfo,
+    tenancy_path: &[String],
     rim_backend: RimBackend,
-) -> RimQpsDecision {
-    let Some(tenancy_path) = tenant.tenancy_path() else {
-        return RimQpsDecision::FailOpen;
-    };
-    let requirements = HashMap::from([(RIM_RESOURCE_QPS.to_string(), 1.0)]);
-
+    requirements: &HashMap<String, f64>,
+) -> RimDecision {
     let log = |tag: &str, detail: String| {
         let mut scuba = ctx.scuba().clone();
-        scuba.add("rim_tenancy_path", tenant.to_string());
+        scuba.add("rim_tenancy_path", tenancy_path.join("/"));
+        scuba.add("rim_backend", rim_backend.0);
+        scuba.add("rim_requirements", format!("{requirements:?}"));
         scuba.log_with_msg(tag, detail);
     };
 
     let result = match timeout(
         RIM_ACQUIRE_TIMEOUT,
-        RimThinClient::acquire(rim_backend, tenancy_path, requirements),
+        RimThinClient::acquire(rim_backend, tenancy_path.to_vec(), requirements.clone()),
     )
     .await
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            log("RIM QPS check error", e.to_string());
-            return RimQpsDecision::FailOpen;
+            log("RIM rate-limit check error", e.to_string());
+            return RimDecision::FailOpen;
         }
         Err(_) => {
             log(
-                "RIM QPS check timeout",
+                "RIM rate-limit check timeout",
                 format!("timeout after {RIM_ACQUIRE_TIMEOUT:?}"),
             );
-            return RimQpsDecision::FailOpen;
+            return RimDecision::FailOpen;
         }
     };
 
     if result.rejected() {
+        log("RIM rejected request", format!("code={:?}", result.code()));
+        RimDecision::Reject
+    } else if result.failed() {
         log(
-            "RIM rejected QPS request",
+            "RIM rate-limit check failed",
             format!("code={:?}", result.code()),
         );
-        RimQpsDecision::Reject
-    } else if result.failed() {
-        log("RIM QPS check failed", format!("code={:?}", result.code()));
-        RimQpsDecision::FailOpen
+        RimDecision::FailOpen
     } else {
-        RimQpsDecision::Allow
+        RimDecision::Allow
     }
 }
 
-pub(crate) async fn report_qps(ctx: &CoreContext, tenant: &TenantInfo, rim_backend: RimBackend) {
-    let Some(tenancy_path) = tenant.tenancy_path() else {
-        return;
-    };
-    let usage = HashMap::from([(RIM_RESOURCE_QPS.to_string(), 1.0)]);
-
+pub(crate) async fn report_load(
+    ctx: &CoreContext,
+    tenancy_path: &[String],
+    rim_backend: RimBackend,
+    usage: &HashMap<String, f64>,
+) {
     let log = |tag: &str, detail: String| {
         let mut scuba = ctx.scuba().clone();
-        scuba.add("rim_tenancy_path", tenant.to_string());
+        scuba.add("rim_tenancy_path", tenancy_path.join("/"));
+        scuba.add("rim_backend", rim_backend.0);
+        scuba.add("rim_requirements", format!("{usage:?}"));
         scuba.log_with_msg(tag, detail);
     };
 
     match timeout(
         RIM_ACQUIRE_TIMEOUT,
-        RimThinClient::report(rim_backend, tenancy_path, usage),
+        RimThinClient::report(rim_backend, tenancy_path.to_vec(), usage.clone()),
     )
     .await
     {
@@ -133,5 +140,48 @@ pub(crate) async fn report_qps(ctx: &CoreContext, tenant: &TenantInfo, rim_backe
                 format!("timeout after {RIM_ACQUIRE_TIMEOUT:?}"),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+    use permission_checker::TenantInfo;
+
+    use super::tenancy_path;
+
+    #[mononoke::test]
+    fn global_and_regional_paths_preserve_category_and_client() {
+        let tenant = TenantInfo::DevEnv {
+            client_id: Some("MACHINE:devserver.example.com".to_owned()),
+            on_demand_type: None,
+            client_region: Some("prn".to_owned()),
+            client_hostname: None,
+        };
+        assert_eq!(
+            tenancy_path(&tenant, None),
+            Some(vec![
+                "root".to_owned(),
+                "dev_env".to_owned(),
+                "MACHINE:devserver.example.com".to_owned()
+            ]),
+        );
+        // The region comes from the serving task, not the client's region.
+        assert_eq!(
+            tenancy_path(&tenant, Some("ldc")),
+            Some(vec![
+                "root".to_owned(),
+                "dev_env".to_owned(),
+                "ldc".to_owned(),
+                "MACHINE:devserver.example.com".to_owned()
+            ]),
+        );
+    }
+
+    #[mononoke::test]
+    fn missing_client_has_no_global_or_regional_path() {
+        let tenant = TenantInfo::Unknown { client_id: None };
+        assert_eq!(tenancy_path(&tenant, None), None);
+        assert_eq!(tenancy_path(&tenant, Some("ldc")), None);
     }
 }

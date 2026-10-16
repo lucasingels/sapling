@@ -35,6 +35,7 @@ rust_binary(
         "fbsource//third-party/rust:maplit",
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/repo_factory:test_repo_factory",
         "//eden/mononoke/tests/fixtures:fixtures",
         "//eden/mononoke/tests/utils:tests_utils",
@@ -42,10 +43,10 @@ rust_binary(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-stream",
+        "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:clap",
-        "fbsource//third-party/rust:either",
         "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:gix-hash",
@@ -59,7 +60,6 @@ rust_binary(
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:sha2-010",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:strum",
         "fbsource//third-party/rust:thiserror",
@@ -67,6 +67,7 @@ rust_binary(
         "fbsource//third-party/rust:tokio-stream",
         "fbsource//third-party/rust:tokio-util",
         "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:uuid",
         "fbsource//third-party/rust:walkdir",
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/bounded_traversal:bounded_traversal",
@@ -96,7 +97,6 @@ rust_binary(
         "//eden/mononoke/common/metadata:metadata",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/common/permission_checker:permission_checker",
-        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/common/time_measuring:time_measuring",
@@ -109,7 +109,6 @@ rust_binary(
         "//eden/mononoke/derived_data:deleted_manifest",
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/derived_data:directory_branch_cluster_manifest",
-        "//eden/mononoke/derived_data:fsnodes",
         "//eden/mononoke/derived_data:skeleton_manifest",
         "//eden/mononoke/derived_data:skeleton_manifest_v2",
         "//eden/mononoke/derived_data:unodes",
@@ -153,7 +152,6 @@ rust_binary(
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
         "//eden/mononoke/repo_attributes/bookmarks/bookmarks_cache:bookmarks_cache",
         "//eden/mononoke/repo_attributes/bookmarks/bookmarks_movement:bookmarks_movement",
-        "//eden/mononoke/repo_attributes/bookmarks/dbbookmarks:dbbookmarks",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph_types:commit_graph_types",
         "//eden/mononoke/repo_attributes/commit_graph/preloaded_commit_graph_storage:preloaded_commit_graph_storage",
@@ -193,12 +191,16 @@ rust_binary(
         []
         if rust_oss.is_oss_build()
         else [
+            "//artillery/artillery2/api/cpp/cli_lite/rust:art_cli_lite_rs",
+            # Only used by the fbcode-only src/facebook/ commands; keeping it
+            # out of the OSS deps avoids the unused-dependency check failure.
+            "fbsource//third-party/rust:derive_more",
             "//common/rust/configo:configo",
             "//configerator/structs/scm/mononoke/repos:repos-rust",
             "//eden/mononoke/blobstore:blobstore_factory",
             "//eden/mononoke/blobstore:fileblob",
-            "//eden/mononoke/blobstore:redactedblobstore",
-            "//eden/mononoke/repo_attributes/bonsai_blob_mapping:bonsai_blob_mapping",
+            "//eden/mononoke/common/sql_construct:sql_construct",
+            "//eden/mononoke/metaconfig:metaconfig_parser",
             "//eden/mononoke/repo_attributes/deletion_log:deletion_log",
             "//eden/mononoke/tools/repo_spec_writer:repo_spec_writer",
             # Tupperware log reader (for `backfill-status --detailed` worker logs).

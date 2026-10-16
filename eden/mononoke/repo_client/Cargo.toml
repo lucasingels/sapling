@@ -22,7 +22,6 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 commit_graph = { version = "0.1.0", path = "../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
 cross_repo_sync = { version = "0.1.0", path = "../features/cross_repo_sync" }
-dbbookmarks = { version = "0.1.0", path = "../repo_attributes/bookmarks/dbbookmarks" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../repo_attributes/filestore" }
@@ -48,7 +47,7 @@ mutable_counters = { version = "0.1.0", path = "../repo_attributes/mutable_count
 nonzero_ext = "0.2"
 phases = { version = "0.1.0", path = "../repo_attributes/phases" }
 pushrebase_mutation_mapping = { version = "0.1.0", path = "../repo_attributes/pushrebase_mutation_mapping" }
-rand = "0.10.2"
+rand = "0.10.3"
 repo_authorization = { version = "0.1.0", path = "../repo_authorization" }
 repo_blobstore = { version = "0.1.0", path = "../repo_attributes/repo_blobstore" }
 repo_bookmark_attrs = { version = "0.1.0", path = "../repo_attributes/repo_bookmark_attrs" }
@@ -58,6 +57,7 @@ repo_event_publisher = { version = "0.1.0", path = "../repo_attributes/repo_even
 repo_identity = { version = "0.1.0", path = "../repo_attributes/repo_identity" }
 repo_lock = { version = "0.1.0", path = "../repo_attributes/repo_lock/repo_lock" }
 repo_permission_checker = { version = "0.1.0", path = "../repo_attributes/repo_permission_checker" }
+restricted_paths = { version = "0.1.0", path = "../repo_attributes/restricted_paths" }
 scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

@@ -35,6 +35,36 @@ import {arrayFromHashes, HashSet} from './set';
  * - Mutation related queries like obsolete().
  * - High-level operations like rebase(), cleanup().
  */
+const withGrandparentsCache = new WeakMap<
+  ReadonlyArray<Hash>,
+  WeakMap<ReadonlyArray<Hash>, ReadonlyArray<Hash>>
+>();
+
+/**
+ * `[...parents, ...grandparents]`, but the same array for the same inputs. The dag is rebuilt on
+ * every smartlog fetch, and a fresh array makes every commit unequal to its previous version,
+ * which re-renders every row.
+ */
+function withGrandparents(
+  parents: ReadonlyArray<Hash>,
+  grandparents: ReadonlyArray<Hash>,
+): ReadonlyArray<Hash> {
+  if (grandparents.length === 0) {
+    return parents;
+  }
+  let byGrandparents = withGrandparentsCache.get(parents);
+  if (byGrandparents == null) {
+    byGrandparents = new WeakMap();
+    withGrandparentsCache.set(parents, byGrandparents);
+  }
+  let combined = byGrandparents.get(grandparents);
+  if (combined == null) {
+    combined = [...parents, ...grandparents];
+    byGrandparents.set(grandparents, combined);
+  }
+  return combined;
+}
+
 export class Dag extends SelfUpdate<CommitDagRecord> {
   constructor(record?: CommitDagRecord) {
     super(record ?? EMPTY_DAG_RECORD);
@@ -71,7 +101,7 @@ export class Dag extends SelfUpdate<CommitDagRecord> {
         // The seqNumber is the same for all `commits` so the order does not matter.
         .set('seqNumber', c.seqNumber ?? seqNumber)
         // Extend `parents` for dagwalkerForRendering to properly connect public commits
-        .set('parents', [...c.parents, ...c.grandparents])
+        .set('parents', withGrandparents(c.parents, c.grandparents))
         // Assign `ancestors` for dagWalkerForRendering to connect public commits properly
         .set('ancestors', c.grandparents.length > 0 ? List(c.grandparents) : c.ancestors),
     );
@@ -472,7 +502,18 @@ export class Dag extends SelfUpdate<CommitDagRecord> {
 
   /** All visible successors recursively, including `set`. */
   successors(set: SetLike): HashSet {
-    return this.mutationDag.range(set, this);
+    return this.mutationRange(set);
+  }
+
+  /**
+   * Same as `mutationDag.range(set, this)`, but O(successors of `set`) instead of
+   * O(size of this dag): mutation descendants of `set` are closed under further
+   * descendants, so the visible ones' ancestors never leave that set.
+   */
+  private mutationRange(set: SetLike): HashSet {
+    const mDag = this.mutationDag;
+    const descendants = mDag.descendants(set);
+    return mDag.ancestors(this.present(descendants), {within: descendants});
   }
 
   /** All visible predecessors of commits in `set`, including `set`. */
@@ -504,7 +545,7 @@ export class Dag extends SelfUpdate<CommitDagRecord> {
   followSuccessors(set: SetLike): HashSet {
     const hashSet = HashSet.fromHashes(set);
     const mDag = this.mutationDag;
-    let successors = mDag.heads(mDag.range(hashSet, this));
+    let successors = mDag.heads(this.mutationRange(hashSet));
     // When following a split to multiple successors, consider using
     // the main dag to pick the stack top.
     if (hashSet.size === 1 && successors.size > 1) {

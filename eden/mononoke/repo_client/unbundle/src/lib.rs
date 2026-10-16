@@ -9,7 +9,6 @@
 #![feature(trait_alias)]
 
 mod changegroup;
-mod errors;
 mod hook_running;
 mod processing;
 mod push_redirector;
@@ -23,7 +22,6 @@ use bonsai_hg_mapping::BonsaiHgMappingArc;
 use bookmarks::BookmarksRef;
 use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphWriterArc;
-use dbbookmarks::SqlBookmarksRef;
 use filestore::FilestoreConfigRef;
 pub use hook_running::run_hooks;
 pub use hooks::CrossRepoPushSource;
@@ -56,13 +54,14 @@ pub use response::UnbundleInfinitePushResponse;
 pub use response::UnbundlePushRebaseResponse;
 pub use response::UnbundlePushResponse;
 pub use response::UnbundleResponse;
+use restricted_paths::RestrictedPathsArc;
+pub use upload_changesets::ShallowSubtreeCopyRejected;
 pub use upload_changesets::upload_changeset;
 
 pub trait Repo = CommitGraphArc
     + CommitGraphWriterArc
     + BonsaiHgMappingArc
     + BookmarksRef
-    + SqlBookmarksRef
     + RepoDerivedDataArc
     + PhasesRef
     + HgMutationStoreArc
@@ -70,6 +69,7 @@ pub trait Repo = CommitGraphArc
     + RepoBlobstoreArc
     + FilestoreConfigRef
     + RepoIdentityRef
+    + RestrictedPathsArc
     + remotefilelog::RepoLike
     + Clone
     + 'static

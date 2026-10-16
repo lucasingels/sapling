@@ -11,11 +11,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Error;
 use anyhow::anyhow;
 use cxx::SharedPtr;
 use cxx::UniquePtr;
+use cxx::WeakPtr;
 use cxxerror::Result;
 use edenapi::types::DirectoryMetadata;
 use storemodel::FileAuxData as ScmStoreFileAuxData;
@@ -100,10 +102,6 @@ pub(crate) mod ffi {
         // TODO: cri: ClientRequestInfo
     }
 
-    pub struct GlobFilesData {
-        files: Vec<String>,
-    }
-
     pub struct FileAuxData {
         total_size: u64,
         content_sha1: [u8; 20],
@@ -164,6 +162,9 @@ pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("eden/scm/lib/backingstore/include/ffi.h");
 
+        #[namespace = "facebook::eden"]
+        type EdenFsEventsLogger;
+
         // Opaque here rather than `= iobuf::IOBuf`: the Rust iobuf crate
         // (folly bindings) lives in fbsource and is not in the OSS export.
         // The IOBuf is built C++-side via sapling_iobuf_from_bytes instead.
@@ -176,6 +177,11 @@ pub(crate) mod ffi {
         type GetFileAuxBatchResolver;
 
         fn sapling_iobuf_from_bytes(bytes: &[u8]) -> UniquePtr<IOBuf>;
+
+        fn sapling_backingstore_log_edenfs_event(
+            logger: &EdenFsEventsLogger,
+            sample_json: &str,
+        ) -> Result<()>;
 
         unsafe fn sapling_backingstore_get_tree_batch_handler(
             resolve_state: SharedPtr<GetTreeBatchResolver>,
@@ -206,6 +212,8 @@ pub(crate) mod ffi {
         );
     }
 
+    impl WeakPtr<EdenFsEventsLogger> {}
+
     unsafe extern "C++" {
         type TreeBuilder;
 
@@ -222,7 +230,7 @@ pub(crate) mod ffi {
             ttype: TreeEntryType,
             is_restricted: bool,
             has_acl: bool,
-        );
+        ) -> Result<()>;
 
         fn add_entry_with_aux_data(
             self: Pin<&mut TreeBuilder>,
@@ -234,13 +242,13 @@ pub(crate) mod ffi {
             blake3: &[u8; 32],
             is_restricted: bool,
             has_acl: bool,
-        );
+        ) -> Result<()>;
 
         fn mark_missing(self: Pin<&mut TreeBuilder>);
 
-        fn reserve(self: Pin<&mut TreeBuilder>, capacity: usize);
+        fn reserve(self: Pin<&mut TreeBuilder>, capacity: usize) -> Result<()>;
 
-        fn set_aux_data(self: Pin<&mut TreeBuilder>, digest: &[u8; 32], size: u64);
+        fn set_aux_data(self: Pin<&mut TreeBuilder>, digest: &[u8; 32], size: u64) -> Result<()>;
 
         fn num_files(&self) -> usize;
 
@@ -263,11 +271,6 @@ pub(crate) mod ffi {
 
     pub struct GetFileAuxResult {
         data: SharedPtr<FileAuxData>,
-        error: UniquePtr<SaplingBackingStoreError>,
-    }
-
-    pub struct GetGlobFilesResult {
-        data: SharedPtr<GlobFilesData>,
         error: UniquePtr<SaplingBackingStoreError>,
     }
 
@@ -341,6 +344,7 @@ pub(crate) mod ffi {
             mount: &str,
             eden_client_dir: &str,
             walk_mode: &str,
+            eden_fs_events_logger: SharedPtr<EdenFsEventsLogger>,
         ) -> Result<Box<BackingStore>>;
 
         pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String>;
@@ -408,12 +412,10 @@ pub(crate) mod ffi {
 
         pub fn sapling_backingstore_flush(store: &BackingStore);
 
-        pub fn sapling_backingstore_get_glob_files(
-            store: &BackingStore,
-            commit_id: &[u8],
-            suffixes: Vec<String>,
-            prefixes: Vec<String>,
-        ) -> GetGlobFilesResult;
+        /// Process-wide switch for the tracing-to-Scuba sink. Mirrors the
+        /// daemon's `telemetry:enable-scribe-logging`; call it at startup and
+        /// after every config reload.
+        pub fn sapling_backingstore_set_scribe_logging_enabled(enabled: bool);
 
         pub fn sapling_backingstore_check_permission(
             store: &BackingStore,
@@ -449,6 +451,40 @@ pub(crate) mod ffi {
         pub fn sapling_backingstore_get_cache_stats(store: &BackingStore) -> GetCacheStatsResult;
 
         pub fn sapling_flush_counters();
+    }
+}
+
+/// Borrows EdenServer's logger without delaying its shutdown and queue drain.
+struct EdenFsEventsLoggerAdapter {
+    logger: Mutex<WeakPtr<ffi::EdenFsEventsLogger>>,
+}
+
+// SAFETY: The adapter never exposes its cxx pointers. The mutex serializes weak
+// pointer upgrades, C++ calls, and destruction of each temporary SharedPtr. A
+// successful upgrade keeps EdenFsEventsLogger alive throughout the call; an
+// expired pointer is never dereferenced. EdenFsEventsLogger only forwards const
+// logging calls to XplatLoggerCore, whose transform registry and message queue
+// are protected by folly::Synchronized, including calls from other C++ owners.
+// The pointers have no thread-affine destruction requirements. Dropping this
+// adapter requires exclusive ownership and releases only a weak reference.
+unsafe impl Send for EdenFsEventsLoggerAdapter {}
+unsafe impl Sync for EdenFsEventsLoggerAdapter {}
+
+impl edenfs_telemetry::SampleLogger for EdenFsEventsLoggerAdapter {
+    fn log(&self, sample: edenfs_telemetry::EdenSample) -> anyhow::Result<()> {
+        let weak_logger = self
+            .logger
+            .lock()
+            .map_err(|_| anyhow!("EdenFsEventsLogger mutex is poisoned"))?;
+        let logger = weak_logger.upgrade();
+        let Some(logger) = logger.as_ref() else {
+            // EdenServer has released its logger during shutdown. Do not keep
+            // it alive or route late events back to the legacy logger.
+            return Ok(());
+        };
+        let sample_json = serde_json::to_string(&sample)?;
+        ffi::sapling_backingstore_log_edenfs_event(logger, &sample_json)?;
+        Ok(())
     }
 }
 
@@ -547,8 +583,15 @@ pub fn sapling_backingstore_new(
     mount: &str,
     eden_client_dir: &str,
     walk_mode: &str,
+    eden_fs_events_logger: SharedPtr<ffi::EdenFsEventsLogger>,
 ) -> Result<Box<BackingStore>> {
-    super::init::backingstore_global_init();
+    if eden_fs_events_logger.is_null() {
+        super::init::backingstore_global_init();
+    } else {
+        super::init::backingstore_global_init_with_logger(Arc::new(EdenFsEventsLoggerAdapter {
+            logger: Mutex::new(eden_fs_events_logger.downgrade()),
+        }));
+    }
 
     let mut extra_sapling_configs = Vec::new();
 
@@ -565,6 +608,13 @@ pub fn sapling_backingstore_new(
         &extra_sapling_configs,
     )?;
     Ok(Box::new(store))
+}
+
+pub fn sapling_backingstore_set_scribe_logging_enabled(enabled: bool) {
+    #[cfg(feature = "scuba")]
+    edenfs_telemetry::tracing_logger::set_scribe_logging_enabled(enabled);
+    #[cfg(not(feature = "scuba"))]
+    let _ = enabled;
 }
 
 pub fn sapling_backingstore_get_name(store: &BackingStore) -> Result<String> {
@@ -654,7 +704,7 @@ fn add_tree_to_builder(
 
     // Pre-allocate the per-entry storage.
     if let Some(hint) = tree.size_hint() {
-        builder.as_mut().reserve(hint);
+        builder.as_mut().reserve(hint)?;
     }
 
     for entry in tree.iter()? {
@@ -686,7 +736,7 @@ fn add_tree_to_builder(
                 aux.blake3.as_byte_array(),
                 is_restricted,
                 has_acl,
-            );
+            )?;
         } else {
             builder.as_mut().add_entry(
                 name.as_str(),
@@ -694,7 +744,7 @@ fn add_tree_to_builder(
                 ttype,
                 is_restricted,
                 has_acl,
-            );
+            )?;
         }
     }
 
@@ -702,7 +752,7 @@ fn add_tree_to_builder(
         builder.as_mut().set_aux_data(
             aux.augmented_manifest_id.as_byte_array(),
             aux.augmented_manifest_size,
-        );
+        )?;
     }
 
     Ok(())
@@ -995,23 +1045,6 @@ pub fn sapling_backingstore_flush(store: &BackingStore) {
     store.sync();
 }
 
-pub fn sapling_backingstore_get_glob_files(
-    store: &BackingStore,
-    commit_id: &[u8],
-    suffixes: Vec<String>,
-    prefixes: Vec<String>,
-) -> ffi::GetGlobFilesResult {
-    let prefix_opt = match prefixes.len() {
-        0 => None,
-        _ => Some(prefixes),
-    };
-    let res = store.get_glob_files(commit_id, suffixes, prefix_opt);
-    let (data, error) = resolve_result!(res, transform_some: |files: Vec<String>| SharedPtr::new(ffi::GlobFilesData {
-        files
-    }), replace_none: SharedPtr::null());
-    ffi::GetGlobFilesResult { data, error }
-}
-
 pub fn sapling_backingstore_check_permission(
     store: &BackingStore,
     manifest_id: &[u8],
@@ -1153,7 +1186,33 @@ pub fn sapling_flush_counters() {
 mod tests {
     use std::path::PathBuf;
 
+    use edenfs_telemetry::EdenSample;
+    use edenfs_telemetry::SampleLogger;
+
     use super::*;
+
+    #[test]
+    fn test_events_logger_adapter_without_live_logger() {
+        let logger = Arc::new(EdenFsEventsLoggerAdapter {
+            logger: Mutex::new(WeakPtr::null()),
+        });
+
+        // An expired weak pointer also upgrades to null. Exercise that path
+        // concurrently through the Rust adapter, not just the C++ log helper.
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let logger = Arc::clone(&logger);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        logger.log(EdenSample::new()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_batch_fetch_stats_maps_fetch_context_counts() {

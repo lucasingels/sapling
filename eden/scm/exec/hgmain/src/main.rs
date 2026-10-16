@@ -32,6 +32,22 @@ static mut JEMALLOC_CONF: *const c_char = c"narenas:16".as_ptr();
 #[unsafe(export_name = "je_malloc_conf")]
 static mut JEMALLOC_CONF: *const c_char = c"narenas:4".as_ptr();
 
+// The curl crate initializes libcurl, and through it OpenSSL, from an
+// `.init_array` constructor before `main`. OpenSSL registers an atexit cleanup
+// unless its first initialization opts out, and that cleanup frees state under
+// HTTP threads that are still running at exit. The linker runs prioritized
+// constructors before unprioritized ones, so this one initializes OpenSSL
+// first.
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array.00101")]
+static INIT_OPENSSL: extern "C" fn() = init_openssl;
+
+#[cfg(target_os = "linux")]
+extern "C" fn init_openssl() {
+    hg_http::init_openssl();
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -40,6 +56,9 @@ use windows::disable_standard_handle_inheritability;
 use windows::is_edenfs_stopped;
 
 fn main() {
+    #[cfg(fbcode_build)]
+    distributed_tracing_artillery::register_provider();
+
     // Meta's Python 3.12 version has the built-in lazy_imports feature,
     // which can be enabled with `PYTHONLAZYIMPORTSALL=1` env variable.
     // However, Sapling is not lazy_imports safe. The following disables

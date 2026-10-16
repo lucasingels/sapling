@@ -11,7 +11,8 @@ import type {ServerPlatform} from '../serverPlatform';
 import type {RepositoryContext} from '../serverTypes';
 
 import {deserializeFromString, serializeToString} from 'isl/src/serialize';
-import {mockLogger, nextTick} from 'shared/testUtils';
+import {mockLogger} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import {Internal} from '../Internal';
 import {Repository} from '../Repository';
 import {repositoryCache} from '../RepositoryCache';
@@ -67,7 +68,10 @@ const mockTracker = makeServerSideTracker(
 
 type MessageHandler = (event: Buffer, isBinary: boolean) => void | Promise<void>;
 
-function createMockConnection(cwd = '/path/to/repo/cwd'): ClientConnection & {
+function createMockConnection(
+  cwd = '/path/to/repo/cwd',
+  logFileLocation?: string,
+): ClientConnection & {
   triggerMessage: (msg: Record<string, unknown>) => void;
 } {
   let handler: MessageHandler | undefined;
@@ -80,12 +84,63 @@ function createMockConnection(cwd = '/path/to/repo/cwd'): ClientConnection & {
     command: 'sl',
     version: '0.1',
     cwd,
+    logFileLocation,
     appMode: {mode: 'isl'},
     triggerMessage(msg: Record<string, unknown>) {
       handler?.(Buffer.from(serializeToString(msg as never)), false);
     },
   };
 }
+
+describe('ServerToClientAPI application info', () => {
+  const platform: ServerPlatform = {
+    platformName: 'test',
+    handleMessageFromClient: jest.fn(),
+  };
+  let api: ServerToClientAPI;
+
+  afterEach(() => {
+    api.dispose();
+    jest.clearAllMocks();
+  });
+
+  async function requestApplicationInfo(logFileLocation?: string) {
+    const connection = createMockConnection('/path/to/repo/cwd', logFileLocation);
+    api = new ServerToClientAPI(platform, connection, mockTracker, mockLogger);
+    api.setActiveRepoForCwd('/path/to/repo/cwd');
+    await nextTick();
+
+    connection.triggerMessage({type: 'requestApplicationInfo'});
+    await nextTick();
+
+    return (connection.postMessage as jest.Mock).mock.calls
+      .map(([str]) => deserializeFromString(str as string) as Record<string, unknown>)
+      .find(message => message.type === 'applicationInfo');
+  }
+
+  it('includes the available debug log file path', async () => {
+    expect(await requestApplicationInfo('/tmp/isl/debug.log')).toEqual({
+      type: 'applicationInfo',
+      info: {
+        platformName: 'test',
+        version: '0.1',
+        logFilePath: '/tmp/isl/debug.log',
+        isBasecamp: false,
+      },
+    });
+  });
+
+  it('omits the debug log file path when unavailable', async () => {
+    expect(await requestApplicationInfo()).toEqual({
+      type: 'applicationInfo',
+      info: {
+        platformName: 'test',
+        version: '0.1',
+        isBasecamp: false,
+      },
+    });
+  });
+});
 
 describe('ServerToClientAPI disposable scoping', () => {
   let repoDispose: jest.Mock;
@@ -217,6 +272,13 @@ describe('ServerToClientAPI diff summary fetches', () => {
     // Unforced, the server answers from its signal count cache, so the one gesture a user has for
     // "CI moved but the diff did not" leaves the badge showing the same stale count.
     expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D1', 'D2'], true);
+  });
+
+  it('passes on a request that forces a fresh diff fetch', async () => {
+    connection.triggerMessage({type: 'fetchDiffSummaries', force: true});
+    await nextTick();
+
+    expect(triggerDiffSummariesFetch).toHaveBeenCalledWith(['D1', 'D2'], true, false);
   });
 
   it('passes on a request that marks itself partial', async () => {

@@ -16,6 +16,8 @@ use edenfs_commands::is_command_enabled_in_rust;
 use edenfs_telemetry::cli_usage::CliUsageSample;
 #[cfg(fbcode_build)]
 use edenfs_telemetry::send_edenfs_cli_usage;
+#[cfg(fbcode_build)]
+use edenfs_telemetry::telemetry_disabled;
 #[cfg(windows)]
 use edenfs_utils::execute_par;
 #[cfg(windows)]
@@ -25,6 +27,12 @@ use fbinit::FacebookInit;
 use testutil::failpoint;
 use tracing_subscriber::filter::EnvFilter;
 
+#[cfg(fbcode_build)]
+use crate::error_report::ErrorReport;
+
+#[cfg(fbcode_build)]
+mod error_report;
+
 #[cfg(not(fbcode_build))]
 // For non-fbcode builds, CliUsageSample is not defined. Let's give it a dummy
 // value so we can pass CliUsageSample through wrapper_main() and fallback().
@@ -32,6 +40,19 @@ struct CliUsageSample;
 
 /// Value used in Python to indicate a command failed to parse
 pub const PYTHON_EDENFSCTL_EX_USAGE: i32 = 64;
+
+// Initialize OpenSSL before curl's `.init_array` constructor so OpenSSL does
+// not register an atexit cleanup that frees its state under HTTP threads still
+// running at exit. Prioritized constructors run before unprioritized ones.
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array.00101")]
+static INIT_OPENSSL: extern "C" fn() = init_openssl;
+
+#[cfg(target_os = "linux")]
+extern "C" fn init_openssl() {
+    http_client::init_openssl();
+}
 
 fn python_fallback() -> Result<Command> {
     if let Ok(args) = std::env::var("EDENFSCTL_REAL") {
@@ -86,7 +107,11 @@ fn python_fallback() -> Result<Command> {
     Err(anyhow!("unable to locate fallback binary"))
 }
 
-fn fallback(reason: Option<&clap::Error>) -> Result<i32> {
+#[cfg_attr(
+    not(fbcode_build),
+    expect(unused_variables, reason = "only fbcode builds log telemetry")
+)]
+fn fallback(reason: Option<&clap::Error>, telemetry_sample: &mut CliUsageSample) -> Result<i32> {
     if std::env::var("EDENFS_LOG").is_ok() {
         setup_logging();
     }
@@ -105,14 +130,37 @@ fn fallback(reason: Option<&clap::Error>) -> Result<i32> {
     cmd.env_remove("PYTHONHOME");
     cmd.env_remove("PYTHONPATH");
 
+    // Python cannot tell a dev build from a release one, so hand it our
+    // decision instead of letting it log where we would not.
+    #[cfg(fbcode_build)]
+    let error_report = if telemetry_disabled() {
+        cmd.env("EDENFS_NO_TELEMETRY", "1");
+        None
+    } else {
+        ErrorReport::attach(&mut cmd)
+            .inspect_err(|error| tracing::debug!(?error, "no error report for Python"))
+            .ok()
+    };
+
+    #[cfg(fbcode_build)]
+    telemetry_sample.set_rust_command(false);
+
     tracing::debug!("Falling back to {:?}", cmd);
 
     // Create a subprocess to run Python edenfsctl
     let status = cmd
         .status()
         .with_context(|| format!("failed to execute: {cmd:?}"))?;
+    let code = status.code().unwrap_or(1);
 
-    Ok(status.code().unwrap_or(1))
+    #[cfg(fbcode_build)]
+    if code != 0
+        && let Some(error_report) = error_report
+    {
+        error_report.record(telemetry_sample);
+    }
+
+    Ok(code)
 }
 
 /// Setup tracing logging. If we are in development mode, we use the fancier logger, otherwise a
@@ -126,33 +174,6 @@ fn setup_logging() {
 
     if let Err(e) = subscriber.try_init() {
         eprintln!("Unable to initialize logger. Logging will be disabled. Cause: {e:?}");
-    }
-}
-
-/// Whether edenfs_cli_usage telemetry should route through XplatLogger, per the
-/// `telemetry:enable-xplatlogger-cli-usage` gate in the on-disk dynamic config
-/// (edenfs_dynamic.rc). Daemon-free, since edenfsctl often runs with no daemon.
-/// Returns false when telemetry is disabled (skipping the config read) or when
-/// the gate is absent/false.
-#[cfg(fbcode_build)]
-fn should_use_xplat_cli_usage() -> bool {
-    // The gate only matters when a sample is actually emitted. When telemetry is
-    // disabled, create_logger returns a NullLogger regardless of the gate, so
-    // reading the config would be wasted I/O on every edenfsctl invocation.
-    if edenfs_telemetry::telemetry_disabled() {
-        return false;
-    }
-
-    let etc_eden_dir = edenfs_client::utils::get_etc_eden_dir(&None);
-    match edenfs_config::load_dynamic_config(&etc_eden_dir) {
-        Ok(config) => config.enable_xplatlogger_cli_usage(),
-        Err(error) => {
-            tracing::debug!(
-                ?error,
-                "failed to read enable-xplatlogger-cli-usage config; using legacy logger"
-            );
-            false
-        }
     }
 }
 
@@ -190,7 +211,7 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
             Err(e) => e.exit(),
         }
     } else if std::env::var("EDENFSCTL_SKIP_RUST").is_ok() {
-        fallback(None)
+        fallback(None, telemetry_sample)
     } else {
         match edenfs_commands::MainCommand::try_parse() {
             // The command is defined in Rust, but check whether it's "enabled"
@@ -204,7 +225,7 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
                     }
                     rust_main(cmd)
                 } else {
-                    match fallback(None) {
+                    match fallback(None, telemetry_sample) {
                         // If the Python version of edenfsctl exited with a
                         // parse error, we should see if the Rust version
                         // exists. This helps prevent cases where rollouts
@@ -225,11 +246,7 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
                         }
                         res => {
                             #[cfg(fbcode_build)]
-                            {
-                                telemetry_sample.set_rust_fallback(false);
-                                // mark the command is triggered as a Python command
-                                telemetry_sample.set_rust_command(false);
-                            }
+                            telemetry_sample.set_rust_fallback(false);
                             res
                         }
                     }
@@ -254,13 +271,13 @@ fn wrapper_main(telemetry_sample: &mut CliUsageSample) -> Result<i32> {
                     if should_use_rust_help(std::env::args(), &None, &None).unwrap_or(false) {
                         e.exit()
                     } else {
-                        fallback(Some(&e))
+                        fallback(Some(&e), telemetry_sample)
                     }
                 } else if e.kind() == clap::error::ErrorKind::UnknownArgument
                     || e.kind() == clap::error::ErrorKind::InvalidSubcommand
                 {
                     // Failed to parse the command. We should try to fallback to Python.
-                    fallback(Some(&e))
+                    fallback(Some(&e), telemetry_sample)
                 } else {
                     // Rust command exists, but encountered a different parsing error. Print the error
                     e.print().ok();
@@ -350,8 +367,7 @@ fn main(_fb: FacebookInit) -> Result<()> {
     #[cfg(fbcode_build)]
     {
         sample.set_exit_code(*code.as_ref().unwrap_or(&1));
-        let enable_xplat = should_use_xplat_cli_usage();
-        send_edenfs_cli_usage(sample.sample, enable_xplat);
+        send_edenfs_cli_usage(sample.sample);
     }
 
     match code {

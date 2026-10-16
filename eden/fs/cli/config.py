@@ -226,8 +226,6 @@ class CheckoutConfig(typing.NamedTuple):
     redirections: Dict[str, "RedirectionType"]
     redirection_targets: Dict[str, str]
     active_prefetch_profiles: List[str]
-    predictive_prefetch_profiles_active: bool
-    predictive_prefetch_num_dirs: int
     enable_sqlite_overlay: bool
     use_write_back_cache: bool
     re_use_case: str
@@ -243,6 +241,7 @@ class ListMountInfo(typing.NamedTuple):
     backing_repo: Optional[Path]
     fs_channel_type: Optional[str] = None
     fuse_transport: Optional[str] = None
+    nfs_transport: Optional[str] = None
     visible_in_daemon_namespace: Optional[bool] = None
 
     def to_json_dict(self) -> Dict[str, Any]:
@@ -265,6 +264,8 @@ class ListMountInfo(typing.NamedTuple):
             d["fs_channel_type"] = self.fs_channel_type
         if self.fuse_transport is not None:
             d["fuse_transport"] = self.fuse_transport
+        if self.nfs_transport is not None:
+            d["nfs_transport"] = self.nfs_transport
         if self.visible_in_daemon_namespace is not None:
             d["visible_in_daemon_namespace"] = self.visible_in_daemon_namespace
         return d
@@ -446,7 +447,7 @@ class EdenInstance(AbstractEdenInstance):
         return logger
 
     def _create_telemetry_logger(self) -> telemetry.TelemetryLogger:
-        if "INTEGRATION_TEST" in os.environ or "EDENFS_UNITTEST" in os.environ:
+        if telemetry.telemetry_disabled_by_env():
             return telemetry.NullTelemetryLogger()
 
         try:
@@ -666,6 +667,7 @@ class EdenInstance(AbstractEdenInstance):
                 backing_repo=backing_repo,
                 fs_channel_type=thrift_mount.fsChannelType,
                 fuse_transport=thrift_mount.fuseTransport,
+                nfs_transport=thrift_mount.nfsTransport,
                 visible_in_daemon_namespace=thrift_mount.visibleInDaemonNamespace,
             )
 
@@ -1517,18 +1519,10 @@ class EdenCheckout:
             "profiles": {
                 "active": checkout_config.active_prefetch_profiles,
             },
-            "predictive-prefetch": {
-                "predictive-prefetch-active": checkout_config.predictive_prefetch_profiles_active,
-            },
             "recas": {
                 "use-case": checkout_config.re_use_case,
             },
         }
-
-        if checkout_config.predictive_prefetch_num_dirs:
-            config_data["predictive-prefetch"]["predictive-prefetch-num-dirs"] = (
-                checkout_config.predictive_prefetch_num_dirs  # pyrefly: ignore [bad-assignment, bad-typed-dict-key]
-            )
 
         util.write_file_atomically(
             self._config_path(), toml.dumps(config_data).encode()
@@ -1647,22 +1641,6 @@ class EdenCheckout:
 
                     prefetch_profiles.append(profile)
 
-        predictive_prefetch_active = False
-        predictive_num_dirs = 0
-        predictive_prefetch_profiles_config = config.get("predictive-prefetch")
-
-        if predictive_prefetch_profiles_config is not None:
-            predictive_prefetch_active = predictive_prefetch_profiles_config.get(
-                "predictive-prefetch-active"
-            )
-            predictive_num_dirs = predictive_prefetch_profiles_config.get(
-                "predictive-prefetch-num-dirs"
-            )
-            # if predictive-prefetch-num-dirs is not set in config.toml, set
-            # predictive_num_dirs to 0 to avoid None != 0 comparisons elsewhere
-            if predictive_num_dirs is None:
-                predictive_num_dirs = 0
-
         enable_sqlite_overlay = repository.get("enable-sqlite-overlay")
         # SqliteOverlay is default on Windows
         if not isinstance(enable_sqlite_overlay, bool):
@@ -1725,9 +1703,6 @@ class EdenCheckout:
                 repository.get("default-revision") or DEFAULT_REVISION[scm_type]
             ),
             active_prefetch_profiles=prefetch_profiles,
-            # pyrefly: ignore [bad-argument-type]
-            predictive_prefetch_profiles_active=predictive_prefetch_active,
-            predictive_prefetch_num_dirs=predictive_num_dirs,
             enable_sqlite_overlay=enable_sqlite_overlay,
             use_write_back_cache=use_write_back_cache,
             re_use_case=re_use_case,
@@ -1894,11 +1869,24 @@ _DEFAULT_FUSE_IO_URING_KERNEL_RELEASE_REGEX = r"^6\.13\."
 FUSE_TRANSPORT_DEVFUSE = "devfuse"
 FUSE_TRANSPORT_IO_URING = "io_uring"
 
+_NFS_USE_UDS = "nfs.use-uds"
+_NFS_RESTART_ON_TRANSPORT_MISMATCH = "nfs.restart-on-transport-mismatch"
 
-class FuseTransportMismatch(typing.NamedTuple):
+NFS_TRANSPORT_TCP = "tcp"
+NFS_TRANSPORT_UNIX = "unix"
+
+
+class TransportMismatch(typing.NamedTuple):
+    """A mount whose channel transport differs from the configured one."""
+
     mount: Path
     active_transport: str
     desired_transport: str
+    # "fuse" or "nfs"
+    channel: str = "fuse"
+
+
+FuseTransportMismatch = TransportMismatch
 
 
 def is_fuse_transport_mismatch_restart_enabled(
@@ -1959,6 +1947,55 @@ def get_fuse_transport_mismatches(
                     desired_transport=desired_transport,
                 )
             )
+    return mismatches
+
+
+def is_nfs_transport_mismatch_restart_enabled(
+    instance: AbstractEdenInstance,
+) -> bool:
+    return sys.platform != "win32" and instance.get_config_bool(
+        _NFS_RESTART_ON_TRANSPORT_MISMATCH, default=False
+    )
+
+
+def get_desired_nfs_transport(instance: AbstractEdenInstance) -> str:
+    if instance.get_config_bool(_NFS_USE_UDS, default=False):
+        return NFS_TRANSPORT_UNIX
+    return NFS_TRANSPORT_TCP
+
+
+def get_nfs_transport_mismatches(
+    instance: AbstractEdenInstance,
+) -> List[TransportMismatch]:
+    """NFS mounts whose transport differs from nfs.use-uds.
+
+    A running daemon keeps the transport its mountd was created with, so
+    after the setting changes every NFS mount mismatches until a full
+    restart.
+    """
+    desired_transport = get_desired_nfs_transport(instance)
+    return [
+        TransportMismatch(
+            mount=mount_info.path,
+            active_transport=mount_info.nfs_transport,
+            desired_transport=desired_transport,
+            channel="nfs",
+        )
+        for mount_info in instance.get_mounts().values()
+        if mount_info.nfs_transport is not None
+        and mount_info.nfs_transport != desired_transport
+    ]
+
+
+def get_transport_mismatches(
+    instance: AbstractEdenInstance,
+) -> List[TransportMismatch]:
+    """Mismatches of every channel whose restart-on-mismatch flag is on."""
+    mismatches: List[TransportMismatch] = []
+    if is_fuse_transport_mismatch_restart_enabled(instance):
+        mismatches.extend(get_fuse_transport_mismatches(instance))
+    if is_nfs_transport_mismatch_restart_enabled(instance):
+        mismatches.extend(get_nfs_transport_mismatches(instance))
     return mismatches
 
 
@@ -2375,8 +2412,6 @@ def create_checkout_config(
         redirections={},
         redirection_targets={},
         active_prefetch_profiles=[],
-        predictive_prefetch_profiles_active=False,
-        predictive_prefetch_num_dirs=0,
         enable_sqlite_overlay=enable_sqlite_overlay,
         use_write_back_cache=False,
         re_use_case=re_use_case or "buck2-default",

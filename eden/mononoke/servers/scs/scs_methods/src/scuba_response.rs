@@ -76,6 +76,18 @@ impl AddScubaResponse for thrift::RepoDeleteBookmarkResponse {}
 
 impl AddScubaResponse for thrift::RepoLandStackResponse {}
 
+impl AddScubaResponse for thrift::RepoRebaseStackResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("response_overlapping_paths", self.overlapping_path_count);
+        scuba.add("response_merged_paths", self.merged_path_count);
+        scuba.add(
+            "response_dropped_commits",
+            self.rebased_commits.iter().filter(|c| c.dropped).count() as i64,
+        );
+        scuba.add("response_stack_size", self.rebased_commits.len() as i64);
+    }
+}
+
 impl AddScubaResponse for thrift::RepoListBookmarksResponse {}
 
 impl AddScubaResponse for thrift::RepoResolveBookmarkResponse {}
@@ -102,7 +114,7 @@ impl AddScubaResponse for thrift::CommitFileDiffsResponse {
             .path_diffs
             .iter()
             .filter_map(|response| match &response.diff {
-                thrift::Diff::metadata_diff(metadata) => match (
+                Some(thrift::Diff::metadata_diff(metadata)) => match (
                     metadata.old_file_info.file_content_type,
                     metadata.new_file_info.file_content_type,
                 ) {

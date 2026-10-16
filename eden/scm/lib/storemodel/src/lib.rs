@@ -36,6 +36,7 @@ use metalog::MetaLog;
 pub use minibytes;
 pub use minibytes::Bytes;
 use parking_lot::RwLock;
+use repo_minimal_info::RepoMinimalInfo;
 use serde::Deserialize;
 use serde::Serialize;
 use slex_items::Items;
@@ -395,7 +396,8 @@ pub trait TreeEntry: Send + Sync + 'static {
     /// Get children entries that will be denied permission when fetched.
     fn permission_denied_children(
         &self,
-    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>>>
+    {
         self.filter_permission_denied(self.children_with_acls()?)
     }
 
@@ -403,7 +405,8 @@ pub trait TreeEntry: Send + Sync + 'static {
     fn filter_permission_denied(
         &self,
         _children_with_acl: Vec<(PathComponentBuf, HgId)>,
-    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, PermissionDenial)>>>
+    {
         Ok(Box::new(std::iter::empty()))
     }
 
@@ -415,6 +418,15 @@ pub trait TreeEntry: Send + Sync + 'static {
 
     /// Get number of entries, if available. Useful to pre-allocate vector capacity, etc.
     fn size_hint(&self) -> Option<usize>;
+}
+
+/// Why a `has_acl` directory child was denied, as reported by the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionDenial {
+    /// ACL to request access through.
+    pub request_acl: String,
+    /// Repo-configured text to show with the denial, if any.
+    pub denial_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -679,6 +691,12 @@ pub trait StoreInfo: 'static {
     /// Provide the "storage path", which is usually `.sl/store` in the backing repo.
     /// Returns `None` for ephemeral repos with no local disk storage.
     fn store_path(&self) -> Option<&Path>;
+    /// Provide the minimal information for a local repository.
+    ///
+    /// Returns `None` for repositories without a local working copy.
+    fn repo_minimal_info(&self) -> Option<&RepoMinimalInfo> {
+        None
+    }
     /// Provide the remote peer.
     fn remote_peer(&self) -> anyhow::Result<Option<Arc<dyn SaplingRemoteApi>>>;
     // Provide the metalog, useful to sync refs from git.

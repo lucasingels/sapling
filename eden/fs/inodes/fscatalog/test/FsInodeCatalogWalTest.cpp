@@ -11,9 +11,14 @@
 #include <sys/stat.h>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <folly/FileUtil.h>
+#include <folly/String.h>
+#include <folly/Varint.h>
 #include <folly/testing/TestUtil.h>
 
 #include "eden/common/utils/PathFuncs.h"
@@ -57,6 +62,18 @@ class FsInodeCatalogWalTest : public ::testing::TestWithParam<bool> {
       store_->close();
       store_.reset();
     }
+  }
+
+  /// Replace the store with one that writes new WAL files in `format`.
+  void reopenStore(WalFormat format) {
+    store_->close();
+    store_ = std::make_unique<FsFileContentStore>(
+        canonicalPath(testDir_.path().string()),
+        /*directFileCreate=*/false,
+        /*cacheWalFiles=*/GetParam(),
+        FsFileContentStore::kDefaultWalFileCacheSize,
+        format);
+    store_->initialize(/*createIfNonExisting=*/true);
   }
 
   /// Read the raw bytes of the WAL file for `parent`.
@@ -123,6 +140,45 @@ uint32_t readU32(const std::string& data, size_t offset) {
   uint32_t v = 0;
   std::memcpy(&v, data.data() + offset, sizeof(v));
   return v;
+}
+
+// Decode the varint at `offset`, advancing `offset` past it.
+uint64_t readVarint(const std::string& data, size_t& offset) {
+  folly::StringPiece rest{data};
+  rest.advance(offset);
+  const auto value = folly::decodeVarint(rest);
+  offset = data.size() - rest.size();
+  return value;
+}
+
+void appendVarint(std::string& out, uint64_t value) {
+  std::array<uint8_t, folly::kMaxVarintLength64> buf{};
+  const auto size = folly::encodeVarint(value, buf.data());
+  out.append(reinterpret_cast<const char*>(buf.data()), size);
+}
+
+// Build a complete v2 WAL file (header plus one ADD record) with arbitrary
+// field values, so the reader's range checks can be exercised directly.
+std::string makeV2AddWal(
+    folly::StringPiece name,
+    uint64_t mode,
+    uint64_t inodeNumber,
+    folly::StringPiece hash = {}) {
+  std::string payload;
+  payload.push_back(static_cast<char>(WalOpType::ADD));
+  appendVarint(payload, name.size());
+  payload.append(name.data(), name.size());
+  appendVarint(payload, mode);
+  appendVarint(payload, inodeNumber);
+  appendVarint(payload, hash.size());
+  payload.append(hash.data(), hash.size());
+  payload.push_back(0); // isRestricted
+  payload.push_back(0); // aclRootState
+
+  std::string bytes{"OVWL"};
+  bytes.append(std::string("\0\0\0\2", 4));
+  appendVarint(bytes, payload.size());
+  return bytes + payload;
 }
 
 uint16_t readU16(const std::string& data, size_t offset) {
@@ -663,6 +719,456 @@ TEST_P(FsInodeCatalogWalTest, loadWalDelta_truncatedTailIsDiscarded) {
   EXPECT_FALSE(delta.count("drop"));
 }
 
+namespace {
+
+// A WAL written by the EdenFS daemon on a devserver before the versioned
+// WAL work, copied from the overlay (`local/7a/13178.wal`). It holds REMOVE
+// journal.branch, REMOVE undo.desc, ADD undo.desc (0100644, inode
+// 317029781, no object ID), REMOVE journal.desc.
+const std::string kProductionV1WalHex =
+    "11000000020e006a6f75726e616c2e6272616e63680c000000020900756e646f2e646573"
+    "631b000000010900756e646f2e64657363a4810000957de512000000000000000f000000"
+    "020c006a6f75726e616c2e64657363";
+
+// Written by appendWalEntry before the versioned WAL work via the same calls
+// as appendGoldenEntries(). Covers what the production sample lacks: object
+// IDs (20 and 255 bytes, one with an embedded NUL), the ACL tail, a
+// directory, MATERIALIZE, and a 300-byte name.
+const std::string kSyntheticV1WalHex =
+    "2e00000001080066696c652e747874a48100002a0000000000000014abababababababab"
+    "abababababababababababab000018000000010600737562646972ed4100000700000000"
+    "000000000000180000000106007365637265748081000009000000000000000001030700"
+    "0000020400676f6e65060000000303006d61743d020000012c016e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6ea481000015cd5b0700000000ff858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585850085858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "8585858585858585858585858585858585850000";
+
+std::string unhex(const std::string& hex) {
+  std::string out;
+  CHECK(folly::unhexlify(hex, out));
+  return out;
+}
+
+std::string goldenLongHash() {
+  std::string hash(255, '\x85');
+  hash[100] = '\0';
+  return hash;
+}
+
+void appendGoldenEntries(FsFileContentStore& store, InodeNumber parent) {
+  auto file = makeEntryWithHash(0100644, 42, std::string(20, '\xab'));
+  store.appendWalEntry(parent, WalOpType::ADD, "file.txt"_pc, &file);
+  auto dir = makeEntry(S_IFDIR | 0755, 7);
+  store.appendWalEntry(parent, WalOpType::ADD, "subdir"_pc, &dir);
+  auto restricted =
+      makeEntryWithAclRootState(0100600, 9, AclRootState::RestrictedAclRoot);
+  store.appendWalEntry(parent, WalOpType::ADD, "secret"_pc, &restricted);
+  store.appendWalEntry(parent, WalOpType::REMOVE, "gone"_pc, nullptr);
+  store.appendWalEntry(parent, WalOpType::MATERIALIZE, "mat"_pc, nullptr);
+  auto big = makeEntryWithHash(0100644, 123456789, goldenLongHash());
+  store.appendWalEntry(
+      parent, WalOpType::ADD, PathComponentPiece{std::string(300, 'n')}, &big);
+}
+
+void appendProductionEntries(FsFileContentStore& store, InodeNumber parent) {
+  store.appendWalEntry(parent, WalOpType::REMOVE, "journal.branch"_pc, nullptr);
+  store.appendWalEntry(parent, WalOpType::REMOVE, "undo.desc"_pc, nullptr);
+  auto undo = makeEntry(0100644, 317029781);
+  store.appendWalEntry(parent, WalOpType::ADD, "undo.desc"_pc, &undo);
+  store.appendWalEntry(parent, WalOpType::REMOVE, "journal.desc"_pc, nullptr);
+}
+
+// Field-level expectations for the records appendGoldenEntries() writes.
+void expectGoldenDelta(const LoadWalResult& result) {
+  EXPECT_EQ(0u, result.parseErrors);
+  EXPECT_EQ(6u, result.rawEntriesParsed);
+  ASSERT_EQ(6u, result.delta.size());
+
+  const auto& file = result.delta.at("file.txt");
+  EXPECT_EQ(WalOpType::ADD, file.type);
+  EXPECT_EQ(0100644, *file.entry.mode());
+  EXPECT_EQ(42, *file.entry.inodeNumber());
+  EXPECT_EQ(std::string(20, '\xab'), *file.entry.hash());
+  EXPECT_FALSE(*file.entry.isRestricted());
+
+  const auto& dir = result.delta.at("subdir");
+  EXPECT_EQ(S_IFDIR | 0755, *dir.entry.mode());
+  EXPECT_EQ(7, *dir.entry.inodeNumber());
+  EXPECT_FALSE(dir.entry.hash().has_value());
+
+  const auto& secret = result.delta.at("secret");
+  EXPECT_EQ(0100600, *secret.entry.mode());
+  EXPECT_EQ(9, *secret.entry.inodeNumber());
+  EXPECT_TRUE(*secret.entry.isRestricted());
+  EXPECT_EQ(
+      static_cast<int32_t>(AclRootState::RestrictedAclRoot),
+      *secret.entry.aclRootState());
+
+  EXPECT_EQ(WalOpType::REMOVE, result.delta.at("gone").type);
+  EXPECT_EQ(WalOpType::MATERIALIZE, result.delta.at("mat").type);
+
+  const auto& big = result.delta.at(std::string(300, 'n'));
+  EXPECT_EQ(123456789, *big.entry.inodeNumber());
+  EXPECT_EQ(goldenLongHash(), *big.entry.hash());
+}
+
+} // namespace
+
+// The golden tests pin the v1 byte layout to captures made before this
+// code existed, so a change to the encoder or decoder fails against real
+// bytes rather than against itself.
+TEST_P(FsInodeCatalogWalTest, goldenV1_productionWalDecodes) {
+  const InodeNumber parent{13178};
+  const auto bytes = unhex(kProductionV1WalHex);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  const auto result = store_->loadWalDelta(parent);
+  EXPECT_EQ(0u, result.parseErrors);
+  EXPECT_EQ(4u, result.rawEntriesParsed);
+  ASSERT_EQ(3u, result.delta.size());
+  EXPECT_EQ(WalOpType::REMOVE, result.delta.at("journal.branch").type);
+  EXPECT_EQ(WalOpType::REMOVE, result.delta.at("journal.desc").type);
+  const auto& undo = result.delta.at("undo.desc");
+  EXPECT_EQ(WalOpType::ADD, undo.type);
+  EXPECT_EQ(0100644, *undo.entry.mode());
+  EXPECT_EQ(317029781, *undo.entry.inodeNumber());
+  EXPECT_FALSE(undo.entry.hash().has_value());
+  EXPECT_FALSE(*undo.entry.isRestricted());
+  EXPECT_EQ(0, *undo.entry.aclRootState());
+}
+
+TEST_P(FsInodeCatalogWalTest, goldenV1_productionWalReencodes) {
+  const InodeNumber parent{13179};
+  appendProductionEntries(*store_, parent);
+  EXPECT_EQ(kProductionV1WalHex, folly::hexlify(readWal(parent)));
+}
+
+TEST_P(FsInodeCatalogWalTest, goldenV1_syntheticWalDecodes) {
+  const InodeNumber parent{778};
+  ASSERT_NO_FATAL_FAILURE(
+      writeRawWal(testDir_, parent, unhex(kSyntheticV1WalHex)));
+
+  const auto result = store_->loadWalDelta(parent);
+  expectGoldenDelta(result);
+}
+
+TEST_P(FsInodeCatalogWalTest, goldenV1_syntheticWalReencodes) {
+  const InodeNumber parent{779};
+  appendGoldenEntries(*store_, parent);
+  EXPECT_EQ(kSyntheticV1WalHex, folly::hexlify(readWal(parent)));
+}
+
+namespace {
+// The same appendGoldenEntries() records in the v2 layout: OVWL header, then
+// every integer as a varint. Pinned when v2 was introduced so later changes
+// to the encoder or decoder fail against fixed bytes.
+const std::string kSyntheticV2WalHex =
+    "4f56574c0000000225010866696c652e747874a483022a14abababababababababababab"
+    "abababababababab00000f0106737562646972ed8301070000000f010673656372657480"
+    "830209000103060204676f6e650503036d6174b90401ac026e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+    "a48302959aef3aff01858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "850085858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "858585858585858585858585858585858585858585858585858585858585858585858585"
+    "8585858585858585858585850000";
+} // namespace
+
+TEST_P(FsInodeCatalogWalTest, goldenV2_syntheticWalDecodes) {
+  const InodeNumber parent{780};
+  ASSERT_NO_FATAL_FAILURE(
+      writeRawWal(testDir_, parent, unhex(kSyntheticV2WalHex)));
+  expectGoldenDelta(store_->loadWalDelta(parent));
+}
+
+TEST_P(FsInodeCatalogWalTest, goldenV2_syntheticWalReencodes) {
+  reopenStore(WalFormat::Version2);
+  const InodeNumber parent{781};
+  appendGoldenEntries(*store_, parent);
+  EXPECT_EQ(kSyntheticV2WalHex, folly::hexlify(readWal(parent)));
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_trailingBytesShorterThanEntryLen) {
+  // A tail too short to hold an entryLen is a torn write, not padding.
+  // Reporting it lets loadOverlayDir heal the file.
+  const InodeNumber parent{352};
+  const auto frame = makeOldFormatAddWalFrame("keep", 0100644, 1);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, frame + "\x05\x00"));
+  auto result = store_->loadWalDelta(parent);
+  EXPECT_EQ(1u, result.delta.size());
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+  EXPECT_EQ(1u, result.parseErrors);
+
+  // Same for v2: 0x80 is a varint continuation byte with nothing after it.
+  const InodeNumber v2{353};
+  ASSERT_NO_FATAL_FAILURE(
+      writeRawWal(testDir_, v2, makeV2AddWal("keep", 0100644, 1) + "\x80"));
+  result = store_->loadWalDelta(v2);
+  EXPECT_EQ(1u, result.delta.size());
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+  EXPECT_EQ(1u, result.parseErrors);
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_preservesLegacyLongObjectIds) {
+  for (const auto size : {128u, 255u}) {
+    const InodeNumber parent{350 + size};
+    const std::string id(size, '\x85');
+    const auto bytes = makeOldFormatAddWalFrame("entry", 0100644, 12, id);
+    ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+    const auto result = store_->loadWalDelta(parent);
+    ASSERT_EQ(1u, result.delta.size());
+    EXPECT_EQ(id, *result.delta.at("entry").entry.hash());
+    EXPECT_EQ(0u, result.parseErrors);
+    EXPECT_EQ(bytes, readWal(parent));
+  }
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_rejectsUnknownWalVersion) {
+  const InodeNumber parent{351};
+  std::string bytes{"OVWL"};
+  bytes.push_back(0);
+  bytes.push_back(0);
+  bytes.push_back(0);
+  bytes.push_back(3);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  EXPECT_THROW(store_->loadWalDelta(parent), std::runtime_error);
+  EXPECT_EQ(bytes, readWal(parent));
+
+  // The writer sniffs the same header, so it refuses to append to a file it
+  // cannot classify rather than mixing formats.
+  EXPECT_THROW(
+      store_->appendWalEntry(parent, WalOpType::REMOVE, "x"_pc, nullptr),
+      std::runtime_error);
+  EXPECT_EQ(bytes, readWal(parent));
+}
+
+TEST_P(FsInodeCatalogWalTest, shortWalHealsLikeTornWrite) {
+  // A file that ends inside "OVWL" + version, or is too short to hold even
+  // an entryLen and op byte, holds no record. The reader reports it so
+  // loadOverlayDir rewrites and clears it, and the writer starts the file
+  // over instead of wedging behind it or appending after a partial header.
+  const std::vector<std::string> torn{
+      std::string("OVWL\0", 5), // versioned header cut inside the version
+      "OVW", // versioned header cut inside the identifier
+      std::string("\x05\0\0", 3), // v1 entryLen cut short
+  };
+  uint64_t ino = 356;
+  for (const auto& bytes : torn) {
+    const InodeNumber parent{ino++};
+    ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+    auto result = store_->loadWalDelta(parent);
+    EXPECT_TRUE(result.delta.empty());
+    EXPECT_EQ(1u, result.parseErrors);
+    EXPECT_EQ(bytes, readWal(parent));
+
+    store_->appendWalEntry(parent, WalOpType::REMOVE, "x"_pc, nullptr);
+    EXPECT_FALSE(folly::StringPiece{readWal(parent)}.startsWith("OVW"));
+    result = store_->loadWalDelta(parent);
+    EXPECT_EQ(0u, result.parseErrors);
+    ASSERT_EQ(1u, result.delta.size());
+    EXPECT_EQ(WalOpType::REMOVE, result.delta.at("x").type);
+  }
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_version2RejectsPaddedVarint) {
+  // 0x84 0x00 decodes to 4 but is not the shortest encoding of 4.
+  const InodeNumber parent{357};
+  auto bytes = makeV2AddWal("keep", 0100644, 1);
+  const auto nameLenOffset = FsFileContentStore::kWalVersion2HeaderLength +
+      1 /* entryLen */ + 1 /* op */;
+  ASSERT_EQ('\x04', bytes[nameLenOffset]);
+  bytes.replace(nameLenOffset, 1, "\x84\x00", 2);
+  // Fix up entryLen for the extra byte so only the varint itself is off.
+  bytes[FsFileContentStore::kWalVersion2HeaderLength] += 1;
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  const auto result = store_->loadWalDelta(parent);
+  EXPECT_TRUE(result.delta.empty());
+  EXPECT_EQ(1u, result.parseErrors);
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_version2RejectsOutOfRangeFields) {
+  // A mode that does not fit 32 bits is a corrupt frame, not a truncation.
+  const InodeNumber badMode{354};
+  ASSERT_NO_FATAL_FAILURE(
+      writeRawWal(testDir_, badMode, makeV2AddWal("x", uint64_t{1} << 32, 1)));
+  auto result = store_->loadWalDelta(badMode);
+  EXPECT_TRUE(result.delta.empty());
+  EXPECT_EQ(1u, result.parseErrors);
+
+  // A negative inode number survives the unsigned varint bit-for-bit and is
+  // then skipped by the same check v1 applies.
+  const InodeNumber negInode{355};
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(
+      testDir_,
+      negInode,
+      makeV2AddWal("x", 0100644, static_cast<uint64_t>(int64_t{-1}))));
+  result = store_->loadWalDelta(negInode);
+  EXPECT_TRUE(result.delta.empty());
+  EXPECT_EQ(1u, result.parseErrors);
+}
+
+TEST_P(FsInodeCatalogWalTest, version2WalUsesVarintFields) {
+  reopenStore(WalFormat::Version2);
+
+  const std::string name(128, 'n');
+  for (const auto idSize : {0u, 127u, 128u, 255u, 256u, 262u}) {
+    const InodeNumber parent{800 + idSize};
+    std::string id(idSize, '\x85');
+    if (!id.empty()) {
+      id[id.size() / 2] = '\0';
+    }
+    auto entry = makeEntryWithHash(0100644, 12, id);
+    store_->appendWalEntry(
+        parent, WalOpType::ADD, PathComponentPiece{name}, &entry);
+
+    const auto bytes = readWal(parent);
+    ASSERT_GE(bytes.size(), FsFileContentStore::kWalVersion2HeaderLength + 1);
+    EXPECT_EQ("OVWL", bytes.substr(0, 4));
+    EXPECT_EQ(std::string("\0\0\0\2", 4), bytes.substr(4, 4));
+
+    // Every integer is a varint: entryLen, nameLen, mode, inodeNumber,
+    // hashLen. Walk the record with an independent decoder.
+    size_t offset = FsFileContentStore::kWalVersion2HeaderLength;
+    EXPECT_EQ(bytes.size() - offset - 2, readVarint(bytes, offset));
+    EXPECT_EQ(WalOpType::ADD, static_cast<WalOpType>(bytes[offset++]));
+    // 128 needs two bytes: 0x80 0x01.
+    EXPECT_EQ(0x80, static_cast<uint8_t>(bytes[offset]));
+    EXPECT_EQ(0x01, static_cast<uint8_t>(bytes[offset + 1]));
+    EXPECT_EQ(name.size(), readVarint(bytes, offset));
+    EXPECT_EQ(name, bytes.substr(offset, name.size()));
+    offset += name.size();
+    const auto modeOffset = offset;
+    EXPECT_EQ(0100644u, readVarint(bytes, offset));
+    EXPECT_EQ(3u, offset - modeOffset);
+    const auto inodeOffset = offset;
+    EXPECT_EQ(12u, readVarint(bytes, offset));
+    EXPECT_EQ(1u, offset - inodeOffset);
+    EXPECT_EQ(idSize, readVarint(bytes, offset));
+    EXPECT_EQ(id, bytes.substr(offset, idSize));
+    offset += idSize;
+    // isRestricted and aclRootState trail the record as single bytes.
+    EXPECT_EQ(bytes.size(), offset + 2);
+
+    const auto result = store_->loadWalDelta(parent);
+    ASSERT_EQ(1u, result.delta.size());
+    ASSERT_EQ(0u, result.parseErrors);
+    const auto& loaded = result.delta.at(name).entry;
+    EXPECT_EQ(0100644, *loaded.mode());
+    EXPECT_EQ(12, *loaded.inodeNumber());
+    EXPECT_EQ(idSize, loaded.hash().value_or("").size());
+    if (idSize != 0) {
+      EXPECT_EQ(id, *loaded.hash());
+    }
+  }
+}
+
+TEST_P(
+    FsInodeCatalogWalTest,
+    version2WalRejectsMalformedVarintAfterValidPrefix) {
+  reopenStore(WalFormat::Version2);
+
+  const InodeNumber parent{1099};
+  auto entry = makeEntryWithHash(0100644, 12, std::string(20, '\x85'));
+  store_->appendWalEntry(parent, WalOpType::ADD, "keep"_pc, &entry);
+  store_->appendWalEntry(parent, WalOpType::ADD, "bad"_pc, &entry);
+
+  auto bytes = readWal(parent);
+  // Skip the first record, then walk the second up to its hashLen varint.
+  size_t offset = FsFileContentStore::kWalVersion2HeaderLength;
+  offset += readVarint(bytes, offset);
+  readVarint(bytes, offset); // entryLen
+  ++offset; // op
+  offset += readVarint(bytes, offset); // nameLen + name
+  readVarint(bytes, offset); // mode
+  readVarint(bytes, offset); // inodeNumber
+  ASSERT_GE(bytes.size(), offset + 5);
+  bytes.replace(offset, 5, 5, static_cast<char>(0xff));
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  const auto result = store_->loadWalDelta(parent);
+  ASSERT_EQ(1u, result.delta.size());
+  EXPECT_EQ("keep", result.delta.begin()->first);
+  EXPECT_EQ(1u, result.parseErrors);
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+}
+
+TEST_P(FsInodeCatalogWalTest, appendWalEntry_existingFileFormatWinsOverConfig) {
+  // A v1 file written before the flag flipped keeps receiving v1 records.
+  const InodeNumber v1Parent{1100};
+  const auto v1Frame = makeOldFormatAddWalFrame("old", 0100644, 1);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, v1Parent, v1Frame));
+  reopenStore(WalFormat::Version2);
+  store_->appendWalEntry(v1Parent, WalOpType::REMOVE, "gone"_pc, nullptr);
+  auto bytes = readWal(v1Parent);
+  EXPECT_EQ(v1Frame, bytes.substr(0, v1Frame.size()));
+  EXPECT_EQ(2u, store_->loadWalDelta(v1Parent).delta.size());
+
+  // A v2 file keeps its header and varint records after the flag is off.
+  const InodeNumber v2Parent{1101};
+  store_->appendWalEntry(v2Parent, WalOpType::REMOVE, "first"_pc, nullptr);
+  reopenStore(WalFormat::Version1);
+  store_->appendWalEntry(v2Parent, WalOpType::REMOVE, "second"_pc, nullptr);
+  bytes = readWal(v2Parent);
+  EXPECT_EQ("OVWL", bytes.substr(0, 4));
+  const auto result = store_->loadWalDelta(v2Parent);
+  EXPECT_EQ(2u, result.delta.size());
+  EXPECT_EQ(0u, result.parseErrors);
+}
+
+TEST_P(FsInodeCatalogWalTest, appendWalEntry_rejectsFieldsTooLargeForVersion1) {
+  const auto entry = makeEntryWithHash(0100644, 7, std::string(256, '\x85'));
+
+  // Configured v1 with no file yet: the rejected append writes no record.
+  const InodeNumber fresh{1102};
+  EXPECT_THROW(
+      store_->appendWalEntry(fresh, WalOpType::ADD, "big"_pc, &entry),
+      WalEntryTooLargeError);
+  const std::string longName(
+      size_t{std::numeric_limits<uint16_t>::max()} + 1, 'n');
+  EXPECT_THROW(
+      store_->appendWalEntry(
+          fresh, WalOpType::REMOVE, PathComponentPiece{longName}, nullptr),
+      WalEntryTooLargeError);
+  EXPECT_TRUE(readWal(fresh).empty());
+
+  // Configured v2 but an existing v1 file: the file is left untouched.
+  const InodeNumber legacy{1103};
+  const auto v1Frame = makeOldFormatAddWalFrame("old", 0100644, 1);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, legacy, v1Frame));
+  reopenStore(WalFormat::Version2);
+  EXPECT_THROW(
+      store_->appendWalEntry(legacy, WalOpType::ADD, "big"_pc, &entry),
+      WalEntryTooLargeError);
+  EXPECT_EQ(v1Frame, readWal(legacy));
+}
+
 TEST_P(FsInodeCatalogWalTest, loadWalDelta_unknownOpIsSkipped) {
   // Forward-compat: an unknown opcode WITH a valid entryLen frame is
   // skipped (advanced by entryLen), not fatal. A subsequent valid REMOVE
@@ -690,6 +1196,64 @@ TEST_P(FsInodeCatalogWalTest, loadWalDelta_unknownOpIsSkipped) {
   // entry — keeping the OverlayStats::walEntriesReplayed and
   // wal_parse_failure counters from double-counting the same entry.
   EXPECT_EQ(1u, result.parseErrors);
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+}
+
+// An entry whose name is not a valid path component is skipped and counted
+// as a parse error, so the frame after it is still applied and the caller
+// rewrites the base and removes the WAL.
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_skipsEmptyName) {
+  const InodeNumber parent{308};
+  std::string bytes = makeOldFormatAddWalFrame("", 0100644, 1);
+  bytes += makeOldFormatAddWalFrame("ok", 0100644, 2);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  auto result = store_->loadWalDelta(parent);
+  ASSERT_EQ(1u, result.delta.size());
+  EXPECT_EQ(2, *result.delta.at("ok").entry.inodeNumber());
+  EXPECT_EQ(1u, result.parseErrors);
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_skipsInvalidUtf8Name) {
+  const InodeNumber parent{309};
+  std::string bytes = makeOldFormatAddWalFrame("\xff\xfe", 0100644, 1);
+  bytes += makeOldFormatAddWalFrame("ok", 0100644, 2);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  auto result = store_->loadWalDelta(parent);
+  ASSERT_EQ(1u, result.delta.size());
+  EXPECT_EQ(2, *result.delta.at("ok").entry.inodeNumber());
+  EXPECT_EQ(1u, result.parseErrors);
+  EXPECT_EQ(1u, result.rawEntriesParsed);
+}
+
+// The reader cannot tell which modes a DirEntry accepts, so a mode outside
+// the initial mode mask is passed through for Overlay::loadOverlayDir to
+// reject.
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_passesThroughUnknownModeBits) {
+  const InodeNumber parent{310};
+  const int32_t badMode = static_cast<int32_t>(0x0f000000 | 0100644);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(
+      testDir_, parent, makeOldFormatAddWalFrame("bad", badMode, 1)));
+
+  auto result = store_->loadWalDelta(parent);
+  ASSERT_EQ(1u, result.delta.size());
+  EXPECT_EQ(badMode, *result.delta.at("bad").entry.mode());
+  EXPECT_EQ(0u, result.parseErrors);
+}
+
+TEST_P(FsInodeCatalogWalTest, loadWalDelta_skipsNonPositiveInodeNumber) {
+  const InodeNumber parent{311};
+  std::string bytes = makeOldFormatAddWalFrame("zero", 0100644, 0);
+  bytes += makeOldFormatAddWalFrame("neg", 0100644, -1);
+  bytes += makeOldFormatAddWalFrame("ok", 0100644, 3);
+  ASSERT_NO_FATAL_FAILURE(writeRawWal(testDir_, parent, bytes));
+
+  auto result = store_->loadWalDelta(parent);
+  ASSERT_EQ(1u, result.delta.size());
+  EXPECT_EQ(3, *result.delta.at("ok").entry.inodeNumber());
+  EXPECT_EQ(2u, result.parseErrors);
   EXPECT_EQ(1u, result.rawEntriesParsed);
 }
 

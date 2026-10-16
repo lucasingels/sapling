@@ -21,6 +21,8 @@ use bonsai_globalrev_mapping::ArcBonsaiGlobalrevMapping;
 use bonsai_globalrev_mapping::SqlBonsaiGlobalrevMappingBuilder;
 use bonsai_hg_mapping::ArcBonsaiHgMapping;
 use bonsai_hg_mapping::SqlBonsaiHgMappingBuilder;
+use bonsai_p4_mapping::ArcBonsaiP4Mapping;
+use bonsai_p4_mapping::SqlBonsaiP4MappingBuilder;
 use bonsai_svnrev_mapping::ArcBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::SqlBonsaiSvnrevMappingBuilder;
 use bonsai_tag_mapping::ArcBonsaiTagMapping;
@@ -312,6 +314,7 @@ impl TestRepoFactory {
         metadata_con.execute_batch(SqlBookmarksBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGitMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGlobalrevMappingBuilder::CREATION_QUERY)?;
+        metadata_con.execute_batch(SqlBonsaiP4MappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiSvnrevMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiTagMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiHgMappingBuilder::CREATION_QUERY)?;
@@ -521,7 +524,12 @@ impl TestRepoFactory {
     ) -> ArcPhases {
         let sql_phases_builder = SqlPhasesBuilder::from_sql_connections(self.metadata_db.clone());
         let heads_fetcher = bookmark_heads_fetcher(bookmarks.clone());
-        sql_phases_builder.build(repo_identity.id(), commit_graph.clone(), heads_fetcher)
+        sql_phases_builder.build(
+            repo_identity.id(),
+            commit_graph.clone(),
+            heads_fetcher,
+            RendezVousOptions::for_test(),
+        )
     }
 
     /// Construct Bonsai Hg Mapping using the in-memory metadata database.
@@ -552,6 +560,15 @@ impl TestRepoFactory {
         Ok(Arc::new(
             SqlBonsaiGlobalrevMappingBuilder::from_sql_connections(self.metadata_db.clone())
                 .build(RendezVousOptions::for_test(), repo_identity.id()),
+        ))
+    }
+
+    /// Construct Bonsai P4 Mapping using the in-memory metadata
+    /// database.
+    pub fn bonsai_p4_mapping(&self, repo_identity: &ArcRepoIdentity) -> Result<ArcBonsaiP4Mapping> {
+        Ok(Arc::new(
+            SqlBonsaiP4MappingBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(repo_identity.id()),
         ))
     }
 
@@ -729,9 +746,9 @@ impl TestRepoFactory {
             repo_config.derived_data_config.clone(),
             None, // derivation_service_client = None
             restricted_paths_config_based.clone(),
-            Arc::new(CommitDerivedDataMapping {
-                sql: SqlCommitDerivedDataMapping::from_sql_connections(self.metadata_db.clone()),
-            }),
+            Arc::new(CommitDerivedDataMapping::new(
+                SqlCommitDerivedDataMapping::from_sql_connections(self.metadata_db.clone()),
+            )),
         )?))
     }
 

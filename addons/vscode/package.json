@@ -20,6 +20,10 @@
   "extensionKind": [
     "workspace"
   ],
+  "enabledApiProposals": [
+    "contribMultiDiffEditorMenus",
+    "editorInsets"
+  ],
   "galleryBanner": {
     "color": "#2e8555",
     "theme": "dark"

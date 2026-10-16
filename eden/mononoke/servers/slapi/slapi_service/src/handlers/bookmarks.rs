@@ -12,11 +12,18 @@ use anyhow::Error;
 use anyhow::format_err;
 use async_trait::async_trait;
 use bookmarks::BookmarkKey;
+use bookmarks::BookmarkUpdateReason;
 use bookmarks::Freshness;
+use bookmarks::MirrorBookmarkMove;
 use bytes::Bytes;
 use edenapi_types::BookmarkEntry;
 use edenapi_types::BookmarkResult;
+use edenapi_types::CODE_BOOKMARK_MOVE_ALREADY_PROCESSED;
 use edenapi_types::HgId;
+use edenapi_types::MirrorBookmarkMove as WireMirrorBookmarkMove;
+use edenapi_types::MirrorBookmarkUpdateReason;
+use edenapi_types::ReplayIdenticalMovesRequest;
+use edenapi_types::ReplayIdenticalMovesResponse;
 use edenapi_types::ServerError;
 use edenapi_types::SetBookmarkRequest;
 use edenapi_types::SetBookmarkResponse;
@@ -35,7 +42,7 @@ use super::HandlerResult;
 use super::SaplingRemoteApiHandler;
 use super::SaplingRemoteApiMethod;
 use super::handler::SaplingRemoteApiContext;
-use crate::errors::ErrorKind;
+use crate::errors::SaplingRemoteApiServiceError;
 
 /// XXX: This number was chosen arbitrarily.
 const MAX_CONCURRENT_FETCHES_PER_REQUEST: usize = 100;
@@ -54,13 +61,17 @@ async fn fetch_bookmark<R: MononokeRepo>(
         SlapiCommitIdentityScheme::Git => repo
             .resolve_bookmark_git(bookmark.clone(), freshness)
             .await
-            .map_err(|e| ErrorKind::BookmarkResolutionFailed(bookmark.clone(), e.into()))?
+            .map_err(|e| {
+                SaplingRemoteApiServiceError::BookmarkResolutionFailed(bookmark.clone(), e.into())
+            })?
             .map(|id| HgId::from_slice(id.as_ref()))
             .transpose()?,
         SlapiCommitIdentityScheme::Hg => repo
             .resolve_bookmark(bookmark.clone(), freshness)
             .await
-            .map_err(|e| ErrorKind::BookmarkResolutionFailed(bookmark.clone(), e.into()))?
+            .map_err(|e| {
+                SaplingRemoteApiServiceError::BookmarkResolutionFailed(bookmark.clone(), e.into())
+            })?
             .map(|id| HgId::from(id.into_nodehash())),
     };
 
@@ -147,7 +158,7 @@ async fn set_bookmark<R: MononokeRepo>(
                         repo.changeset(to)
                             .await
                             .context("failed to resolve 'to' hgid")?
-                            .ok_or(ErrorKind::HgIdNotFound(to_hgid))?
+                            .ok_or(SaplingRemoteApiServiceError::HgIdNotFound(to_hgid))?
                             .id(),
                     )
                 },
@@ -156,7 +167,7 @@ async fn set_bookmark<R: MononokeRepo>(
                         repo.changeset(from)
                             .await
                             .context("failed to resolve 'from' hgid")?
-                            .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
+                            .ok_or(SaplingRemoteApiServiceError::HgIdNotFound(from_hgid))?
                             .id(),
                     )
                 },
@@ -179,7 +190,7 @@ async fn set_bookmark<R: MononokeRepo>(
                 .changeset(to)
                 .await
                 .context("failed to resolve 'to' hgid")?
-                .ok_or(ErrorKind::HgIdNotFound(to_hgid))?
+                .ok_or(SaplingRemoteApiServiceError::HgIdNotFound(to_hgid))?
                 .id();
 
             repo.create_bookmark(&BookmarkKey::new(&bookmark)?, to, pushvars, None)
@@ -192,7 +203,7 @@ async fn set_bookmark<R: MononokeRepo>(
                 .changeset(from)
                 .await
                 .context("failed to resolve 'from' hgid")?
-                .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
+                .ok_or(SaplingRemoteApiServiceError::HgIdNotFound(from_hgid))?
                 .id();
 
             repo.delete_bookmark(&BookmarkKey::new(&bookmark)?, Some(from), pushvars)
@@ -204,6 +215,125 @@ async fn set_bookmark<R: MononokeRepo>(
             ));
         }
     })
+}
+
+/// Mirror a contiguous chain of source bookmark moves to a `*_shadow` replica.
+/// modern_sync uses this to keep the replica's bookmark and
+/// bookmarks_update_log identical to the source, row for row.
+pub struct ReplayIdenticalMovesHandler;
+
+#[async_trait]
+impl SaplingRemoteApiHandler for ReplayIdenticalMovesHandler {
+    type Request = ReplayIdenticalMovesRequest;
+    type Response = ReplayIdenticalMovesResponse;
+
+    const HTTP_METHOD: http::Method = http::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::ReplayIdenticalMoves;
+    const ENDPOINT: &'static str = "/bookmarks/replay_identical_moves";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let res = replay_identical_moves_response(
+            ectx.repo(),
+            request.bookmark,
+            request.moves,
+            request
+                .pushvars
+                .into_iter()
+                .map(|p| (p.key, p.value.into()))
+                .collect(),
+        );
+
+        Ok(stream::once(res).boxed())
+    }
+
+    fn extract_in_band_error(response: &Self::Response) -> Option<anyhow::Error> {
+        response
+            .data
+            .as_ref()
+            .err()
+            // A lost-ack replay is success-equivalent: the replica already holds
+            // the chain and modern_sync advances its checkpoint. Do not count it
+            // as a request error, or the metric hides real failures from on-call.
+            .filter(|err| err.code != CODE_BOOKMARK_MOVE_ALREADY_PROCESSED)
+            .map(|err| format_err!("{err:?}"))
+    }
+}
+
+async fn replay_identical_moves_response<R: MononokeRepo>(
+    repo: HgRepoContext<R>,
+    bookmark: String,
+    moves: Vec<WireMirrorBookmarkMove>,
+    pushvars: HashMap<String, Bytes>,
+) -> anyhow::Result<ReplayIdenticalMovesResponse> {
+    Ok(ReplayIdenticalMovesResponse {
+        data: replay_identical_moves(repo, bookmark, moves, pushvars)
+            .await
+            .map_err(|e| {
+                // A chain the replica already applied (a lost-ack replay) must
+                // return a distinct code so modern_sync advances its checkpoint
+                // instead of retrying the chain forever.
+                if let Some(MononokeError::BookmarkMoveAlreadyProcessed) =
+                    e.downcast_ref::<MononokeError>()
+                {
+                    ServerError::new(format!("{e:?}"), CODE_BOOKMARK_MOVE_ALREADY_PROCESSED)
+                } else {
+                    ServerError::generic(format!("{e:?}"))
+                }
+            }),
+    })
+}
+
+async fn replay_identical_moves<R: MononokeRepo>(
+    repo: HgRepoContext<R>,
+    bookmark: String,
+    moves: Vec<WireMirrorBookmarkMove>,
+    pushvars: HashMap<String, Bytes>,
+) -> Result<(), Error> {
+    let repo = repo.repo_ctx();
+
+    let pushvars = if pushvars.is_empty() {
+        None
+    } else {
+        Some(&pushvars)
+    };
+
+    // The wire moves already carry bonsai ids, so there is nothing to resolve.
+    // modern_sync uploads each changeset to the replica under the source's own
+    // bonsai id, so the source and the replica name a changeset the same way.
+    // `replay_identical_moves` checks the whole chain against the commit graph
+    // in one query.
+    let moves = moves
+        .into_iter()
+        .map(|m| MirrorBookmarkMove {
+            log_id: m.log_id,
+            old: m.from.map(Into::into),
+            new: m.to.into(),
+            reason: mirror_reason(m.reason),
+        })
+        .collect();
+
+    repo.replay_identical_moves(&BookmarkKey::new(&bookmark)?, moves, pushvars)
+        .await?;
+    Ok(())
+}
+
+/// Map the wire reason to the server reason. modern_sync copies each source
+/// move's reason so the replica's log matches the source row for row.
+fn mirror_reason(reason: MirrorBookmarkUpdateReason) -> BookmarkUpdateReason {
+    match reason {
+        MirrorBookmarkUpdateReason::Pushrebase => BookmarkUpdateReason::Pushrebase,
+        MirrorBookmarkUpdateReason::Push => BookmarkUpdateReason::Push,
+        MirrorBookmarkUpdateReason::Blobimport => BookmarkUpdateReason::Blobimport,
+        MirrorBookmarkUpdateReason::ManualMove => BookmarkUpdateReason::ManualMove,
+        MirrorBookmarkUpdateReason::TestMove => BookmarkUpdateReason::TestMove,
+        MirrorBookmarkUpdateReason::Backsyncer => BookmarkUpdateReason::Backsyncer,
+        MirrorBookmarkUpdateReason::XRepoSync => BookmarkUpdateReason::XRepoSync,
+        MirrorBookmarkUpdateReason::ApiRequest => BookmarkUpdateReason::ApiRequest,
+        MirrorBookmarkUpdateReason::MultiRepoLand => BookmarkUpdateReason::MultiRepoLand,
+    }
 }
 
 /// Error wrapped bookmarks

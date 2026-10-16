@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use auth_consts::AUTH_SET;
+use auth_consts::INTERN_CONTROLLER;
 use auth_consts::ONCALL;
 use auth_consts::ONCALL_GROUP_TYPE;
 use auth_consts::REPO;
@@ -34,6 +35,7 @@ use git_source_of_truth::GitSourceOfTruth;
 use git_source_of_truth::GitSourceOfTruthConfig;
 use git_source_of_truth::RepositoryName;
 use git_source_of_truth::Staleness;
+use git_source_of_truth::flip_landed_mutation_to_mononoke;
 use git_symbolic_refs::GitSymbolicRefs;
 use git_symbolic_refs::GitSymbolicRefsEntry;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
@@ -50,7 +52,7 @@ use infrasec_authorization_service::CommitChangeSpecificationRequest;
 use infrasec_authorization_service_srclients::make_AuthorizationService_srclient;
 use infrasec_authorization_service_srclients::thrift::ChangeSpecification;
 use infrasec_authorization_service_srclients::thrift::errors::AsNoConfigExistsException;
-use metaconfig_parser::configerator_repo_config_handle;
+use metaconfig_parser::configerator_repo_spec_handle;
 use mononoke_api::MononokeError;
 use mononoke_api::RepositoryId;
 use mononoke_configs::MononokeConfigs;
@@ -58,16 +60,14 @@ use mononoke_macros::mononoke;
 use oncall::OncallClient;
 use permission_checker::AclProvider;
 use repo_authorization::AuthorizationContext;
+use repo_spec_writer::DEFAULT_GIT_REPO_SPEC_PATH;
 use repo_spec_writer::RepoIndexEntry;
 use repo_spec_writer::RepoSpecDir;
 use repo_spec_writer::append_to_repo_index;
-use repo_spec_writer::make_repo_spec_config_path;
 use repo_spec_writer::make_repo_spec_file_path;
 use repo_spec_writer::tier_list_for_repo_spec;
 use repos::RawCommitIdentityScheme;
-use repos::RawRepoConfig;
 use repos::RepoSpec;
-use repos::ShardingRegions;
 use repos::TShirtSize;
 use source_control as thrift;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
@@ -93,7 +93,9 @@ const ATTACH_JK: &str = "scm/mononoke:create_repos_attach_to_inflight_mutation";
 const ENFORCE_BATCH_SIZE_JK: &str = "scm/mononoke:create_repos_enforce_max_batch_size";
 const WRITE_DEFAULT_BRANCH_SYMREF_JK: &str =
     "scm/mononoke:create_repos_write_default_branch_symref";
-const DEFAULT_GIT_REPO_CONFIG_PATH: &str = "scm/mononoke/repos/common/default_git_repo_config";
+/// Sequence vs the old `MAX(repo_id) + 1` ceiling. Turning this off reinstates
+/// the reuse behind S709055, so it buys diagnosis time, not a resting state.
+const ALLOCATE_FROM_SEQUENCE_JK: &str = "scm/mononoke:create_repos_allocate_from_id_sequence";
 
 /// Group granting the elevated batch tier, one step below Source Control's own.
 /// Membership is the whole mechanism:
@@ -292,50 +294,111 @@ struct SymrefStoreFactory {
     builder: Arc<OnceCell<SqlGitSymbolicRefsBuilder>>,
 }
 
-impl SymrefStoreFactory {
-    fn default_git_storage_name(&self) -> Result<String, scs_errors::ServiceError> {
-        let config_store = self.configs.config_store().ok_or_else(|| {
-            scs_errors::internal_error(
-                "No config store available for resolving the default git repo storage",
-            )
-        })?;
-        let template = configerator_repo_config_handle(DEFAULT_GIT_REPO_CONFIG_PATH, config_store)
-            .map_err(|e| {
-                scs_errors::internal_error(format!("Failed to load default git repo config: {e:#}"))
-            })?
-            .get();
-        template.storage_config.clone().ok_or_else(|| {
+/// The storage config a repo id will get once it has one. Every store
+/// `create_repos` opens is keyed by an id that is reserved but not yet landed,
+/// so it is absent from `repo_configs` by definition and the default git
+/// RepoSpec template is the only thing that can name its database.
+fn default_git_storage_name(configs: &MononokeConfigs) -> Result<String, scs_errors::ServiceError> {
+    let template = load_default_git_repo_spec_template(configs)?;
+    template_storage_name(&template)
+}
+
+/// Load `DEFAULT_GIT_REPO_SPEC_PATH` and refuse it unless it is usable; every
+/// caller gets a validated template or an error, never a half-usable one.
+fn load_default_git_repo_spec_template(
+    configs: &MononokeConfigs,
+) -> Result<Arc<RepoSpec>, scs_errors::ServiceError> {
+    let config_store = configs.config_store().ok_or_else(|| {
+        scs_errors::internal_error(
+            "No config store available for loading the default git repo spec template",
+        )
+    })?;
+    let template = configerator_repo_spec_handle(DEFAULT_GIT_REPO_SPEC_PATH, config_store)
+        .map_err(|e| {
             scs_errors::internal_error(format!(
-                "{DEFAULT_GIT_REPO_CONFIG_PATH} does not name a storage config"
+                "Failed to load default git repo spec template: {e:#}"
+            ))
+        })?
+        .get();
+    validate_template(&template)?;
+    Ok(template)
+}
+
+/// The template is embedded verbatim into every new repo, so a bad template
+/// is a bad repo. Checked before any Configo write: `create_repos` is
+/// git-only (see `RepoSpecDir`), the symref store needs the storage config
+/// before the repo's own config exists, and a repo with no tiers is served by
+/// nothing.
+fn validate_template(template: &RepoSpec) -> Result<(), scs_errors::ServiceError> {
+    if template.default_commit_identity_scheme != RawCommitIdentityScheme::GIT {
+        return Err(scs_errors::internal_error(format!(
+            "{DEFAULT_GIT_REPO_SPEC_PATH} has default_commit_identity_scheme {:?}; \
+             create_repos only creates GIT repos",
+            template.default_commit_identity_scheme
+        ))
+        .into());
+    }
+    template_storage_name(template)?;
+    if template.tiers.is_empty() {
+        return Err(scs_errors::internal_error(format!(
+            "{DEFAULT_GIT_REPO_SPEC_PATH} lists no tiers"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn template_storage_name(template: &RepoSpec) -> Result<String, scs_errors::ServiceError> {
+    template
+        .repo_config
+        .as_ref()
+        .and_then(|c| c.storage_config.clone())
+        .ok_or_else(|| {
+            scs_errors::internal_error(format!(
+                "{DEFAULT_GIT_REPO_SPEC_PATH} does not name a storage config"
             ))
             .into()
         })
-    }
+}
 
+/// Open a metadata store against that storage config. `store_name` names the
+/// store in the error text; without it two callers opening different stores
+/// against the same config produce the same message.
+async fn open_default_git_metadata_store<T>(
+    fb: FacebookInit,
+    configs: &MononokeConfigs,
+    mysql_options: &MysqlOptions,
+    store_name: &str,
+) -> Result<T, scs_errors::ServiceError>
+where
+    T: SqlConstructFromMetadataDatabaseConfig,
+{
+    let storage_name = default_git_storage_name(configs)?;
+    let storage_configs = configs.storage_configs();
+    let storage_config = storage_configs.storage.get(&storage_name).ok_or_else(|| {
+        scs_errors::ServiceError::from(scs_errors::internal_error(format!(
+            "Storage config '{storage_name}' not found while building the {store_name} store"
+        )))
+    })?;
+    T::with_metadata_database_config(fb, &storage_config.metadata, mysql_options, false)
+        .await
+        .map_err(|e| {
+            scs_errors::ServiceError::from(scs_errors::internal_error(format!(
+                "Failed to open the {store_name} store: {e:#}"
+            )))
+        })
+}
+
+impl SymrefStoreFactory {
     async fn shared_builder(&self) -> Result<&SqlGitSymbolicRefsBuilder, scs_errors::ServiceError> {
         self.builder
-            .get_or_try_init(|| async {
-                let storage_name = self.default_git_storage_name()?;
-                let storage_configs = self.configs.storage_configs();
-                let storage_config =
-                    storage_configs.storage.get(&storage_name).ok_or_else(|| {
-                        scs_errors::ServiceError::from(scs_errors::internal_error(format!(
-                            "Storage config '{storage_name}' not found while building the symref \
-                             store"
-                        )))
-                    })?;
-                SqlGitSymbolicRefsBuilder::with_metadata_database_config(
+            .get_or_try_init(|| {
+                open_default_git_metadata_store(
                     self.fb,
-                    &storage_config.metadata,
+                    &self.configs,
                     &self.mysql_options,
-                    false,
+                    "symref",
                 )
-                .await
-                .map_err(|e| {
-                    scs_errors::ServiceError::from(scs_errors::internal_error(format!(
-                        "Failed to open the symref store: {e:#}"
-                    )))
-                })
             })
             .await
     }
@@ -473,6 +536,7 @@ fn initial_acl_grants(hipster_group: &str) -> Vec<AclPermissionChange> {
                 (AUTH_SET, "coding_crewmates"),
                 (AUTH_SET, "svcscm_read_all"),
                 (AUTH_SET, "svnuser"),
+                (INTERN_CONTROLLER, "XInternGraphGraphQLController"),
                 (SERVICE_IDENTITY, "aosp_megarepo_service_identity"),
                 (SERVICE_IDENTITY, "gitremoteimport"),
                 (SERVICE_IDENTITY, "scm_service_identity"),
@@ -563,7 +627,7 @@ async fn create_repo_acl(
     let thrift_client = make_AuthorizationService_srclient!(ctx.fb)
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     thrift_client
-        .commitChangeSpecificationV2(&request)
+        .commitChangeSpecification(&request)
         .await
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     Ok(())
@@ -852,241 +916,290 @@ enum ReserveOutcome {
     AttachedToInflight { mutation_id: i64 },
 }
 
+/// Pair each requested repo with an id off the sequence. The old
+/// `MAX(repo_id) + 1` ceiling rewound whenever `cleanup_repos` deleted rows,
+/// reissuing ids that still carried a previous occupant's data (S709055).
+#[cfg(fbcode_build)]
+/// The pre-sequence allocator, kept verbatim so the kill switch restores the
+/// old behaviour exactly, id reuse included.
+#[cfg(fbcode_build)]
+async fn allocate_repo_ids_from_ceiling(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    count: usize,
+) -> Result<Vec<RepositoryId>, scs_errors::ServiceError> {
+    let max_id = git_source_of_truth_config
+        .get_max_id(ctx)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?
+        .ok_or_else(|| {
+            scs_errors::internal_error(
+                "No rows in git_repositories_source_of_truth. That's unexpected",
+            )
+        })?;
+
+    let ceiling = max_id.id();
+    Ok((1..=count)
+        .map(|offset| RepositoryId::new(ceiling + offset as i32))
+        .collect())
+}
+
+#[cfg(fbcode_build)]
+async fn allocate_repo_ids(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    params: &thrift::CreateReposParams,
+) -> Result<Vec<(RepositoryId, thrift::RepoCreationRequest)>, scs_errors::ServiceError> {
+    let repo_ids = if justknobs::eval(ALLOCATE_FROM_SEQUENCE_JK, None, None) {
+        git_source_of_truth_config
+            .allocate_repo_ids(ctx, params.repos.len())
+            .await
+            .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?
+    } else {
+        allocate_repo_ids_from_ceiling(ctx, git_source_of_truth_config, params.repos.len()).await?
+    };
+
+    // `zip` would silently drop repos on a short batch and report success.
+    if repo_ids.len() != params.repos.len() {
+        return Err(scs_errors::internal_error(format!(
+            "Allocated {} repo ids for a batch of {} repos",
+            repo_ids.len(),
+            params.repos.len()
+        ))
+        .into());
+    }
+
+    Ok(repo_ids
+        .into_iter()
+        .zip(params.repos.iter().cloned())
+        .collect())
+}
+
+/// Whether `error_trace` is a uniqueness violation on `column` of
+/// `git_repositories_source_of_truth`. SQLite names the column and MySQL names
+/// the index, which the schema defines as `<column>_idx` for both constraints.
+#[cfg(fbcode_build)]
+fn violates_unique(error_trace: &str, column: &str) -> bool {
+    (error_trace.contains("UNIQUE constraint failed")
+        && error_trace.contains(&format!("git_repositories_source_of_truth.{column}")))
+        || (error_trace.contains("Duplicate entry")
+            && error_trace.contains(&format!("{column}_idx")))
+}
+
 #[cfg(fbcode_build)]
 async fn reserve_repos_ids(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     params: &thrift::CreateReposParams,
 ) -> Result<ReserveOutcome, scs_errors::ServiceError> {
-    let max_id = git_source_of_truth_config
-        .get_max_id(&ctx)
-        .await
-        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
-    if let Some(max_id) = max_id {
-        let mut repo_id = max_id.id();
-        let repo_ids_and_requests = params
-            .repos
-            .iter()
-            .map(|request| {
-                repo_id += 1;
-                (RepositoryId::new(repo_id), request.clone())
-            })
-            .collect::<Vec<_>>();
-        let result = git_source_of_truth_config
-            .insert_repos(
-                &ctx,
-                &repo_ids_and_requests
+    let repo_ids_and_requests = allocate_repo_ids(&ctx, git_source_of_truth_config, params).await?;
+    let result = git_source_of_truth_config
+        .insert_repos(
+            &ctx,
+            &repo_ids_and_requests
+                .iter()
+                .map(|(id, request)| {
+                    (
+                        id.clone(),
+                        RepositoryName(request.repo_name.clone()),
+                        GitSourceOfTruth::Reserved,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(ReserveOutcome::Reserved(repo_ids_and_requests)),
+        Err(e) => {
+            let error_trace = format!("{e:#}");
+
+            // Not the split-brain case below: the sequence hit an id held by a
+            // repo outside its bookkeeping, like the hand-assigned ids in the
+            // configerator index. Internal, so the retry loop re-allocates; the
+            // sequence only moves forward, so a retry clears it.
+            if violates_unique(&error_trace, "repo_id") {
+                let allocated = repo_ids_and_requests
                     .iter()
-                    .map(|(id, request)| {
-                        (
-                            id.clone(),
-                            RepositoryName(request.repo_name.clone()),
-                            GitSourceOfTruth::Reserved,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .await;
-        match result {
-            Ok(_) => Ok(ReserveOutcome::Reserved(repo_ids_and_requests)),
-            Err(e) => {
-                let error_trace = format!("{e:#}");
-                // Match both SQLite ("UNIQUE constraint failed") and MySQL
-                // ("Duplicate entry '...' for key 'repo_name_idx'") errors.
-                let is_duplicate = (error_trace.contains("UNIQUE constraint failed")
-                    && error_trace.contains("git_repositories_source_of_truth.repo_name"))
-                    || (error_trace.contains("Duplicate entry")
-                        && error_trace.contains("repo_name_idx"));
-                if is_duplicate {
-                    // Look up every requested repo's current row so we can both
-                    // build human-readable `details` (today's behavior) and, when
-                    // the attach knob is enabled, classify whether this is a
-                    // duplicate request for a single in-flight mutation we can
-                    // safely attach to.
-                    let mut details = Vec::new();
-                    let mut lookups = Vec::with_capacity(repo_ids_and_requests.len());
-                    for (_id, request) in &repo_ids_and_requests {
-                        let repo_name = RepositoryName(request.repo_name.clone());
-                        let lookup = git_source_of_truth_config
-                            .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
-                            .await;
-                        match &lookup {
-                            Ok(Some(entry)) => match entry.source_of_truth {
-                                GitSourceOfTruth::Reserved => {
-                                    details.push(format!(
-                                        "Repo '{}' (id={}) has a stale 'Reserved' entry from a prior failed creation attempt. \
-                                         It is safe to delete this row and retry.",
-                                        request.repo_name, entry.repo_id
-                                    ));
-                                }
-                                ref sot => {
-                                    details.push(format!(
-                                        "DANGER: Repo '{}' (id={}) already exists with source_of_truth={}. \
-                                         Do NOT force-create — this will cause split-brain! \
-                                         See SEV S617275 for context.",
-                                        request.repo_name, entry.repo_id, sot
-                                    ));
-                                }
-                            },
-                            Ok(None) => {
+                    .map(|(id, _)| id.id().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(scs_errors::internal_error(format!(
+                    "Repo id sequence issued an id that is already in use (allocated: {allocated}). \
+                     Retrying allocates fresh ids. Details: {error_trace}"
+                ))
+                .into());
+            }
+
+            if violates_unique(&error_trace, "repo_name") {
+                // Look up every requested repo's current row so we can both
+                // build human-readable `details` (today's behavior) and, when
+                // the attach knob is enabled, classify whether this is a
+                // duplicate request for a single in-flight mutation we can
+                // safely attach to.
+                let mut details = Vec::new();
+                let mut lookups = Vec::with_capacity(repo_ids_and_requests.len());
+                for (_id, request) in &repo_ids_and_requests {
+                    let repo_name = RepositoryName(request.repo_name.clone());
+                    let lookup = git_source_of_truth_config
+                        .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
+                        .await;
+                    match &lookup {
+                        Ok(Some(entry)) => match entry.source_of_truth {
+                            GitSourceOfTruth::Reserved => {
                                 details.push(format!(
-                                    "Repo '{}': UNIQUE constraint violated but no row found on lookup. \
-                                     Original error: {error_trace}",
-                                    request.repo_name
+                                    "Repo '{}' (id={}) has a stale 'Reserved' entry from a prior failed creation attempt. \
+                                     It is safe to delete this row and retry.",
+                                    request.repo_name, entry.repo_id
                                 ));
                             }
-                            Err(lookup_err) => {
+                            ref sot => {
                                 details.push(format!(
-                                    "Repo '{}': UNIQUE constraint violated but lookup failed: {:#}. \
-                                     Original error: {error_trace}",
-                                    request.repo_name, lookup_err
+                                    "DANGER: Repo '{}' (id={}) already exists with source_of_truth={}. \
+                                     Do NOT force-create — this will cause split-brain! \
+                                     See SEV S617275 for context.",
+                                    request.repo_name, entry.repo_id, sot
                                 ));
                             }
+                        },
+                        Ok(None) => {
+                            details.push(format!(
+                                "Repo '{}': UNIQUE constraint violated but no row found on lookup. \
+                                 Original error: {error_trace}",
+                                request.repo_name
+                            ));
                         }
-                        lookups.push(lookup);
+                        Err(lookup_err) => {
+                            details.push(format!(
+                                "Repo '{}': UNIQUE constraint violated but lookup failed: {:#}. \
+                                 Original error: {error_trace}",
+                                request.repo_name, lookup_err
+                            ));
+                        }
+                    }
+                    lookups.push(lookup);
+                }
+
+                let attach_enabled = justknobs::eval(ATTACH_JK, None, None);
+
+                if attach_enabled {
+                    // A lookup `Err` is a transient DB/query failure, NOT a
+                    // client-side invalid request. Surface it as an internal
+                    // error (mapped to `ServiceError::Internal`) so the retry
+                    // loop in `create_repos_in_mononoke` retries it, instead
+                    // of masking a retryable failure as `invalid_request`.
+                    let lookup_errors = lookups
+                        .iter()
+                        .filter_map(|lookup| lookup.as_ref().err())
+                        .map(|e| format!("{e:#}"))
+                        .collect::<Vec<_>>();
+                    if !lookup_errors.is_empty() {
+                        return Err(scs_errors::internal_error(format!(
+                            "Failed to look up reserved repos while classifying a duplicate \
+                             creation request: {}",
+                            lookup_errors.join("; ")
+                        ))
+                        .into());
                     }
 
-                    let attach_enabled = justknobs::eval(ATTACH_JK, None, None);
+                    // Only attach when every requested repo resolved to a
+                    // `Reserved` row stamped with the SAME mutation_id.
+                    let all_reserved_entries = lookups
+                        .iter()
+                        .map(|lookup| match lookup {
+                            Ok(Some(entry))
+                                if entry.source_of_truth == GitSourceOfTruth::Reserved =>
+                            {
+                                entry.mutation_id
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
 
-                    if attach_enabled {
-                        // A lookup `Err` is a transient DB/query failure, NOT a
-                        // client-side invalid request. Surface it as an internal
-                        // error (mapped to `ServiceError::Internal`) so the retry
-                        // loop in `create_repos_in_mononoke` retries it, instead
-                        // of masking a retryable failure as `invalid_request`.
-                        let lookup_errors = lookups
-                            .iter()
-                            .filter_map(|lookup| lookup.as_ref().err())
-                            .map(|e| format!("{e:#}"))
-                            .collect::<Vec<_>>();
-                        if !lookup_errors.is_empty() {
-                            return Err(scs_errors::internal_error(format!(
-                                "Failed to look up reserved repos while classifying a duplicate \
-                                 creation request: {}",
-                                lookup_errors.join("; ")
-                            ))
-                            .into());
+                    // All lookups are `Ok` here (errors returned above), so a
+                    // non-reserved entry is a genuine split-brain / missing-row
+                    // case, not a transient failure.
+                    let any_non_reserved = lookups.iter().any(|lookup| {
+                        !matches!(
+                            lookup,
+                            Ok(Some(entry)) if entry.source_of_truth == GitSourceOfTruth::Reserved
+                        )
+                    });
+
+                    if any_non_reserved {
+                        // At least one row is not `Reserved` (or lookup
+                        // failed / returned None). If any row is present but
+                        // in a non-reserved state, this is the split-brain
+                        // case and `details` already carries the DANGER
+                        // message. Fall through to the shared error below.
+                        return Err(scs_errors::invalid_request(details.join("\n")).into());
+                    }
+
+                    // Every row is `Reserved`. Decide based on stamping.
+                    if all_reserved_entries.iter().any(Option::is_none) {
+                        return Err(scs_errors::invalid_request(format!(
+                            "Repo creation is already in progress but not yet trackable \
+                             (a reserved row has no mutation_id stamped yet); retry shortly, \
+                             or delete the stale reserved row if the original attempt died.\n{}",
+                            details.join("\n")
+                        ))
+                        .into());
+                    }
+
+                    let mutation_ids = all_reserved_entries
+                        .iter()
+                        .filter_map(|id| *id)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let mut ids = mutation_ids.iter();
+                    match (ids.next(), ids.next()) {
+                        (Some(mutation_id), None) => {
+                            // Exactly one distinct in-flight mutation: attach.
+                            let repo_names = repo_ids_and_requests
+                                .iter()
+                                .map(|(_id, request)| request.repo_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let mut scuba = ctx.scuba().clone();
+                            scuba.add("action", "create_repos_attach");
+                            scuba.add("attached_mutation_id", *mutation_id);
+                            scuba.add("repo_names", repo_names);
+                            scuba.log_with_msg("create_repos attached to in-flight mutation", None);
+                            return Ok(ReserveOutcome::AttachedToInflight {
+                                mutation_id: *mutation_id,
+                            });
                         }
-
-                        // Only attach when every requested repo resolved to a
-                        // `Reserved` row stamped with the SAME mutation_id.
-                        let all_reserved_entries = lookups
-                            .iter()
-                            .map(|lookup| match lookup {
-                                Ok(Some(entry))
-                                    if entry.source_of_truth == GitSourceOfTruth::Reserved =>
-                                {
-                                    entry.mutation_id
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
-
-                        // All lookups are `Ok` here (errors returned above), so a
-                        // non-reserved entry is a genuine split-brain / missing-row
-                        // case, not a transient failure.
-                        let any_non_reserved = lookups.iter().any(|lookup| {
-                            !matches!(
-                                lookup,
-                                Ok(Some(entry)) if entry.source_of_truth == GitSourceOfTruth::Reserved
-                            )
-                        });
-
-                        if any_non_reserved {
-                            // At least one row is not `Reserved` (or lookup
-                            // failed / returned None). If any row is present but
-                            // in a non-reserved state, this is the split-brain
-                            // case and `details` already carries the DANGER
-                            // message. Fall through to the shared error below.
-                            return Err(scs_errors::invalid_request(details.join("\n")).into());
-                        }
-
-                        // Every row is `Reserved`. Decide based on stamping.
-                        if all_reserved_entries.iter().any(Option::is_none) {
+                        (None, _) => {
+                            // Defensive: no mutation ids collected. Unreachable
+                            // in practice — the all-Some guard above ensures
+                            // every reserved repo has a stamped id; reachable
+                            // only for an empty batch, which cannot hit the
+                            // duplicate path.
                             return Err(scs_errors::invalid_request(format!(
-                                "Repo creation is already in progress but not yet trackable \
-                                 (a reserved row has no mutation_id stamped yet); retry shortly, \
-                                 or delete the stale reserved row if the original attempt died.\n{}",
+                                "No reserved repos to attach to.\n{}",
                                 details.join("\n")
                             ))
                             .into());
                         }
-
-                        let mutation_ids = all_reserved_entries
-                            .iter()
-                            .filter_map(|id| *id)
-                            .collect::<std::collections::BTreeSet<_>>();
-                        let mut ids = mutation_ids.iter();
-                        match (ids.next(), ids.next()) {
-                            (Some(mutation_id), None) => {
-                                // Exactly one distinct in-flight mutation: attach.
-                                let repo_names = repo_ids_and_requests
-                                    .iter()
-                                    .map(|(_id, request)| request.repo_name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                let mut scuba = ctx.scuba().clone();
-                                scuba.add("action", "create_repos_attach");
-                                scuba.add("attached_mutation_id", *mutation_id);
-                                scuba.add("repo_names", repo_names);
-                                scuba.log_with_msg(
-                                    "create_repos attached to in-flight mutation",
-                                    None,
-                                );
-                                return Ok(ReserveOutcome::AttachedToInflight {
-                                    mutation_id: *mutation_id,
-                                });
-                            }
-                            (None, _) => {
-                                // Defensive: no mutation ids collected. Unreachable
-                                // in practice — the all-Some guard above ensures
-                                // every reserved repo has a stamped id; reachable
-                                // only for an empty batch, which cannot hit the
-                                // duplicate path.
-                                return Err(scs_errors::invalid_request(format!(
-                                    "No reserved repos to attach to.\n{}",
-                                    details.join("\n")
-                                ))
-                                .into());
-                            }
-                            (Some(_), Some(_)) => {
-                                // More than one distinct in-flight mutation.
-                                return Err(scs_errors::invalid_request(format!(
-                                    "Repo creation request is not idempotent: the reserved repos \
-                                     span multiple in-flight mutations; resolve manually.\n{}",
-                                    details.join("\n")
-                                ))
-                                .into());
-                            }
+                        (Some(_), Some(_)) => {
+                            // More than one distinct in-flight mutation.
+                            return Err(scs_errors::invalid_request(format!(
+                                "Repo creation request is not idempotent: the reserved repos \
+                                 span multiple in-flight mutations; resolve manually.\n{}",
+                                details.join("\n")
+                            ))
+                            .into());
                         }
                     }
-
-                    Err(scs_errors::invalid_request(details.join("\n")).into())
-                } else {
-                    Err(scs_errors::internal_error(format!(
-                        "Failed to write row to git_repositories_source_of_truth. Details: {error_trace}"
-                    ))
-                    .into())
                 }
+
+                Err(scs_errors::invalid_request(details.join("\n")).into())
+            } else {
+                Err(scs_errors::internal_error(format!(
+                    "Failed to write row to git_repositories_source_of_truth. Details: {error_trace}"
+                ))
+                .into())
             }
         }
-    } else {
-        Err(scs_errors::internal_error(
-            "No rows in git_repositories_source_of_truth. That's unexpected",
-        )
-        .into())
     }
-}
-
-/// Returns the tier list for a new repo as owned `String`s
-/// (matches the `Vec<String>` type used by `RepoSpec::tiers`).
-/// See `repo_spec_writer::tier_list_for_repo_spec` for substring-based
-/// `aosp/` matching behavior.
-fn tier_list_for_repo(repo_name: &str) -> Vec<String> {
-    tier_list_for_repo_spec(repo_name)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
 }
 
 fn to_repo_spec_tshirt_size(
@@ -1105,15 +1218,20 @@ fn to_repo_spec_tshirt_size(
 }
 
 // RepoSpec path helpers, Python-literal formatters, RepoIndexEntry, and
-// append_to_repo_index live in `repo_spec_writer` so the Phase 6 RepoSpec
-// migrator can share the same byte-equivalent implementation. See
+// append_to_repo_index live in `repo_spec_writer` so the admin tools and any
+// other writer share one implementation. See
 // `eden/mononoke/tools/repo_spec_writer/src/lib.rs`.
 
+/// The `RepoSpec` for one new repo. The request owns identity and size; the
+/// template owns everything else, verbatim, by construction: the struct tail
+/// is the template, so a field added to `RepoSpec` later is template-owned
+/// unless this function is changed to say otherwise.
 fn make_repo_spec(
     (repo_id, request): &(RepositoryId, thrift::RepoCreationRequest),
-    default_repo_config: Option<RawRepoConfig>,
+    template: &RepoSpec,
 ) -> Result<RepoSpec, scs_errors::ServiceError> {
     Ok(RepoSpec {
+        // Request-owned: identity and size.
         repo_id: repo_id.id(),
         repo_name: request.repo_name.clone(),
         hipster_acl: if request.custom_acl.is_some() {
@@ -1121,16 +1239,13 @@ fn make_repo_spec(
         } else {
             make_top_level_acl_name_from_repo_name(&request.repo_name)
         },
-        enabled: true,
-        readonly: false,
-        default_commit_identity_scheme: RawCommitIdentityScheme::GIT,
-        enable_git_bundle_uri: None,
-        tiers: tier_list_for_repo(&request.repo_name),
+        readonly: request.readonly.unwrap_or(false),
         t_shirt_size: to_repo_spec_tshirt_size(request.size_bucket)?,
-        sharding_regions: ShardingRegions::BGM_ONLY_REGIONS,
-        repo_config: default_repo_config,
-        tier_overrides: None,
-        ..Default::default()
+        // The only rule left in Rust is the additive AOSP tier on top of the
+        // template's list (see repo_spec_writer::tier_list_for_repo_spec).
+        tiers: tier_list_for_repo_spec(&template.tiers, &request.repo_name),
+        // Template-owned: everything else. This tail is the ownership rule.
+        ..template.clone()
     })
 }
 
@@ -1146,25 +1261,27 @@ async fn prepare_repo_configs_mutation_nowait(
     );
     let mut txn = configo_client.managed_transaction();
 
-    // Load the default git repo config template once before the loop.
-    let config_store = configs.config_store().ok_or_else(|| {
-        scs_errors::internal_error("No config store available for loading default repo config")
-    })?;
-    let default_repo_config =
-        configerator_repo_config_handle(DEFAULT_GIT_REPO_CONFIG_PATH, config_store)
-            .map_err(|e| {
-                scs_errors::internal_error(format!("Failed to load default git repo config: {e:#}"))
-            })?
-            .get();
+    // Load and validate the default git RepoSpec template once, before the
+    // loop and before anything is written to the transaction: a bad template
+    // fails the whole call closed rather than landing a bad repo.
+    let template = load_default_git_repo_spec_template(configs)?;
 
-    // Create individual repo config files
+    // Write each repo's RepoSpec and derive its repo_index.cinc entry from
+    // that same spec, so the index can only ever say what the spec says.
+    let mut new_entries = Vec::with_capacity(repos_ids_and_requests.len());
     for (repo_id, request) in &repos_ids_and_requests {
-        let repo_spec = make_repo_spec(
-            &(*repo_id, request.clone()),
-            Some((*default_repo_config).clone()),
-        )?;
-        // create_repos only ever creates git repos (see RepoSpecDir docs).
-        let file_path = make_repo_spec_file_path(&request.repo_name, RepoSpecDir::Git);
+        let repo_spec = make_repo_spec(&(*repo_id, request.clone()), &template)?;
+        let entry = RepoIndexEntry::from_repo_spec(&repo_spec).map_err(|e| {
+            scs_errors::internal_error(format!("Failed to derive repo_index entry: {e:#}"))
+        })?;
+        // Same scheme -> directory rule as the index entry's config_path, so
+        // the file and the index can never name different trees.
+        let dir =
+            RepoSpecDir::for_scheme(repo_spec.default_commit_identity_scheme).map_err(|e| {
+                scs_errors::internal_error(format!("repo {}: {e:#}", repo_spec.repo_name))
+            })?;
+        let file_path = make_repo_spec_file_path(&repo_spec.repo_name, dir);
+        new_entries.push((repo_spec.repo_name.clone(), entry));
         txn.set_thrift_object(
             repo_spec,
             file_path,
@@ -1186,31 +1303,6 @@ async fn prepare_repo_configs_mutation_nowait(
             scs_errors::internal_error(format!("repo_index.cinc is not valid UTF-8: {e:#}"))
         })?
     }; // handle dropped — txn no longer borrowed
-
-    // Build entries for all new repos
-    let new_entries: Vec<_> = repos_ids_and_requests
-        .iter()
-        .map(|(repo_id, request)| {
-            let config_path = make_repo_spec_config_path(&request.repo_name, RepoSpecDir::Git);
-            let t_shirt_size = to_repo_spec_tshirt_size(request.size_bucket)?;
-            Ok((
-                request.repo_name.clone(),
-                RepoIndexEntry {
-                    config_path,
-                    repo_id: repo_id.id(),
-                    tiers: tier_list_for_repo_spec(&request.repo_name),
-                    is_deep_sharded: true,
-                    t_shirt_size,
-                    hipster_acl: if request.custom_acl.is_some() {
-                        make_full_acl_name_from_repo_name(&request.repo_name)
-                    } else {
-                        make_top_level_acl_name_from_repo_name(&request.repo_name)
-                    },
-                    enable_git_bundle_uri: None,
-                },
-            ))
-        })
-        .collect::<Result<_, scs_errors::ServiceError>>()?;
 
     let updated_index = append_to_repo_index(&index_str, &new_entries).map_err(|e| {
         scs_errors::internal_error(format!("Failed to update repo_index.cinc: {e:#}"))
@@ -1238,25 +1330,14 @@ async fn prepare_repo_configs_mutation_nowait(
     Ok(mutation.id)
 }
 
-async fn update_source_of_truth_to_mononoke_for_mutation_id(
-    ctx: CoreContext,
-    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
-    mutation_id: i64,
-) -> Result<(), scs_errors::ServiceError> {
-    git_source_of_truth_config
-        .update_source_of_truth_by_mutation_id(&ctx, GitSourceOfTruth::Mononoke, mutation_id)
-        .await
-        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
-    Ok(())
-}
-
 async fn update_mutation_id_by_repo_names_for_reserved_repos(
     ctx: CoreContext,
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     params: &thrift::CreateReposParams,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
-    git_source_of_truth_config
+    let expected = params.repos.len() as u64;
+    let stamped = git_source_of_truth_config
         .update_mutation_id_by_repo_names_for_reserved_repos(
             &ctx,
             &params
@@ -1268,7 +1349,52 @@ async fn update_mutation_id_by_repo_names_for_reserved_repos(
         )
         .await
         .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
+    // Every reserved row must still exist when it is stamped. A shortfall
+    // means rows were lost (e.g. deleted out-of-band) after reservation:
+    // fail the creation loudly before it proceeds toward landing, instead
+    // of landing repos with no source-of-truth row.
+    // MySQL affected_rows counts CHANGED rows; the confirm-read distinguishes a lost-ack re-stamp from genuine row loss.
+    if stamped != expected
+        && !all_requested_repos_stamped(&ctx, git_source_of_truth_config, params, mutation_id)
+            .await?
+    {
+        return Err(scs_errors::internal_error(format!(
+            "stamping mutation_id {mutation_id} updated {stamped} reserved row(s) but {expected} \
+             were reserved; refusing to proceed, reconcile the source-of-truth table"
+        ))
+        .into());
+    }
     Ok(())
+}
+
+async fn all_requested_repos_stamped(
+    ctx: &CoreContext,
+    git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
+    params: &thrift::CreateReposParams,
+    mutation_id: i64,
+) -> Result<bool, scs_errors::ServiceError> {
+    // A row can flip Reserved -> Mononoke while the stamp is still retrying:
+    // once the stamp has committed (even with its ack lost), a concurrent
+    // duplicate request can attach to this mutation_id, and its client's poll
+    // can land the mutation and flip the rows before the retry loop is done.
+    // A flip proves the stamp committed, so rows in either state count.
+    let stamped_names: HashSet<String> = git_source_of_truth_config
+        .get_reserved_by_mutation_id(ctx, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?
+        .into_iter()
+        .chain(
+            git_source_of_truth_config
+                .get_redirected_to_mononoke_by_mutation_id(ctx, mutation_id)
+                .await
+                .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?,
+        )
+        .map(|entry| entry.repo_name.0)
+        .collect();
+    Ok(params
+        .repos
+        .iter()
+        .all(|request| stamped_names.contains(&request.repo_name)))
 }
 
 async fn delete_source_of_truth_for_reserved_repos(
@@ -1638,19 +1764,9 @@ async fn handle_landed_state(
     git_source_of_truth_config: &dyn GitSourceOfTruthConfig,
     mutation_id: i64,
 ) -> Result<(), scs_errors::ServiceError> {
-    retry(
-        |_| {
-            update_source_of_truth_to_mononoke_for_mutation_id(
-                ctx.clone(),
-                git_source_of_truth_config,
-                mutation_id,
-            )
-        },
-        Duration::from_millis(1_000),
-    )
-    .binary_exponential_backoff()
-    .max_attempts(5)
-    .await?;
+    flip_landed_mutation_to_mononoke(&ctx, git_source_of_truth_config, mutation_id)
+        .await
+        .map_err(|e| scs_errors::internal_error(format!("{e:#}")))?;
     Ok(())
 }
 
@@ -1857,1467 +1973,9 @@ async fn initiate_land_for_mutation(
     Ok(())
 }
 
+#[cfg(all(fbcode_build, test))]
+mod attach_tests;
+#[cfg(all(fbcode_build, test))]
+mod symref_tests;
 #[cfg(test)]
-mod tests {
-    use fbinit::FacebookInit;
-    use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
-    use mononoke_macros::mononoke;
-    use sql_construct::SqlConstruct;
-
-    use super::*;
-
-    #[mononoke::test]
-    fn test_make_repo_spec_file_path_simple_name() {
-        // Test asserts the git-only path. When adding HG support to create_repos, add a
-        // parallel test for repos/hg/ paths.
-        let path = make_repo_spec_file_path("my-repo", RepoSpecDir::Git);
-        assert!(
-            path.starts_with("source/scm/mononoke/repos/git/"),
-            "Path should start with RepoSpec base path: {path}"
-        );
-        assert!(
-            path.ends_with("/my-repo.cconf"),
-            "Path should end with /repo-name.cconf: {path}"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_file_path_slash_in_name() {
-        let path = make_repo_spec_file_path("org/project/repo", RepoSpecDir::Git);
-        assert!(
-            path.ends_with("/org_project_repo.cconf"),
-            "Slashes should be replaced with underscores: {path}"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_file_path_no_collision_slash_vs_underscore() {
-        let path1 = make_repo_spec_file_path("org/repo", RepoSpecDir::Git);
-        let path2 = make_repo_spec_file_path("org_repo", RepoSpecDir::Git);
-        assert_ne!(
-            path1, path2,
-            "Repos differing only in '/' vs '_' must produce different paths"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_file_path_deterministic() {
-        let path1 = make_repo_spec_file_path("test/repo", RepoSpecDir::Git);
-        let path2 = make_repo_spec_file_path("test/repo", RepoSpecDir::Git);
-        assert_eq!(path1, path2, "Hash-based path should be deterministic");
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_file_path_different_repos_may_differ() {
-        let path1 = make_repo_spec_file_path("repo-alpha", RepoSpecDir::Git);
-        let path2 = make_repo_spec_file_path("repo-beta", RepoSpecDir::Git);
-        assert_ne!(
-            path1, path2,
-            "Different repos should produce different paths"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_top_level_acl_name_lowercases_uppercase_org() {
-        // Regression for the XF-APAC mirror sync failure on 2026-06-24:
-        // before this fix, the uppercase repo name flowed through verbatim
-        // to the ACL name on the Mononoke repo config, producing a
-        // case-mismatch with the lowercased Hipster ACL.
-        assert_eq!(
-            make_top_level_acl_name_from_repo_name("XF-APAC/dreamwright-v2"),
-            "repos/git/xf-apac",
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_top_level_acl_name_preserves_already_lowercase_org() {
-        // Existing tenants (par-msl) must keep producing the byte-equal
-        // ACL name they had before this fix — otherwise their repo
-        // configs would point at a different name than the live Hipster
-        // entries on the next config rewrite.
-        assert_eq!(
-            make_top_level_acl_name_from_repo_name("par-msl/risk-test"),
-            "repos/git/par-msl",
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_top_level_acl_name_no_slash() {
-        // Defensive: repo name without a slash falls back to using the
-        // whole name as the top-level (matches the pre-fix behavior
-        // shape), still lowercased.
-        assert_eq!(
-            make_top_level_acl_name_from_repo_name("Single-Segment"),
-            "repos/git/single-segment",
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_full_acl_name_lowercases() {
-        // Custom-ACL path (callers with `custom_acl.is_some()`) also goes
-        // through Hipster's lowercasing, so the full ACL name must be
-        // lowercased end-to-end.
-        assert_eq!(
-            make_full_acl_name_from_repo_name("XF-APAC/Dreamwright-V2"),
-            "repos/git/xf-apac/dreamwright-v2",
-        );
-        assert_eq!(
-            make_full_acl_name_from_repo_name("par-msl/risk-test"),
-            "repos/git/par-msl/risk-test",
-        );
-    }
-
-    #[cfg(fbcode_build)]
-    #[mononoke::test]
-    fn test_initial_acl_grants_include_coding_crewmates_read() {
-        // Every newly-created per-repo Git ACL must grant read to
-        // AUTH_SET:coding_crewmates so all Meta engineers can clone the
-        // repo. Removing this grant would silently regress the eliminate
-        // -per-repo-onboarding-friction commitment made after the
-        // provide_gitimport_read_access.sh backfill; grep for that script
-        // name before deleting this assertion.
-        let grants = initial_acl_grants("some_hipster_group");
-        let read = grants
-            .iter()
-            .find(|g| g.action == "read")
-            .expect("initial_acl_grants must contain a read action");
-        let has_coding_crewmates = read
-            .entry_changes
-            .iter()
-            .any(|e| e.entry.id_type == AUTH_SET && e.entry.id_data == "coding_crewmates");
-        assert!(
-            has_coding_crewmates,
-            "initial_acl_grants read action must grant AUTH_SET:coding_crewmates",
-        );
-    }
-
-    #[mononoke::test]
-    fn test_to_repo_spec_tshirt_size_mapping() {
-        assert_eq!(
-            to_repo_spec_tshirt_size(RepoSizeBucket::EXTRA_SMALL).unwrap(),
-            TShirtSize::SMALL
-        );
-        assert_eq!(
-            to_repo_spec_tshirt_size(RepoSizeBucket::SMALL).unwrap(),
-            TShirtSize::MEDIUM
-        );
-        assert_eq!(
-            to_repo_spec_tshirt_size(RepoSizeBucket::MEDIUM).unwrap(),
-            TShirtSize::MEDIUM
-        );
-        assert_eq!(
-            to_repo_spec_tshirt_size(RepoSizeBucket::LARGE).unwrap(),
-            TShirtSize::LARGE
-        );
-        assert_eq!(
-            to_repo_spec_tshirt_size(RepoSizeBucket::EXTRA_LARGE).unwrap(),
-            TShirtSize::HUGE
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_produces_valid_spec() {
-        let repo_id = RepositoryId::new(12345);
-        let request = thrift::RepoCreationRequest {
-            repo_name: "org/my-repo".to_string(),
-            size_bucket: RepoSizeBucket::SMALL,
-            ..Default::default()
-        };
-
-        let spec =
-            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
-
-        assert_eq!(spec.repo_id, 12345);
-        assert_eq!(spec.repo_name, "org/my-repo");
-        assert!(spec.enabled);
-        assert!(!spec.readonly);
-        assert_eq!(
-            spec.default_commit_identity_scheme,
-            RawCommitIdentityScheme::GIT
-        );
-        assert_eq!(spec.t_shirt_size, TShirtSize::MEDIUM);
-        assert_eq!(spec.sharding_regions, ShardingRegions::BGM_ONLY_REGIONS);
-        assert_eq!(
-            spec.tiers,
-            vec!["gitimport", "gitimport_content", "scs", "backfill_worker"]
-        );
-        assert!(
-            spec.repo_config.is_none(),
-            "New repos should have no custom config"
-        );
-        assert!(
-            spec.tier_overrides.is_none(),
-            "New repos should have no tier overrides"
-        );
-        assert_eq!(
-            spec.hipster_acl, "repos/git/org",
-            "hipster_acl should be the top-level namespace ACL, not the full repo name"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_uses_top_level_acl_for_aosp_repo() {
-        let repo_id = RepositoryId::new(18279);
-        let request = thrift::RepoCreationRequest {
-            repo_name: "aosp/platform/vendor/meta/prebuilts/assets".to_string(),
-            size_bucket: RepoSizeBucket::SMALL,
-            ..Default::default()
-        };
-
-        let spec =
-            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
-
-        assert_eq!(
-            spec.hipster_acl, "repos/git/aosp",
-            "AOSP repos must use the top-level `repos/git/aosp` ACL, not a non-existent full-path ACL"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_uses_full_name_when_no_slash() {
-        let repo_id = RepositoryId::new(99999);
-        let request = thrift::RepoCreationRequest {
-            repo_name: "simple-repo".to_string(),
-            size_bucket: RepoSizeBucket::SMALL,
-            ..Default::default()
-        };
-
-        let spec =
-            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
-
-        assert_eq!(
-            spec.hipster_acl, "repos/git/simple-repo",
-            "Repos without `/` should use the full name as the ACL"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_tier_list_for_repo_spec_aosp_prefix_adds_multi_repo_land() {
-        assert_eq!(
-            tier_list_for_repo_spec("aosp/platform/vendor/foo"),
-            vec![
-                "gitimport",
-                "gitimport_content",
-                "scs",
-                "backfill_worker",
-                "aosp_multi_repo_land",
-            ],
-            "aosp/* repos must include aosp_multi_repo_land tier"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_tier_list_for_repo_spec_nested_aosp_adds_multi_repo_land() {
-        // Substring match: repos with `aosp/` deeper in the path (e.g. the
-        // Oculus AOSP fork) must also be on the aosp_multi_repo_land tier.
-        assert_eq!(
-            tier_list_for_repo_spec("oculus/aosp/vendor/oculus"),
-            vec![
-                "gitimport",
-                "gitimport_content",
-                "scs",
-                "backfill_worker",
-                "aosp_multi_repo_land",
-            ],
-            "repos containing aosp/ as a substring must include aosp_multi_repo_land tier"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_tier_list_for_repo_spec_non_aosp_excluded_from_multi_repo_land() {
-        assert_eq!(
-            tier_list_for_repo_spec("manus/foo"),
-            vec!["gitimport", "gitimport_content", "scs", "backfill_worker"],
-            "non-aosp repos must NOT include aosp_multi_repo_land tier"
-        );
-        assert_eq!(
-            tier_list_for_repo_spec("simple-repo"),
-            vec!["gitimport", "gitimport_content", "scs", "backfill_worker"],
-            "simple repos must NOT include aosp_multi_repo_land tier"
-        );
-        // Boundary: a repo literally named "aosp" (no slash) does NOT contain `aosp/`.
-        assert_eq!(
-            tier_list_for_repo_spec("aosp"),
-            vec!["gitimport", "gitimport_content", "scs", "backfill_worker"],
-            "literal name 'aosp' (no trailing /) must NOT match the aosp/ substring"
-        );
-        // Boundary: confusingly-named prefix that shares "aosp" but isn't `aosp/`.
-        assert_eq!(
-            tier_list_for_repo_spec("aosp_extras/foo"),
-            vec!["gitimport", "gitimport_content", "scs", "backfill_worker"],
-            "aosp_extras/* must NOT match the aosp/ substring"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_tier_list_for_repo_string_variant_matches_repo_spec() {
-        // The String variant must mirror the &'static str variant exactly.
-        let s_aosp = tier_list_for_repo("aosp/platform/vendor/foo");
-        let r_aosp = tier_list_for_repo_spec("aosp/platform/vendor/foo");
-        assert_eq!(
-            s_aosp,
-            r_aosp.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        );
-
-        let s_other = tier_list_for_repo("org/repo");
-        let r_other = tier_list_for_repo_spec("org/repo");
-        assert_eq!(
-            s_other,
-            r_other.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        );
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_aosp_repo_includes_multi_repo_land_tier() {
-        let repo_id = RepositoryId::new(18279);
-        let request = thrift::RepoCreationRequest {
-            repo_name: "aosp/platform/vendor/meta/prebuilts/assets".to_string(),
-            size_bucket: RepoSizeBucket::SMALL,
-            ..Default::default()
-        };
-
-        let spec =
-            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
-
-        assert_eq!(
-            spec.tiers,
-            vec![
-                "gitimport".to_string(),
-                "gitimport_content".to_string(),
-                "scs".to_string(),
-                "backfill_worker".to_string(),
-                "aosp_multi_repo_land".to_string(),
-            ],
-            "AOSP repos must be added to aosp_multi_repo_land tier so multi_repo_land_service can serve them"
-        );
-    }
-
-    #[mononoke::test]
-    fn test_default_branch_validation() {
-        for invalid in [
-            "",
-            "HEAD",
-            "head",
-            "Head",
-            "hEaD",
-            "refs/heads/main",
-            "refs/tags/v1.0",
-        ] {
-            let err = validate_default_branch(invalid)
-                .expect_err(&format!("'{invalid}' must be rejected as a default_branch"));
-            assert!(
-                matches!(err, scs_errors::ServiceError::Request(_)),
-                "'{invalid}' must be rejected as an invalid request, got: {err:?}"
-            );
-        }
-        for valid in ["main", "release/1.0"] {
-            assert_eq!(
-                validate_default_branch(valid)
-                    .unwrap_or_else(|err| panic!("'{valid}' must be accepted, got: {err:?}")),
-                valid,
-            );
-        }
-    }
-
-    #[mononoke::fbinit_test]
-    async fn test_write_default_branch_symref_writes_head_row(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let store = SqlGitSymbolicRefsBuilder::with_sqlite_in_memory()?.build(RepositoryId::new(1));
-
-        write_default_branch_symref(&ctx, &store, "main")
-            .await
-            .expect("writing the HEAD symref should succeed");
-
-        let entry = store
-            .get_ref_by_symref(&ctx, "HEAD".to_string())
-            .await?
-            .expect("a HEAD symref row should exist after the write");
-        assert_eq!(entry.ref_name, "main");
-        assert_eq!(entry.ref_name_with_type(), "refs/heads/main");
-        Ok(())
-    }
-
-    #[mononoke::test]
-    fn test_make_repo_spec_uses_full_acl_when_custom_acl_set() {
-        let repo_id = RepositoryId::new(55555);
-        let request = thrift::RepoCreationRequest {
-            repo_name: "fairinternal/occhi".to_string(),
-            size_bucket: RepoSizeBucket::SMALL,
-            custom_acl: Some(thrift::CustomAclParams {
-                hipster_group: "oncall_onevision".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let spec =
-            make_repo_spec(&(repo_id, request), None).expect("make_repo_spec should succeed");
-
-        assert_eq!(
-            spec.hipster_acl, "repos/git/fairinternal/occhi",
-            "Repos with custom_acl should use the full-path ACL"
-        );
-    }
-}
-
-#[cfg(all(fbcode_build, test))]
-mod attach_tests {
-    use std::collections::HashMap;
-
-    use fbinit::FacebookInit;
-    use futures::FutureExt;
-    use git_source_of_truth::GitSourceOfTruth;
-    use git_source_of_truth::RepositoryName;
-    use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
-    use justknobs::test_helpers::JustKnobsInMemory;
-    use justknobs::test_helpers::KnobVal;
-    use justknobs::test_helpers::with_just_knobs_async;
-    use mononoke_macros::mononoke;
-    use sql_construct::SqlConstruct;
-
-    use super::*;
-
-    fn params_for(names: &[&str]) -> thrift::CreateReposParams {
-        thrift::CreateReposParams {
-            repos: names
-                .iter()
-                .map(|n| thrift::RepoCreationRequest {
-                    repo_name: (*n).to_string(),
-                    scm_type: thrift::RepoScmType::GIT,
-                    size_bucket: thrift::RepoSizeBucket::SMALL,
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    #[mononoke::fbinit_test]
-    async fn attach_happy_path(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        config
-            .insert_repos(
-                &ctx,
-                &[(
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                )],
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/a".to_string())],
-                4242,
-            )
-            .await?;
-
-        let params = params_for(&["repo/a"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let outcome = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect("reserve_repos_ids should succeed and attach");
-                match outcome {
-                    ReserveOutcome::AttachedToInflight { mutation_id } => {
-                        assert_eq!(mutation_id, 4242);
-                    }
-                    ReserveOutcome::Reserved(_) => {
-                        panic!("expected AttachedToInflight, got Reserved")
-                    }
-                }
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn null_mutation_window(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        config
-            .insert_repos(
-                &ctx,
-                &[(
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                )],
-            )
-            .await?;
-
-        let params = params_for(&["repo/a"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let err = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect_err("expected an error for a null-mutation reserved repo");
-                match &err {
-                    scs_errors::ServiceError::Request(req) => {
-                        assert!(
-                            format!("{req:?}").contains("in progress"),
-                            "message should mention 'in progress', got: {req:?}"
-                        );
-                    }
-                    other => panic!("expected Request error, got: {other:?}"),
-                }
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn split_brain_guard(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        // Insert reserved, stamp a mutation id, then flip it to Mononoke.
-        config
-            .insert_repos(
-                &ctx,
-                &[(
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                )],
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/a".to_string())],
-                7,
-            )
-            .await?;
-        config
-            .update_source_of_truth_by_mutation_id(&ctx, GitSourceOfTruth::Mononoke, 7)
-            .await?;
-
-        let params = params_for(&["repo/a"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let err = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect_err("expected an error for a non-reserved (mononoke) repo");
-                match &err {
-                    scs_errors::ServiceError::Request(req) => {
-                        assert!(
-                            format!("{req:?}").contains("DANGER"),
-                            "message should mention 'DANGER', got: {req:?}"
-                        );
-                    }
-                    other => panic!("expected Request error, got: {other:?}"),
-                }
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn mixed_batch(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        config
-            .insert_repos(
-                &ctx,
-                &[
-                    (
-                        RepositoryId::new(1),
-                        RepositoryName("repo/a".to_string()),
-                        GitSourceOfTruth::Reserved,
-                    ),
-                    (
-                        RepositoryId::new(2),
-                        RepositoryName("repo/b".to_string()),
-                        GitSourceOfTruth::Reserved,
-                    ),
-                ],
-            )
-            .await?;
-        // Stamp the two reserved repos with DIFFERENT mutation ids.
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/a".to_string())],
-                100,
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/b".to_string())],
-                200,
-            )
-            .await?;
-
-        let params = params_for(&["repo/a", "repo/b"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let err = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect_err("expected an error for a batch spanning multiple mutations");
-                match &err {
-                    scs_errors::ServiceError::Request(req) => {
-                        assert!(
-                            format!("{req:?}").contains("multiple in-flight mutations"),
-                            "message should mention 'multiple in-flight mutations', got: {req:?}"
-                        );
-                    }
-                    other => panic!("expected Request error, got: {other:?}"),
-                }
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn jk_off(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        config
-            .insert_repos(
-                &ctx,
-                &[(
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                )],
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/a".to_string())],
-                4242,
-            )
-            .await?;
-
-        let params = params_for(&["repo/a"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(false),
-            )])),
-            async {
-                let err = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect_err("expected today's behavior (error) when the knob is off");
-                assert!(
-                    matches!(err, scs_errors::ServiceError::Request(_)),
-                    "expected Request error, got: {err:?}"
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn attach_happy_path_multi_repo(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        // Two reserved repos both stamped with the SAME mutation id: a
-        // duplicate multi-repo request should dedup to one mutation and attach.
-        config
-            .insert_repos(
-                &ctx,
-                &[
-                    (
-                        RepositoryId::new(1),
-                        RepositoryName("repo/a".to_string()),
-                        GitSourceOfTruth::Reserved,
-                    ),
-                    (
-                        RepositoryId::new(2),
-                        RepositoryName("repo/b".to_string()),
-                        GitSourceOfTruth::Reserved,
-                    ),
-                ],
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[
-                    RepositoryName("repo/a".to_string()),
-                    RepositoryName("repo/b".to_string()),
-                ],
-                4242,
-            )
-            .await?;
-
-        let params = params_for(&["repo/a", "repo/b"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let outcome = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect("reserve_repos_ids should succeed and attach for multi-repo");
-                match outcome {
-                    ReserveOutcome::AttachedToInflight { mutation_id } => {
-                        assert_eq!(mutation_id, 4242);
-                    }
-                    ReserveOutcome::Reserved(_) => {
-                        panic!("expected AttachedToInflight, got Reserved")
-                    }
-                }
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn attach_lookup_none(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let config = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        // Only one of the two requested repos has a seeded (reserved+stamped)
-        // row; the other has NO row at all. The absent repo makes the batch
-        // non-attachable (lookup returns None => `any_non_reserved`), so the
-        // whole request must fail closed rather than attaching to the single
-        // reserved mutation.
-        config
-            .insert_repos(
-                &ctx,
-                &[(
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                )],
-            )
-            .await?;
-        config
-            .update_mutation_id_by_repo_names_for_reserved_repos(
-                &ctx,
-                &[RepositoryName("repo/a".to_string())],
-                4242,
-            )
-            .await?;
-
-        let params = params_for(&["repo/a", "repo/absent"]);
-        with_just_knobs_async(
-            JustKnobsInMemory::new(HashMap::from([(
-                ATTACH_JK.to_string(),
-                KnobVal::Bool(true),
-            )])),
-            async {
-                let err = reserve_repos_ids(ctx.clone(), &config, &params)
-                    .await
-                    .expect_err("expected an error when a requested repo has no row");
-                assert!(
-                    matches!(err, scs_errors::ServiceError::Request(_)),
-                    "expected Request error, got: {err:?}"
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::test]
-    fn batch_at_cap_is_allowed() {
-        check_batch_size(2, 2).expect("a batch exactly at the cap must be allowed");
-    }
-
-    #[mononoke::test]
-    fn batch_over_cap_is_rejected() {
-        let err = check_batch_size(3, 2).expect_err("a batch over the cap must be rejected");
-        // An Internal error would be retried by `create_repos_in_mononoke`
-        // rather than reported to the caller.
-        let scs_errors::ServiceError::Request(request_error) = &err else {
-            panic!("expected Request error, got: {err:?}");
-        };
-        let message = format!("{request_error:?}");
-        assert!(
-            message.contains('3'),
-            "message should state the requested count, got: {message}"
-        );
-        assert!(
-            message.contains('2'),
-            "message should state the cap, got: {message}"
-        );
-    }
-
-    #[mononoke::test]
-    fn empty_batch_is_rejected() {
-        let err = check_batch_size(0, BatchSizeTier::Default.max_batch_size())
-            .expect_err("an empty batch must be rejected");
-        let scs_errors::ServiceError::Request(request_error) = &err else {
-            panic!("expected Request error, got: {err:?}");
-        };
-        let message = format!("{request_error:?}");
-        assert!(
-            message.contains("empty"),
-            "message should say the batch was empty, got: {message}"
-        );
-    }
-
-    #[mononoke::test]
-    fn tiers_admit_the_batches_they_are_sized_for() {
-        let elevated = BatchSizeTier::Elevated.max_batch_size();
-        let default = BatchSizeTier::Default.max_batch_size();
-
-        // Real runs through the bulk-import pipeline: ~40, 95, 134.
-        for count in [40, 95, 134] {
-            check_batch_size(count, elevated).unwrap_or_else(|err| {
-                panic!("a pipeline batch of {count} must be allowed, got: {err:?}")
-            });
-        }
-        // p50 of all observed traffic is 1: the common case is one repo.
-        check_batch_size(1, default).expect("a single-repo batch must always be allowed");
-    }
-
-    #[mononoke::test]
-    fn only_source_control_admits_the_largest_batches_on_record() {
-        // 588 (par-msl, the all-time high) and the 700+ MTK Wearables say they
-        // expect. Source Control has issued batches this size and can still do
-        // so; a delegated grant deliberately cannot, so a group member has to
-        // split, ask for the cap to be raised, or hand the batch back to Source
-        // Control. Sizing the delegated tier around its two largest outliers
-        // would leave it bounding nothing. Encoded so the decision is
-        // discoverable rather than a surprise at the flip.
-        let source_control = BatchSizeTier::SourceControl.max_batch_size();
-        let elevated = BatchSizeTier::Elevated.max_batch_size();
-        for count in [588, 700] {
-            check_batch_size(count, source_control).unwrap_or_else(|err| {
-                panic!("Source Control must still be able to issue {count}, got: {err:?}")
-            });
-            check_batch_size(count, elevated)
-                .expect_err(&format!("{count} is expected to exceed the elevated tier"));
-        }
-    }
-
-    #[mononoke::test]
-    fn the_default_tier_does_not_admit_the_observed_p95() {
-        // Also deliberate, and the sharper edge of the two. Observed over 32
-        // days: p95 66, max 139 -- both from ad-hoc Thrift Fiddle onboarding
-        // runs. Under a default of 50 those callers must split their batches,
-        // join the group, or be recognised as Source Control, which the
-        // identity check should already do for a human on the team. Anyone else
-        // doing bulk creation from an unrecognised identity is exactly what the
-        // cap is for, so this is the intended bite rather than collateral.
-        let default = BatchSizeTier::Default.max_batch_size();
-        check_batch_size(66, default).expect_err("the observed p95 is expected to exceed default");
-        check_batch_size(139, default).expect_err("the observed max is expected to exceed default");
-    }
-}
-
-#[cfg(all(fbcode_build, test))]
-mod symref_tests {
-    use std::collections::HashMap;
-
-    use fbinit::FacebookInit;
-    use futures::FutureExt;
-    use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
-    use git_symbolic_refs::RefType;
-    use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
-    use justknobs::test_helpers::JustKnobsInMemory;
-    use justknobs::test_helpers::KnobVal;
-    use justknobs::test_helpers::with_just_knobs_async;
-    use mononoke_macros::mononoke;
-    use sql_construct::SqlConstruct;
-
-    use super::*;
-
-    struct TestSymrefStoreProvider {
-        stores: HashMap<RepositoryId, Arc<dyn GitSymbolicRefs>>,
-    }
-
-    #[async_trait::async_trait]
-    impl SymrefStoreProvider for TestSymrefStoreProvider {
-        async fn repo_store(
-            &self,
-            repo_id: RepositoryId,
-        ) -> Result<Arc<dyn GitSymbolicRefs>, scs_errors::ServiceError> {
-            self.stores.get(&repo_id).cloned().ok_or_else(|| {
-                scs_errors::internal_error(format!("no test symref store for repo {repo_id}"))
-                    .into()
-            })
-        }
-    }
-
-    struct FailingSymrefStore {
-        repo_id: RepositoryId,
-    }
-
-    #[async_trait::async_trait]
-    impl GitSymbolicRefs for FailingSymrefStore {
-        fn repo_id(&self) -> RepositoryId {
-            self.repo_id
-        }
-
-        async fn get_ref_by_symref(
-            &self,
-            _ctx: &CoreContext,
-            _symref: String,
-        ) -> Result<Option<GitSymbolicRefsEntry>> {
-            anyhow::bail!("FailingSymrefStore always fails")
-        }
-
-        async fn get_symrefs_by_ref(
-            &self,
-            _ctx: &CoreContext,
-            _ref_name: String,
-            _ref_type: RefType,
-        ) -> Result<Option<Vec<String>>> {
-            anyhow::bail!("FailingSymrefStore always fails")
-        }
-
-        async fn add_or_update_entries(
-            &self,
-            _ctx: &CoreContext,
-            _entries: Vec<GitSymbolicRefsEntry>,
-        ) -> Result<()> {
-            anyhow::bail!("FailingSymrefStore always fails")
-        }
-
-        async fn delete_symrefs(&self, _ctx: &CoreContext, _symrefs: Vec<String>) -> Result<()> {
-            anyhow::bail!("FailingSymrefStore always fails")
-        }
-
-        async fn list_all_symrefs(&self, _ctx: &CoreContext) -> Result<Vec<GitSymbolicRefsEntry>> {
-            anyhow::bail!("FailingSymrefStore always fails")
-        }
-    }
-
-    fn sqlite_store(repo_id: RepositoryId) -> Result<Arc<dyn GitSymbolicRefs>> {
-        Ok(Arc::new(
-            SqlGitSymbolicRefsBuilder::with_sqlite_in_memory()?.build(repo_id),
-        ))
-    }
-
-    fn request_with_branch(name: &str, branch: Option<&str>) -> thrift::RepoCreationRequest {
-        thrift::RepoCreationRequest {
-            repo_name: name.to_string(),
-            scm_type: thrift::RepoScmType::GIT,
-            size_bucket: thrift::RepoSizeBucket::SMALL,
-            default_branch: branch.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    fn requests_of(
-        repo_ids_and_requests: &[(RepositoryId, thrift::RepoCreationRequest)],
-    ) -> Vec<thrift::RepoCreationRequest> {
-        repo_ids_and_requests
-            .iter()
-            .map(|(_id, request)| request.clone())
-            .collect()
-    }
-
-    async fn head_branch(
-        ctx: &CoreContext,
-        store: &Arc<dyn GitSymbolicRefs>,
-    ) -> Result<Option<String>> {
-        Ok(store
-            .get_ref_by_symref(ctx, HEAD_SYMREF.to_string())
-            .await?
-            .map(|entry| entry.ref_name))
-    }
-
-    fn symref_jk(enabled: bool) -> JustKnobsInMemory {
-        JustKnobsInMemory::new(HashMap::from([(
-            WRITE_DEFAULT_BRANCH_SYMREF_JK.to_string(),
-            KnobVal::Bool(enabled),
-        )]))
-    }
-
-    #[mononoke::fbinit_test]
-    async fn writes_head_only_for_requests_with_default_branch(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let store_with = sqlite_store(RepositoryId::new(1))?;
-        let store_without = sqlite_store(RepositoryId::new(2))?;
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([
-                (RepositoryId::new(1), store_with.clone()),
-                (RepositoryId::new(2), store_without.clone()),
-            ]),
-        };
-        let repo_ids_and_requests = vec![
-            (
-                RepositoryId::new(1),
-                request_with_branch("repo/with", Some("main")),
-            ),
-            (
-                RepositoryId::new(2),
-                request_with_branch("repo/without", None),
-            ),
-        ];
-
-        with_just_knobs_async(
-            symref_jk(true),
-            async {
-                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
-                    .expect("valid default branches must pass validation");
-                assert!(
-                    enabled,
-                    "JK on + a set default_branch must enable symref writes",
-                );
-                let written =
-                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
-                        .await
-                        .expect("writing symrefs for a mixed batch should succeed");
-                assert_eq!(
-                    written,
-                    vec![RepositoryId::new(1)],
-                    "only the repo with default_branch should be reported as written",
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-
-        assert_eq!(
-            head_branch(&ctx, &store_with).await?,
-            Some("main".to_string()),
-            "the repo with default_branch must get a HEAD row",
-        );
-        assert_eq!(
-            head_branch(&ctx, &store_without).await?,
-            None,
-            "the repo without default_branch must NOT get a HEAD row",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn jk_off_writes_nothing(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let store = sqlite_store(RepositoryId::new(1))?;
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
-        };
-        let repo_ids_and_requests = vec![(
-            RepositoryId::new(1),
-            request_with_branch("repo/with", Some("main")),
-        )];
-
-        with_just_knobs_async(
-            symref_jk(false),
-            async {
-                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
-                    .expect("the gated-off path must not reject the request");
-                assert!(!enabled, "writes must be disabled with the kill switch off");
-                let written =
-                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
-                        .await
-                        .expect("the gated-off path should succeed as a no-op");
-                assert!(
-                    written.is_empty(),
-                    "nothing should be reported as written with the kill switch off",
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-
-        assert_eq!(
-            head_branch(&ctx, &store).await?,
-            None,
-            "no HEAD row should be written with the kill switch off",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn jk_off_invalid_branch_is_fully_inert(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let store = sqlite_store(RepositoryId::new(1))?;
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
-        };
-        let repo_ids_and_requests = vec![(
-            RepositoryId::new(1),
-            request_with_branch("repo/with", Some("refs/heads/x")),
-        )];
-
-        with_just_knobs_async(
-            symref_jk(false),
-            async {
-                let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
-                    .expect(
-                        "an invalid default_branch must NOT be rejected with the kill switch off",
-                    );
-                assert!(!enabled, "writes must be disabled with the kill switch off");
-                let written =
-                    write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
-                        .await
-                        .expect("the gated-off path should succeed as a no-op");
-                assert!(
-                    written.is_empty(),
-                    "nothing should be reported as written with the kill switch off",
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-
-        assert_eq!(
-            head_branch(&ctx, &store).await?,
-            None,
-            "no HEAD row should be written with the kill switch off",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn jk_on_invalid_branch_is_rejected(_fb: FacebookInit) -> Result<()> {
-        with_just_knobs_async(
-            symref_jk(true),
-            async {
-                let err = validate_default_branches(&[request_with_branch(
-                    "repo/with",
-                    Some("refs/heads/x"),
-                )])
-                .expect_err("an invalid default_branch must be rejected with the kill switch on");
-                assert!(
-                    matches!(err, scs_errors::ServiceError::Request(_)),
-                    "expected Request error, got: {err:?}"
-                );
-                anyhow::Ok(())
-            }
-            .boxed(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn no_default_branch_targets_short_circuit_before_jk(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let store = sqlite_store(RepositoryId::new(1))?;
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
-        };
-        let repo_ids_and_requests = vec![(
-            RepositoryId::new(1),
-            request_with_branch("repo/without", None),
-        )];
-
-        // Deliberately no `with_just_knobs_async`: a JK eval against the unset test store panics.
-        let enabled = validate_default_branches(&requests_of(&repo_ids_and_requests))
-            .expect("a batch with no default_branch must succeed without a JK eval");
-        assert!(!enabled, "a batch with no default_branch enables nothing");
-        let written = write_default_branch_symrefs(&ctx, &stores, &repo_ids_and_requests, enabled)
-            .await
-            .expect("a batch with no default_branch must succeed without a JK eval");
-        assert!(
-            written.is_empty(),
-            "nothing should be reported as written for a batch with no default_branch",
-        );
-        assert_eq!(
-            head_branch(&ctx, &store).await?,
-            None,
-            "no HEAD row should be written for a batch with no default_branch",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn poll_cleanup_deletes_symrefs_and_sot_rows(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        sot.insert_repos(
-            &ctx,
-            &[
-                (
-                    RepositoryId::new(1),
-                    RepositoryName("repo/a".to_string()),
-                    GitSourceOfTruth::Reserved,
-                ),
-                (
-                    RepositoryId::new(2),
-                    RepositoryName("repo/b".to_string()),
-                    GitSourceOfTruth::Reserved,
-                ),
-            ],
-        )
-        .await?;
-        sot.update_mutation_id_by_repo_names_for_reserved_repos(
-            &ctx,
-            &[
-                RepositoryName("repo/a".to_string()),
-                RepositoryName("repo/b".to_string()),
-            ],
-            4242,
-        )
-        .await?;
-
-        let store_a = sqlite_store(RepositoryId::new(1))?;
-        let store_b = sqlite_store(RepositoryId::new(2))?;
-        write_default_branch_symref(&ctx, store_a.as_ref(), "main")
-            .await
-            .expect("seeding repo/a's HEAD row should succeed");
-        write_default_branch_symref(&ctx, store_b.as_ref(), "main")
-            .await
-            .expect("seeding repo/b's HEAD row should succeed");
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([
-                (RepositoryId::new(1), store_a.clone()),
-                (RepositoryId::new(2), store_b.clone()),
-            ]),
-        };
-
-        cleanup_repos(ctx.clone(), &sot, &stores, 4242)
-            .await
-            .expect("poll-path cleanup should succeed");
-
-        assert_eq!(
-            head_branch(&ctx, &store_a).await?,
-            None,
-            "cleanup must delete repo/a's HEAD row",
-        );
-        assert_eq!(
-            head_branch(&ctx, &store_b).await?,
-            None,
-            "cleanup must delete repo/b's HEAD row",
-        );
-        for name in ["repo/a", "repo/b"] {
-            assert!(
-                sot.get_by_repo_name(
-                    &ctx,
-                    &RepositoryName(name.to_string()),
-                    Staleness::MostRecent,
-                )
-                .await?
-                .is_none(),
-                "cleanup must delete the reserved SoT row for {name}",
-            );
-        }
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn poll_cleanup_with_unseeded_symref_store_succeeds(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        sot.insert_repos(
-            &ctx,
-            &[(
-                RepositoryId::new(1),
-                RepositoryName("repo/a".to_string()),
-                GitSourceOfTruth::Reserved,
-            )],
-        )
-        .await?;
-        sot.update_mutation_id_by_repo_names_for_reserved_repos(
-            &ctx,
-            &[RepositoryName("repo/a".to_string())],
-            4242,
-        )
-        .await?;
-
-        let store = sqlite_store(RepositoryId::new(1))?;
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
-        };
-
-        cleanup_repos(ctx.clone(), &sot, &stores, 4242)
-            .await
-            .expect("cleanup against a store with no HEAD row must succeed");
-
-        assert_eq!(
-            head_branch(&ctx, &store).await?,
-            None,
-            "there is still no HEAD row after cleanup",
-        );
-        assert!(
-            sot.get_by_repo_name(
-                &ctx,
-                &RepositoryName("repo/a".to_string()),
-                Staleness::MostRecent,
-            )
-            .await?
-            .is_none(),
-            "cleanup must still delete the reserved SoT row",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn prepare_failure_cleanup_deletes_symrefs_and_sot_rows(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        sot.insert_repos(
-            &ctx,
-            &[(
-                RepositoryId::new(1),
-                RepositoryName("repo/a".to_string()),
-                GitSourceOfTruth::Reserved,
-            )],
-        )
-        .await?;
-
-        let store = sqlite_store(RepositoryId::new(1))?;
-        write_default_branch_symref(&ctx, store.as_ref(), "main")
-            .await
-            .expect("seeding the HEAD row should succeed");
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(RepositoryId::new(1), store.clone())]),
-        };
-        let params = thrift::CreateReposParams {
-            repos: vec![request_with_branch("repo/a", Some("main"))],
-            ..Default::default()
-        };
-
-        cleanup_reserved_repos_after_failure(&ctx, &sot, &stores, &[RepositoryId::new(1)], &params)
-            .await
-            .expect("prepare-failure cleanup should succeed");
-
-        assert_eq!(
-            head_branch(&ctx, &store).await?,
-            None,
-            "prepare-failure cleanup must delete the HEAD row",
-        );
-        assert!(
-            sot.get_by_repo_name(
-                &ctx,
-                &RepositoryName("repo/a".to_string()),
-                Staleness::MostRecent,
-            )
-            .await?
-            .is_none(),
-            "prepare-failure cleanup must delete the reserved SoT row",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn poll_cleanup_failed_symref_delete_keeps_sot_rows(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        sot.insert_repos(
-            &ctx,
-            &[(
-                RepositoryId::new(1),
-                RepositoryName("repo/a".to_string()),
-                GitSourceOfTruth::Reserved,
-            )],
-        )
-        .await?;
-        sot.update_mutation_id_by_repo_names_for_reserved_repos(
-            &ctx,
-            &[RepositoryName("repo/a".to_string())],
-            7,
-        )
-        .await?;
-
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(
-                RepositoryId::new(1),
-                Arc::new(FailingSymrefStore {
-                    repo_id: RepositoryId::new(1),
-                }) as Arc<dyn GitSymbolicRefs>,
-            )]),
-        };
-
-        cleanup_repos(ctx.clone(), &sot, &stores, 7)
-            .await
-            .expect_err("cleanup must fail when the symref delete fails");
-
-        let entry = sot
-            .get_by_repo_name(
-                &ctx,
-                &RepositoryName("repo/a".to_string()),
-                Staleness::MostRecent,
-            )
-            .await?
-            .expect("the SoT row must survive a failed symref delete");
-        assert_eq!(
-            entry.source_of_truth,
-            GitSourceOfTruth::Reserved,
-            "the surviving row must still be Reserved (retryable)",
-        );
-        Ok(())
-    }
-
-    #[mononoke::fbinit_test]
-    async fn prepare_failure_cleanup_failed_symref_delete_keeps_sot_rows(
-        fb: FacebookInit,
-    ) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let sot = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?.build();
-        sot.insert_repos(
-            &ctx,
-            &[(
-                RepositoryId::new(1),
-                RepositoryName("repo/a".to_string()),
-                GitSourceOfTruth::Reserved,
-            )],
-        )
-        .await?;
-
-        let stores = TestSymrefStoreProvider {
-            stores: HashMap::from([(
-                RepositoryId::new(1),
-                Arc::new(FailingSymrefStore {
-                    repo_id: RepositoryId::new(1),
-                }) as Arc<dyn GitSymbolicRefs>,
-            )]),
-        };
-        let params = thrift::CreateReposParams {
-            repos: vec![request_with_branch("repo/a", Some("main"))],
-            ..Default::default()
-        };
-
-        cleanup_reserved_repos_after_failure(&ctx, &sot, &stores, &[RepositoryId::new(1)], &params)
-            .await
-            .expect_err("prepare-failure cleanup must fail when the symref delete fails");
-
-        let entry = sot
-            .get_by_repo_name(
-                &ctx,
-                &RepositoryName("repo/a".to_string()),
-                Staleness::MostRecent,
-            )
-            .await?
-            .expect("the SoT row must survive a failed symref delete");
-        assert_eq!(
-            entry.source_of_truth,
-            GitSourceOfTruth::Reserved,
-            "the surviving row must still be Reserved (retryable)",
-        );
-        Ok(())
-    }
-}
+mod tests;

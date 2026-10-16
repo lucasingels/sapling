@@ -6,7 +6,6 @@
  */
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 use anyhow::anyhow;
 use bookmarks::BookmarkUpdateReason;
@@ -22,8 +21,7 @@ use metaconfig_types::PHAB_DIFF_ID_PUSHVAR_KEY;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
-use pushrebase_hook::PushrebaseHook;
-use pushrebase_hooks::get_pushrebase_hooks;
+use pushrebase::RepoLockPolicy;
 use repo_authorization::AuthorizationContext;
 use repo_authorization::RepoWriteOperation;
 use repo_bookmark_attrs::RepoBookmarkAttrsRef;
@@ -37,10 +35,16 @@ use crate::BookmarkMovementError;
 use crate::Repo;
 use crate::affected_changesets::AdditionalChangesets;
 use crate::affected_changesets::AffectedChangesets;
-use crate::repo_lock::RepoLockPushrebaseHook;
 use crate::repo_lock::check_repo_lock;
 use crate::restrictions::BookmarkKindRestrictions;
 use crate::restrictions::check_bookmark_sync_config;
+
+/// Authorization and request policy needed to execute a pushrebase.
+pub struct PushrebasePreparation {
+    pub flags: PushrebaseFlags,
+    pub kind: BookmarkKind,
+    pub repo_lock: RepoLockPolicy,
+}
 
 /// Returns the configured pushrebase flags with bookmark and request overrides.
 pub fn pushrebase_flags(
@@ -69,8 +73,8 @@ pub fn pushrebase_flags(
     flags
 }
 
-/// Authorizes and validates the changesets supplied to pushrebase.
-pub async fn validate_pushrebase_request(
+/// Authorizes and prepares a pushrebase request for direct or batched execution.
+pub async fn prepare_pushrebase(
     ctx: &CoreContext,
     authz: &AuthorizationContext,
     repo: &impl Repo,
@@ -80,7 +84,7 @@ pub async fn validate_pushrebase_request(
     pushvars: Option<&HashMap<String, Bytes>>,
     cross_repo_push_source: CrossRepoPushSource,
     bookmark_restrictions: BookmarkKindRestrictions,
-) -> Result<BookmarkKind, BookmarkMovementError> {
+) -> Result<PushrebasePreparation, BookmarkMovementError> {
     let kind = bookmark_restrictions.check_kind(repo, bookmark)?;
 
     authz
@@ -89,6 +93,18 @@ pub async fn validate_pushrebase_request(
     authz.require_bookmark_modify(ctx, repo, bookmark).await?;
 
     check_bookmark_sync_config(ctx, repo, bookmark, kind).await?;
+
+    let max_commits = justknobs::get_as::<usize>(
+        "scm/mononoke:pushrebase_max_commits_per_request",
+        Some(repo.repo_identity().name()),
+    );
+    if changesets.len() > max_commits {
+        return Err(anyhow!(
+            "Land requests are limited to {max_commits} commits; received {}. Split the stack into smaller land requests.",
+            changesets.len(),
+        )
+        .into());
+    }
 
     if repo.repo_config().pushrebase.block_merges {
         let any_merges = changesets.iter().any(BonsaiChangeset::is_merge);
@@ -120,26 +136,11 @@ pub async fn validate_pushrebase_request(
         )
         .await?;
 
-    Ok(kind)
-}
-
-/// Builds the runtime hooks after checking the repository lock.
-pub async fn prepare_pushrebase_hooks(
-    ctx: &CoreContext,
-    authz: &AuthorizationContext,
-    repo: &impl Repo,
-    bookmark: &BookmarkKey,
-    pushvars: Option<&HashMap<String, Bytes>>,
-    kind: BookmarkKind,
-) -> Result<Vec<Box<dyn PushrebaseHook>>, BookmarkMovementError> {
-    let mut pushrebase_hooks =
-        get_pushrebase_hooks(ctx, repo, bookmark, &repo.repo_config().pushrebase, None).await?;
-
     // For pushrebase, we check the repo lock once at the beginning of the
     // pushrebase operation, and then once more as part of the pushrebase
     // bookmark update transaction, to check if the repo got locked while
     // we were performing the pushrebase.
-    check_repo_lock(
+    let repo_lock = check_repo_lock(
         ctx,
         repo,
         kind,
@@ -149,20 +150,11 @@ pub async fn prepare_pushrebase_hooks(
     )
     .await?;
 
-    if let Some(hook) = RepoLockPushrebaseHook::new(
-        repo.repo_identity().id(),
+    Ok(PushrebasePreparation {
+        flags: pushrebase_flags(repo, bookmark, pushvars),
         kind,
-        pushvars,
-        repo.repo_permission_checker(),
-        ctx.metadata().identities(),
-        authz,
-    )
-    .await
-    {
-        pushrebase_hooks.push(hook);
-    }
-
-    Ok(pushrebase_hooks)
+        repo_lock,
+    })
 }
 
 /// Performs all post-pushrebase work: scribe logging, bookmark operation
@@ -173,7 +165,7 @@ pub async fn postprocess_pushrebase_outcome(
     bookmark: &BookmarkKey,
     kind: BookmarkKind,
     outcome: &pushrebase::PushrebaseOutcome,
-    source_changesets: &HashSet<BonsaiChangeset>,
+    source_changesets: &[BonsaiChangeset],
     log_new_public_commits_to_scribe: bool,
 ) -> Result<(), BookmarkMovementError> {
     if log_new_public_commits_to_scribe {

@@ -38,6 +38,12 @@ Config::
     bad-diff-id-human-mode = prompt
     # Remove Differential Revision lines when agents copy commits.
     unlink-copied-diff-revisions = true
+
+    [phabstatus]
+    # Make {phabstatus} return the label of the status badge Phabricator
+    # shows for the diff (e.g. "Awaiting OWNERS Review"), and fill in
+    # {phabbadgestatus} with its state (e.g. AWAITING_OWNER_REVIEW).
+    use-status-badge = false
 """
 
 import http.client
@@ -582,6 +588,7 @@ def extsetup(ui) -> None:
         {
             "phabsignalstatus": ["phabstatus"],
             "phabstatus": ["phabstatus"],
+            "phabbadgestatus": ["phabstatus"],
             "syncstatus": ["phabstatus"],
             "phabcommit": ["phabstatus"],
         }
@@ -648,6 +655,7 @@ def getdiffstatus(repo, *diffid):
         return []
     timeout = repo.ui.configint("ssl", "timeout", 10)
     signalstatus = repo.ui.configbool("ssl", "signal_status", True)
+    statusbadge = repo.ui.configbool("phabstatus", "use-status-badge")
     batchsize = repo.ui.configint("fbcodereview", "max-diff-count", 50)
 
     try:
@@ -657,7 +665,12 @@ def getdiffstatus(repo, *diffid):
         # Use itertools.batched once we are on Python 3.12.
         for i in range(0, len(diffid), batchsize):
             statuses.update(
-                client.getrevisioninfo(timeout, signalstatus, diffid[i : i + batchsize])
+                client.getrevisioninfo(
+                    timeout,
+                    signalstatus,
+                    diffid[i : i + batchsize],
+                    statusbadge=statusbadge,
+                )
             )
     except arcconfig.ArcConfigError as ex:
         msg = _(
@@ -740,6 +753,9 @@ def showphabstatus(repo, ctx, templ, **args):
 
     result = getdiffstatus(repo, diffnum)[0]
     if isinstance(result, dict) and "status" in result:
+        badge = result.get("status_badge")
+        if badge:
+            return badge["label"]
         landstatus = result.get("land_job_status")
         finalreviewstatus = result.get("needs_final_review_status")
         if landstatus == "LAND_JOB_RUNNING":
@@ -786,6 +802,20 @@ def showphabstatus(repo, ctx, templ, **args):
             return result.get("status")
     else:
         return "Error"
+
+
+@templatekeyword("phabbadgestatus")
+def showphabbadgestatus(repo, ctx, templ, **args):
+    """String. Return the state of the Phabricator status badge for a given
+    @prog@ rev, e.g. LANDING or NEEDS_REVIEW."""
+    diffnum = getdiffnum(repo, ctx)
+    if diffnum is None:
+        return None
+    populateresponseforphab(repo, diffnum)
+
+    result = getdiffstatus(repo, diffnum)[0]
+    if isinstance(result, dict) and result.get("status_badge"):
+        return result["status_badge"]["status"]
 
 
 @templatekeyword("phabsignalstatus")
@@ -1457,11 +1487,7 @@ def localgetdiff(repo, diffid):
     """Scans the changelog for commit lines mentioning the Differential ID"""
 
     if repo.ui.configbool("phrevset", "graphqlonly"):
-        raise error.Abort(
-            _("phrevset.graphqlonly is set and Phabricator cannot resolve D%s") % diffid
-        )
-
-    repo.ui.debug("[diffrev] Traversing log for %s\n" % diffid)
+        return None
 
     def check(repo, rev, diffid):
         changectx = repo[rev]
@@ -1470,17 +1496,19 @@ def localgetdiff(repo, diffid):
         else:
             return None
 
+    repo.ui.warn(
+        _("Scanning D%s. This can diverage from Phabricator source of truth.\n")
+        % (diffid,)
+    )
+
     # Search through draft commits first. This is still needed as there are
     # cases where Phabricator GraphQL cannot resolve the commit for some reason
     # and the user really wants to resolve the commit locally (ex. S199694).
-    for rev in repo.revs("sort(draft(), -rev)"):
+    revs = repo.revs("sort(draft(), -rev)").prefetch("text")
+    for rev in revs:
         matched = check(repo, rev, diffid)
         if matched is not None:
             return matched
-
-    repo.ui.warn(
-        _("D%s not found in drafts. Perform (slow) full changelog scan.\n") % diffid
-    )
 
     # Search through the whole changelog. This does not scale. Log this as we
     # plan to remove it at some point.
@@ -1489,10 +1517,16 @@ def localgetdiff(repo, diffid):
         fullargs=repr(sys.argv),
         feature="phrevset-full-changelog-scan",
     )
-    for rev in repo.changelog.revs(start=len(repo.changelog), stop=0):
-        matched = check(repo, rev, diffid)
-        if matched is not None:
-            return matched
+    revs = repo.revs("sort(public(), -rev)").prefetch("text")
+    if revs:
+        repo.ui.warn(
+            _("Scanning D%s in %s public commits. This can be slow.\n")
+            % (diffid, len(revs))
+        )
+        for rev in revs:
+            matched = check(repo, rev, diffid)
+            if matched is not None:
+                return matched
 
     return None
 
@@ -1511,12 +1545,10 @@ def search(repo, diffid, version=None):
         return (None, graphqlgetdiff(repo, diffid))
     except Exception as ex:
         repo.ui.warn(_("cannot resolve D%s via GraphQL: %s\n") % (diffid, ex))
-        repo.ui.warn(_("falling back to search commits locally\n"))
         repo.ui.debug("[diffrev] Starting log walk\n")
         node = localgetdiff(repo, diffid)
         if node is None:
-            # walked the entire repo and couldn't find the diff
-            raise error.Abort("Could not find diff D%s in changelog" % diffid)
+            return None
         repo.ui.debug("[diffrev] Parallel log walk completed with %s\n" % hex(node))
         return (node, None)
 
@@ -1629,13 +1661,18 @@ def diffidtonode(repo, diffid, localreponame=None, version=None):
 
     repo_callsigns = _get_callsigns(repo)
     if not repo_callsigns:
-        msg = _("phrevset.callsign is not set - doing a linear search\n")
-        hint = _("This will be slow if the diff was not committed recently\n")
+        msg = _("Could not determine Phabricator callsign to resolve D%s.\n") % diffid
+        hint = _(
+            "  To fix this configuration issue:\n"
+            "    1. Edit repo root's .arcconfig (JSON) to include:\n"
+            '      {"repository.callsign": "YOUR_PHABRICATOR_REPO_CALLSIGN"}\n'
+            "    2. Commit the change.\n"
+            "  To test callsign config temporarily, re-run with:\n"
+            "    --config phrevset.callsign=CALLSIGN\n"
+        )
         repo.ui.warn(msg)
         repo.ui.warn(hint)
         node = localgetdiff(repo, diffid)
-        if node is None:
-            repo.ui.warn(_("Could not find diff D%s in changelog\n") % diffid)
         return node
 
     node, resp = search(repo, diffid, version=version)

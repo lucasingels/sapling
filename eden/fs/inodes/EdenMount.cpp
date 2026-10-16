@@ -133,8 +133,11 @@ constexpr PathComponentPiece kDotEdenSymlinkName{"this-dir"_pc};
 #endif
 
 namespace {
-constexpr PathComponentPiece kNfsdSocketName{"nfsd.socket"_pc};
-}
+// The name is part of how the mount is recognized: macOS reports a mount
+// served over a Unix domain socket as "<socket path>:<mount path>", see
+// is_edenfs_nfs_mount().
+constexpr PathComponentPiece kNfsdSocketName{"edenfs-nfsd.socket"_pc};
+} // namespace
 
 /**
  * Helper for computing unclean paths when changing parents
@@ -292,6 +295,8 @@ EdenMount::EdenMount(
           serverState_->getReloadableConfig(),
           stats.copy(),
           serverState_->getEdenFsEventsLogger())},
+      inodePathCache_{
+          serverState_->getEdenConfig()->inodePathCacheSize.getValue()},
       objectStore_{std::move(objectStore)},
       blobCache_{std::move(blobCache)},
       blobAccess_{objectStore_, blobCache_},
@@ -394,7 +399,8 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
           .value();
 
   static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
-      "EdenMount::initialize");
+      ObjectFetchContext::StaticCauseDetail::fromLiteral(
+          "EdenMount::initialize"));
   return serverState_->getFaultInjector()
       .checkAsync("mount", getPath().view())
       .thenValue([this, parent](auto&&) {
@@ -495,8 +501,9 @@ ImmediateFuture<Unit> ensureDotEdenSymlink(
     UnlinkThenSymlink,
   };
 
-  static auto context =
-      ObjectFetchContext::getNullContextWithCauseDetail("ensureDotEdenSymlink");
+  static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
+      ObjectFetchContext::StaticCauseDetail::fromLiteral(
+          "ensureDotEdenSymlink"));
   return directory->getOrLoadChild(symlinkName, context)
       .thenTry([=](Try<InodePtr>&& result) -> ImmediateFuture<Action> {
         if (!result.hasValue()) {
@@ -577,8 +584,8 @@ ImmediateFuture<Unit> ensureDotEdenSymlink(
 
 ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
   // Set up the magic .eden dir
-  static auto context =
-      ObjectFetchContext::getNullContextWithCauseDetail("setupDotEden");
+  static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
+      ObjectFetchContext::StaticCauseDetail::fromLiteral("setupDotEden"));
   return root->getOrLoadChildTree(PathComponentPiece{kDotEdenName}, context)
       .thenTry([=, this](Try<TreeInodePtr>&& lookupResult) {
         TreeInodePtr dotEdenInode;
@@ -650,6 +657,7 @@ ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
 
 folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   auto mountPath = getPath();
+  auto edenDir = getEdenConfig()->edenDir.getValue();
   auto systemConfigDir = getEdenConfig()->getSystemConfigDir();
   SpawnedProcess::Options opts;
 #ifdef _WIN32
@@ -661,6 +669,8 @@ folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   return folly::makeSemiFutureWith([&] {
            std::vector<std::string> argv{
                FLAGS_edenfsctlPath,
+               "--config-dir",
+               edenDir.c_str(),
                "--etc-eden-dir",
                systemConfigDir.c_str(),
                "redirect",
@@ -1195,42 +1205,54 @@ void EdenMount::updateInodePressurePolicy() {
       gcPeriodMax.count());
 }
 
-// Below this many invalidations, rerunning GC is cheap enough that stall
+// Below this many invalidations, rerunning GC is cheap enough that reclaim
 // tracking isn't worthwhile.
-constexpr uint64_t kPressureGcStallMinInvalidated = 10'000;
+constexpr uint64_t kPressureGcReclaimMinInvalidated = 10'000;
 
 void EdenMount::recordPressureGcOutcome(
     uint64_t numInvalidated,
-    uint64_t inodesBefore,
-    uint64_t inodesAfter) {
+    uint64_t numUnloaded,
+    bool pinScanFailed) {
   // GC flushes the invalidation queue between invalidating entries and
   // sweeping, and the kernel FORGETs triggered by the invalidations arrive
-  // quickly in practice, so most of a run's invalidations should be dropped
-  // from the inode count by the run's own sweep. Concurrent lookups can
-  // offset some of the drop, but a healthy run reclaims far more than 10%;
-  // should a run be misjudged anyway, the cost is one cycle at the regular
-  // GC cadence.
-  auto numDropped =
-      static_cast<int64_t>(inodesBefore) - static_cast<int64_t>(inodesAfter);
-  bool stalled = numInvalidated >= kPressureGcStallMinInvalidated &&
-      numDropped <= static_cast<int64_t>(numInvalidated / 10);
+  // quickly in practice, so most of a run's invalidations should be unloaded
+  // by the run's own sweep. A healthy run reclaims far more than the default
+  // 10%; should a run be misjudged anyway, the cost is one cycle at the
+  // regular GC cadence. The sweep's own count is used rather than the change
+  // in the mount's inode count, which concurrent lookups (a build, a crawl)
+  // can push the other way while GC runs.
+  auto minReclaimPercent =
+      getEdenConfig()->pressureBasedGcMinReclaimPercent.getValue();
+  const bool stalled = minReclaimPercent > 0 &&
+      numInvalidated >= kPressureGcReclaimMinInvalidated &&
+      numUnloaded * 100 <= numInvalidated * minReclaimPercent;
+  // Without a pin set the run reclaimed files only, and every run until a
+  // scan succeeds would do the same; each costs a full scan of every
+  // process, so it is not worth the pressure-derived rate either.
+  const bool backOff = stalled || pinScanFailed;
 
-  if (pressureGcStalled_.exchange(stalled, std::memory_order_relaxed) !=
-      stalled) {
-    if (stalled) {
+  if (pressureGcBackoff_.exchange(backOff, std::memory_order_relaxed) !=
+      backOff) {
+    if (pinScanFailed) {
       XLOGF(
           INFO,
-          "Pressure-based GC for {} invalidated {} inodes but only dropped "
+          "Pressure-based GC for {} ran without a pin set because the pin "
+          "scan failed. Falling back to the regular GC period.",
+          getPath());
+    } else if (backOff) {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} invalidated {} inodes but only reclaimed "
           "{}; the kernel may no longer hold the invalidated entries. "
           "Falling back to the regular GC period.",
           getPath(),
           numInvalidated,
-          numDropped);
+          numUnloaded);
     } else {
       XLOGF(
           INFO,
-          "Pressure-based GC for {} is reclaiming inodes again, resuming "
-          "the pressure-based GC period",
+          "Pressure-based GC for {} completed, resuming the pressure-based GC "
+          "period",
           getPath());
     }
   }
@@ -2473,7 +2495,8 @@ std::unique_ptr<DiffContext> EdenMount::createDiffContext(
       getCheckoutConfig()->getCaseSensitive(),
       getObjectStore(),
       serverState_->getTopLevelIgnores(),
-      getEdenConfig()->throwOnCancel.getValue());
+      getEdenConfig()->throwOnCancel.getValue(),
+      serverState_->getGlobMatchOptions());
 }
 
 folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
@@ -2786,12 +2809,15 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       mount->getServerState()->getEdenConfig()->FuseTraceBusCapacity.getValue(),
       edenConfig->fuseBdiReadAheadKb.getValue(),
       edenConfig->fuseMaxPages.getValue(),
+      edenConfig->experimentalFuseHandleKillPrivV2.getValue(),
       edenConfig->fuseUseIoUring.getValue(),
       edenConfig->fuseIoUringKernelReleaseRegex.getValue(),
       edenConfig->fuseIoUringQueueDepth.getValue(),
       edenConfig->fuseIoUringDisableIoWait.getValue(),
       edenConfig->experimentalFuseIoUringSkipSelfWakeup.getValue(),
-      edenConfig->fuseNumInvalidationThreads.getValue());
+      edenConfig->fuseIoUringPreCreateQueues.getValue(),
+      edenConfig->fuseNumInvalidationThreads.getValue(),
+      edenConfig->fuseBusyPoll.getValue());
 }
 } // namespace
 #endif
@@ -2802,12 +2828,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
     std::optional<folly::File> connectedSocket = std::nullopt) {
   auto edenConfig = mount->getEdenConfig();
   auto nfsServer = mount->getServerState()->getNfsServer();
-  auto iosize = edenConfig->nfsIoSize.getValue();
   auto mountPath = mount->getPath();
   // Make sure that we are running on the EventBase while registering
   // the mount point.
   return via(nfsServer->getEventBase(),
-             [mount, mountPath, nfsServer, iosize, edenConfig]() {
+             [mount, mountPath, nfsServer, edenConfig]() {
                return nfsServer->registerMount(
                    mountPath,
                    mount->getRootInode()->getNodeId(),
@@ -2821,10 +2846,12 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                        edenConfig->nfsRequestTimeout.getValue()),
                    mount->getServerState()->getNotifier(),
                    mount->getCheckoutConfig()->getCaseSensitive(),
-                   iosize,
+                   edenConfig->nfsReadIoSize.getValue(),
+                   edenConfig->nfsWriteIoSize.getValue(),
                    edenConfig->nfsTraceBusCapacity.getValue(),
                    edenConfig->nfsFastPathRPCs.getValue(),
-                   mount->getServerState()->getReloadableConfig());
+                   mount->getServerState()->getReloadableConfig(),
+                   mount->getServerState()->getFaultInjector());
              })
       .thenValue([mount,
                   nfsServer,
@@ -2843,10 +2870,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
           // the listening one is the one we wanna register. So we need to
           // transfer that socket to be able to register it.
         } else {
+          // The kernel requires a checkout's mountd and nfsd sockets to be
+          // of the same type, so follow the running mountd rather than
+          // nfs:use-uds, which only applies when a mountd is created.
           std::optional<AbsolutePath> unixSocketPath;
-          if (mount->getServerState()
-                  ->getEdenConfig()
-                  ->useUnixSocket.getValue()) {
+          if (nfsServer->getMountdAddr().getFamily() == AF_UNIX) {
             unixSocketPath = mount->getCheckoutConfig()->getClientDirectory() +
                 kNfsdSocketName;
             XLOGF(
@@ -2879,7 +2907,6 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
 
         if (shouldBeOrIsNfsChannel()) {
           NFSMountOptions options;
-          options.iosize = edenConfig->nfsIoSize.getValue();
           options.useReaddirplus = edenConfig->useReaddirplus.getValue();
           options.useSoftMount = edenConfig->useSoftMounts.getValue();
           options.readOnly = readOnly;
@@ -3358,12 +3385,15 @@ std::optional<TreePrefetchLease> EdenMount::tryStartTreePrefetch(
 
 std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
   auto mount = shared_from_this();
+  auto failureLimit = getEdenConfig()->gcMaxTreeLoadFailures.getValue();
   auto state = inodeGCState_.wlock();
   if (state->gcRunning || state->inhibitorCount != 0) {
     return std::nullopt;
   }
 
   state->cancellationSource = folly::CancellationSource{};
+  state->treeLoadFailureLimit = failureLimit;
+  state->remainingTreeLoadFailures = failureLimit;
   auto cancellationToken = state->cancellationSource.getToken();
   state->gcRunning = true;
   return InodeGCLease{
@@ -3374,6 +3404,29 @@ std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
 
 bool EdenMount::isInodeGCRunning() const {
   return inodeGCState_.rlock()->gcRunning;
+}
+
+void EdenMount::recordInodeGCTreeLoadFailure() {
+  auto cancellationSource = folly::CancellationSource::invalid();
+  uint64_t failureLimit;
+  {
+    auto state = inodeGCState_.wlock();
+    if (!state->gcRunning || state->remainingTreeLoadFailures == 0 ||
+        --state->remainingTreeLoadFailures != 0) {
+      return;
+    }
+    pressureGcBackoff_.store(true, std::memory_order_relaxed);
+    cancellationSource = state->cancellationSource;
+    failureLimit = state->treeLoadFailureLimit;
+  }
+  // Cancellation callbacks may run inline and acquire the GC state lock.
+  cancellationSource.requestCancellation();
+  XLOGF(
+      WARN,
+      "Cancelling inode GC for {} after {} tree-load failures; pressure-based "
+      "GC will wait the regular GC period before running again",
+      getPath(),
+      failureLimit);
 }
 
 EdenMount::InodeGCLease EdenMount::stealInodeGCLease() {

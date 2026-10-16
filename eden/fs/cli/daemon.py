@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import contextlib
 import datetime
 import os
 import re
@@ -14,7 +15,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
+
+if sys.platform != "win32":
+    import fcntl
 
 from eden.fs.cli.util import (
     EdensparseMigrationStep,
@@ -22,9 +26,9 @@ from eden.fs.cli.util import (
     maybe_edensparse_migration,
 )
 
-from . import configutil, daemon_util, proc_utils as proc_utils_mod
+from . import configutil, daemon_util, error_report, proc_utils as proc_utils_mod
 from .config import EdenInstance
-from .util import poll_until, print_stderr, ShutdownError
+from .util import get_pid_using_lockfile, poll_until, print_stderr, ShutdownError
 
 # The amount of time to wait for the edenfs process to exit after we send SIGKILL.
 # We normally expect the process to be killed and reaped fairly quickly in this
@@ -41,13 +45,6 @@ DEFAULT_SIGKILL_TIMEOUT = 30.0
 EDENFS_UNIT_NAME_TEMPLATE = "edenfs@{escaped_state_dir}.service"
 EDENFS_SYSTEMD_SERVICE_UNIT = Path("/usr/lib/systemd/user/edenfs@.service")
 EDENFS_SYSTEMD_SLICE_UNIT = Path("/usr/lib/systemd/user/edenfs.slice")
-EDENFS_SYSTEMD_SLICE_NAME = "edenfs.slice"
-EDENFS_OOMD_AVOID_XATTR = "user.oomd_avoid"
-EDENFS_OOMD_AVOID_CONFIG = "experimental.oomd_avoid"
-EDENFS_OOMD_AVOID_DISABLED = -1
-EDENFS_OOMD_AVOID_CLEAR = 0
-CGROUP2_ROOT = Path("/sys/fs/cgroup")
-PROC_ROOT = Path("/proc")
 ENVIRONMENT_VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -86,85 +83,6 @@ def _build_systemd_run_cmd(
     cmd.append("--")
     cmd.extend(edenfs_cmd)
     return cmd
-
-
-def _parse_edenfs_slice_cgroup(proc_cgroup: str) -> Optional[Path]:
-    """Extract the edenfs.slice cgroup directory from /proc/<pid>/cgroup content.
-
-    The cgroup2 unified hierarchy is the line prefixed with "0::", whose path is
-    the daemon's leaf unit, e.g.
-    /user.slice/user-1000.slice/user@1000.service/edenfs.slice/edenfs@foo.service
-
-    Returns the ancestor named edenfs.slice, or None if the daemon is not under
-    it or the host has no unified hierarchy.
-    """
-    for line in proc_cgroup.splitlines():
-        if not line.startswith("0::"):
-            continue
-        parts = [part for part in line[len("0::") :].split("/") if part]
-        if EDENFS_SYSTEMD_SLICE_NAME not in parts:
-            return None
-        depth = parts.index(EDENFS_SYSTEMD_SLICE_NAME) + 1
-        return CGROUP2_ROOT.joinpath(*parts[:depth])
-    return None
-
-
-def _log_oomd_avoid_failure(instance: EdenInstance, error: str) -> None:
-    instance.log_sample(
-        "edenfs_slice_oomd_avoid",
-        success=False,
-        path="",
-        error=error,
-    )
-
-
-def _set_edenfs_slice_oomd_avoid(instance: EdenInstance) -> None:
-    oomd_avoid = instance.get_config_int(
-        EDENFS_OOMD_AVOID_CONFIG, EDENFS_OOMD_AVOID_DISABLED
-    )
-
-    # Any negative value will be indicating disabled
-    if oomd_avoid <= EDENFS_OOMD_AVOID_DISABLED:
-        return
-
-    pid = instance.check_health().pid
-    if pid is None:
-        _log_oomd_avoid_failure(instance, "edenfs is not running")
-        return
-
-    proc_cgroup_path = PROC_ROOT / str(pid) / "cgroup"
-    try:
-        proc_cgroup = proc_cgroup_path.read_text()
-    except OSError as e:
-        _log_oomd_avoid_failure(
-            instance, f"failed to read {proc_cgroup_path}: {str(e)}"
-        )
-        return
-
-    cgroup_path = _parse_edenfs_slice_cgroup(proc_cgroup)
-    if cgroup_path is None:
-        _log_oomd_avoid_failure(
-            instance,
-            f"edenfs {pid} is not under {EDENFS_SYSTEMD_SLICE_NAME}",
-        )
-        return
-
-    xattr_value = b"0" if oomd_avoid == EDENFS_OOMD_AVOID_CLEAR else b"1"
-    try:
-        os.setxattr(cgroup_path, EDENFS_OOMD_AVOID_XATTR, xattr_value)
-    except OSError as e:
-        instance.log_sample(
-            "edenfs_slice_oomd_avoid",
-            success=False,
-            path=str(cgroup_path),
-            error=str(e),
-        )
-        return
-    instance.log_sample(
-        "edenfs_slice_oomd_avoid",
-        success=True,
-        path=str(cgroup_path),
-    )
 
 
 def _ensure_dbus_env(env: Dict[str, str]) -> bool:
@@ -300,6 +218,57 @@ def _send_sigkill(
         )
 
 
+def _may_remove_restart_sentinel(pid: int, config_dir: Path) -> bool:
+    """Whether pid's killer may remove config_dir's restart sentinel.
+
+    True when pid holds the lock, or when the lock file is absent so that no
+    daemon owns the state dir. A lock file that exists but cannot be read or
+    parsed counts as a live owner.
+    """
+    try:
+        return get_pid_using_lockfile(config_dir) == pid
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def _restart_lock(config_dir: Path) -> Iterator[None]:
+    """Serialize restart arming with a deliberate SIGKILL.
+
+    Raises ShutdownError rather than proceeding unlocked: killing while a
+    daemon arms would let the privhelper relaunch the daemon this kill is
+    meant to retire.
+    """
+    lock_path = config_dir / daemon_util.RESTART_SENTINEL_LOCK_NAME
+    with contextlib.ExitStack() as stack:
+        try:
+            lock_file = stack.enter_context(lock_path.open("a"))
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as ex:
+            raise ShutdownError(
+                f"Failed to acquire restart lock {lock_path}: {ex}"
+            ) from ex
+        yield
+
+
+def _remove_restart_sentinels(pid: int, config_dir: Path) -> None:
+    prefix = f"{daemon_util.RESTART_SENTINEL_NAME_PREFIX}{pid}."
+    try:
+        sentinels = list(config_dir.glob(f"{prefix}*"))
+    except OSError as ex:
+        print_stderr(f"Failed to list restart sentinels in {config_dir}: {ex}")
+        return
+    for sentinel in sentinels:
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as ex:
+            print_stderr(f"Failed to delete restart sentinel {sentinel}: {ex}")
+
+
 def sigkill_process(
     pid: int,
     config_dir: Path,
@@ -332,7 +301,18 @@ def sigkill_process(
         except Exception as e:
             print_stderr(f"Failed to delete heartbeat file {heartbeat_file}: {e}")
 
-    _send_sigkill(pid, instance)
+        if sys.platform == "darwin":
+            with _restart_lock(config_dir):
+                # Only pid's own sentinels are removed. A concurrent generation
+                # that took ownership while this call waited is left alone.
+                if _may_remove_restart_sentinel(pid, config_dir):
+                    _remove_restart_sentinels(pid, config_dir)
+                _send_sigkill(pid, instance)
+        else:
+            _send_sigkill(pid, instance)
+
+    else:
+        _send_sigkill(pid, instance)
 
     if timeout <= 0:
         return
@@ -389,6 +369,54 @@ def gracefully_restart_edenfs_service(
     return result
 
 
+def _daemon_args_file(instance: EdenInstance) -> Path:
+    return instance.state_dir / daemon_util.DAEMON_ARGS_FILENAME
+
+
+def _try_write_daemon_args_file(
+    instance: EdenInstance,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Record the daemon command and environment in the state directory.
+
+    Returns the failure message, or None if the file was written.
+    """
+    try:
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        daemon_util.write_daemon_args_file(
+            instance.state_dir, cmd, eden_env, restart_cmd
+        )
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            _daemon_args_file(instance).unlink(missing_ok=True)
+        return str(e)
+    except Exception as e:
+        # best-effort
+        return str(e)
+    return None
+
+
+def _warn_daemon_args_file_failure(instance: EdenInstance, error: str) -> None:
+    """Warn that the daemon command could not be recorded."""
+    # A state directory that refuses the write usually refuses the removal of
+    # the earlier file too, which leaves that command armed instead of none.
+    # An unreadable state directory gets the same benefit of the doubt.
+    try:
+        stale_file_survives = _daemon_args_file(instance).exists()
+    except OSError:
+        stale_file_survives = True
+    consequence = (
+        "edenfs may be auto-restarted from an earlier start's command"
+        if stale_file_survives
+        else "edenfs will not be auto-restarted after a crash"
+    )
+    print_stderr(
+        f"warning: failed to write the daemon args file: {error}; {consequence}"
+    )
+
+
 def _start_edenfs_service(
     instance: EdenInstance,
     daemon_binary: Optional[str] = None,
@@ -400,10 +428,17 @@ def _start_edenfs_service(
     daemon_binary = daemon_util.find_daemon_binary(daemon_binary)
     cmd, privhelper = get_edenfs_cmd(instance, daemon_binary)
 
+    # Snapshot the relaunch command before `--takeover` and the sudo wrapper,
+    # neither of which may be replayed. Must stay above
+    # `prepare_edenfs_privileges`.
+    restart_cmd = list(cmd)
+
     if takeover:
         cmd.append("--takeover")
     if edenfs_args:
+        # A restarted daemon should behave like the one it replaces.
         cmd.extend(edenfs_args)
+        restart_cmd.extend(edenfs_args)
 
     eden_env = get_edenfs_environment(instance, preserved_env)
     systemd_env = os.environ.copy()
@@ -412,12 +447,39 @@ def _start_edenfs_service(
     # prepare_edenfs_privileges for more info.
     cmd, eden_env = prepare_edenfs_privileges(daemon_binary, cmd, eden_env, privhelper)
 
-    if should_use_systemd_lifecycle_management(instance) and _try_setup_systemd_env(
-        systemd_env, instance
-    ):
-        return _systemctl_start_or_reload(
-            instance, cmd, eden_env, systemd_env, takeover
-        )
+    use_systemd = should_use_systemd_lifecycle_management(
+        instance
+    ) and _try_setup_systemd_env(systemd_env, instance)
+
+    # Windows has neither systemd nor a privhelper, so nothing there reads the
+    # file back. Off systemd the only reader is privhelper restart, which the
+    # daemon arms from this same knob.
+    write_args_file = sys.platform != "win32" and (
+        use_systemd
+        or instance.get_config_bool("privhelper.restart-edenfs-on-crash", default=False)
+    )
+
+    args_file_error = (
+        _try_write_daemon_args_file(instance, cmd, eden_env, restart_cmd)
+        if write_args_file
+        else None
+    )
+
+    if use_systemd:
+        if args_file_error is not None:
+            # systemd launches the daemon from the file rather than from this
+            # command, so there is nothing left for it to start.
+            print_stderr(
+                f"error: failed to write the daemon args file: {args_file_error}"
+            )
+            error_report.record(
+                f"failed to write the daemon args file: {args_file_error}"
+            )
+            return 1
+        return _systemctl_start_or_reload(instance, systemd_env, takeover)
+
+    if args_file_error is not None:
+        _warn_daemon_args_file_failure(instance, args_file_error)
 
     if (
         sys.platform == "linux"
@@ -433,22 +495,15 @@ def _start_edenfs_service(
         launch_env = eden_env
         use_systemd_cgroup = False
 
-    creation_flags = 0
-
     maybe_edensparse_migration(instance, EdensparseMigrationStep.PRE_EDEN_START)
-    exit_code = subprocess.call(
-        cmd, stdin=subprocess.DEVNULL, env=launch_env, creationflags=creation_flags
-    )
+    exit_code, daemon_error = _launch_daemon(instance, cmd, launch_env)
     maybe_edensparse_migration(instance, EdensparseMigrationStep.POST_EDEN_START)
+    if exit_code != 0:
+        error_report.record(
+            daemon_error or f"edenfs daemon startup exited with status {exit_code}"
+        )
 
     if use_systemd_cgroup:
-        if exit_code == 0:
-            # Setting the xattr is best-effort: the daemon is already running,
-            # so nothing here may fail the start.
-            try:
-                _set_edenfs_slice_oomd_avoid(instance)
-            except Exception as e:
-                _log_oomd_avoid_failure(instance, str(e))
         instance.log_sample(
             "systemd_cgroup_start",
             success=exit_code == 0,
@@ -590,33 +645,86 @@ def _extract_daemon_error(startup_log_content: str) -> Optional[str]:
     return None
 
 
+def _new_startup_log(instance: EdenInstance) -> Path:
+    """Rotate the earlier startup logs. Return the log path for this start."""
+    startup_log = instance.state_dir / daemon_util.STARTUP_LOG_FILENAME
+    # TODO: make the retention count configurable
+    _rotate_startup_log(startup_log, keep=5)
+    return startup_log
+
+
+def _read_startup_log(startup_log: Path, start_time: float) -> Optional[str]:
+    """Return the startup log content if the log changed at or after `start_time`.
+
+    Return None if the log is older, missing, or unreadable. An older log is
+    the output of an earlier start. It stays if the rotation failed.
+    """
+    try:
+        if startup_log.exists() and startup_log.stat().st_mtime >= start_time:
+            return startup_log.read_text()
+    except OSError as e:
+        print_stderr(f"warning: failed to read startup log: {e}")
+    return None
+
+
+_STARTUP_NOTICE = (
+    "Starting EdenFS. The startup output will show when the start is complete."
+)
+
+
+def _launch_daemon(
+    instance: EdenInstance, cmd: List[str], env: Dict[str, str]
+) -> Tuple[int, Optional[str]]:
+    """Run the daemon launch command.
+
+    Outside Windows, the command writes its stderr to the startup log. The log
+    shows on stderr when the command exits. Return the exit code. On failure,
+    also return the daemon error from the log.
+    """
+    if sys.platform == "win32":
+        return subprocess.call(cmd, stdin=subprocess.DEVNULL, env=env), None
+
+    startup_log = _new_startup_log(instance)
+    start_time = time.time()
+    try:
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        # Use a file, not a pipe. The privhelper inherits this stderr and can
+        # keep a pipe open after the daemon command exits.
+        log_file = open(startup_log, "wb")
+    except OSError as e:
+        print_stderr(f"warning: failed to open the startup log: {e}")
+        return subprocess.call(cmd, stdin=subprocess.DEVNULL, env=env), None
+    print_stderr(_STARTUP_NOTICE)
+    with log_file:
+        exit_code = subprocess.call(
+            cmd, stdin=subprocess.DEVNULL, stderr=log_file, env=env
+        )
+
+    content = _read_startup_log(startup_log, start_time)
+    if content:
+        sys.stderr.write(content)
+    if exit_code == 0 or not content:
+        return exit_code, None
+    return exit_code, _extract_daemon_error(content)
+
+
 def _systemctl_start_or_reload(
     instance: EdenInstance,
-    cmd: List[str],
-    eden_env: Dict[str, str],
     systemd_env: Dict[str, str],
     takeover: bool,
 ) -> int:
-    """Start or reload the edenfs systemd service.
-
-    Writes the daemon command and environment to an args file, then calls
-    systemctl start (fresh start) or systemctl reload (takeover).
-    """
-    instance.state_dir.mkdir(parents=True, exist_ok=True)
-    daemon_util.write_daemon_args_file(instance.state_dir, cmd, eden_env)
+    """Start or reload the edenfs systemd service."""
     unit = _get_systemd_unit(instance)
     if takeover and _is_systemd_unit_active(unit):
         action = "reload"
     else:
         action = "start"
 
-    # Rotate old startup logs before launching so we only capture output
-    # from this invocation.  systemd uses StandardOutput=file: which appends,
-    # so stale content would otherwise leak into the CLI output.
-    # TODO: make the retention count configurable
-    startup_log = instance.state_dir / daemon_util.SYSTEMD_STARTUP_LOG_FILENAME
-    _rotate_startup_log(startup_log, keep=5)
+    # systemd appends to the startup log (StandardOutput=file:). Without the
+    # rotation, output of earlier starts goes into the CLI output.
+    startup_log = _new_startup_log(instance)
 
+    print_stderr(_STARTUP_NOTICE)
     start_time = time.time()
     result = subprocess.run(
         ["systemctl", "--user", action, unit],
@@ -627,15 +735,9 @@ def _systemctl_start_or_reload(
     rc = result.returncode
 
     # Display the daemon's startup output captured by systemd (StandardOutput=file:).
-    # Only read if created after we invoked systemctl, to avoid showing stale content
-    # from a previous run if log rotation failed.
-    startup_log_content: Optional[str] = None
-    try:
-        if startup_log.exists() and startup_log.stat().st_mtime >= start_time:
-            startup_log_content = startup_log.read_text()
-            sys.stderr.write(startup_log_content)
-    except OSError as e:
-        print_stderr(f"warning: failed to read startup log: {e}")
+    startup_log_content = _read_startup_log(startup_log, start_time)
+    if startup_log_content:
+        sys.stderr.write(startup_log_content)
 
     sample_kwargs: Dict[str, Union[bool, int, str]] = {
         "action": action,
@@ -650,10 +752,14 @@ def _systemctl_start_or_reload(
         # Always check the startup log for daemon errors independently of
         # systemctl stderr — systemctl's generic "Job failed" message doesn't
         # contain the actual daemon error (e.g. "error starting EdenFS: ...").
+        daemon_error = None
         if startup_log_content:
             daemon_error = _extract_daemon_error(startup_log_content)
             if daemon_error:
                 sample_kwargs["daemon_startup_log"] = daemon_error
+        error_report.record(
+            daemon_error or result.stderr or f"systemctl {action} {unit} failed"
+        )
     instance.log_sample("systemctl_action", **sample_kwargs)
     return rc
 
@@ -895,8 +1001,6 @@ def get_edenfs_environment(
         # when starting edenfs with cgroup isolation.
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
-        # Used to identify if edenfs was started by a coding agent
-        "CODING_AGENT_METADATA",
     ]
 
     if sys.platform == "win32":

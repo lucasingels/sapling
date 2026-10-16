@@ -8,7 +8,8 @@
 import type {DiffComment} from 'isl/src/types';
 import type {VSCodeRepo, VSCodeReposList} from '../../VSCodeRepo';
 
-import {mockLogger, nextTick} from 'shared/testUtils';
+import {mockLogger} from 'shared/testUtils';
+import {nextTick} from 'shared/utils';
 import * as vscode from 'vscode';
 import {
   CommentsProvider,

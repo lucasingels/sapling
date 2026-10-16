@@ -17,12 +17,13 @@ context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/conte
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
 in_memory_commit_graph_storage = { version = "0.1.0", path = "../in_memory_commit_graph_storage" }
 itertools = "0.15.0"
+justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
 maplit = "1.0"
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
-rand = "0.10.2"
+rand = "0.10.3"
 repo_identity = { version = "0.1.0", path = "../../repo_identity" }
 sapling-drawdag = { version = "0.1.0", path = "../../../../scm/lib/drawdag" }
-smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.16.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 vec1 = { version = "1.12.1", features = ["serde"] }
 
 [dev-dependencies]

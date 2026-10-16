@@ -6,7 +6,6 @@
  */
 
 mod dummy;
-mod errors;
 #[cfg(fbcode_build)]
 mod facebook;
 
@@ -14,7 +13,6 @@ use anyhow::Error;
 use bytes::Bytes;
 use context::CoreContext;
 pub use dummy::DummyCasClient;
-pub use errors::ErrorKind;
 #[cfg(fbcode_build)]
 pub use facebook::casd_client::RemoteExecutionCasdClient;
 use fbinit::FacebookInit;
@@ -41,6 +39,8 @@ pub trait CasClient: Sync + Send {
         &self,
         digests: &'a [MononokeDigest],
     ) -> Result<Vec<MononokeDigest>, Error>;
+    /// Delete given digests from a Cas backend. Digests that are not present are not an error.
+    async fn delete_blobs(&self, digests: &[MononokeDigest]) -> Result<(), Error>;
     /// Get the name of the repo this client is for.
     fn repo_name(&self) -> &str;
 }

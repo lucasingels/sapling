@@ -49,6 +49,9 @@ use bonsai_globalrev_mapping::SqlBonsaiGlobalrevMappingBuilder;
 use bonsai_hg_mapping::ArcBonsaiHgMapping;
 use bonsai_hg_mapping::CachingBonsaiHgMapping;
 use bonsai_hg_mapping::SqlBonsaiHgMappingBuilder;
+use bonsai_p4_mapping::ArcBonsaiP4Mapping;
+use bonsai_p4_mapping::CachingBonsaiP4Mapping;
+use bonsai_p4_mapping::SqlBonsaiP4MappingBuilder;
 use bonsai_svnrev_mapping::ArcBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::CachingBonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::SqlBonsaiSvnrevMappingBuilder;
@@ -757,6 +760,9 @@ pub enum RepoFactoryError {
     #[error("Error opening bonsai-globalrev mapping")]
     BonsaiGlobalrevMapping,
 
+    #[error("Error opening bonsai-p4 mapping")]
+    BonsaiP4Mapping,
+
     #[error("Error opening bonsai-svnrev mapping")]
     BonsaiSvnrevMapping,
 
@@ -924,7 +930,12 @@ impl RepoFactory {
             sql_phases_builder.enable_caching(cache_handler_factory);
         }
         let heads_fetcher = bookmark_heads_fetcher(bookmarks.clone());
-        Ok(sql_phases_builder.build(repo_identity.id(), commit_graph.clone(), heads_fetcher))
+        Ok(sql_phases_builder.build(
+            repo_identity.id(),
+            commit_graph.clone(),
+            heads_fetcher,
+            self.env.rendezvous_options,
+        ))
     }
 
     pub async fn bonsai_hg_mapping(
@@ -1003,6 +1014,26 @@ impl RepoFactory {
             )))
         } else {
             Ok(Arc::new(bonsai_globalrev_mapping))
+        }
+    }
+
+    pub async fn bonsai_p4_mapping(
+        &self,
+        repo_config: &ArcRepoConfig,
+        repo_identity: &ArcRepoIdentity,
+    ) -> Result<ArcBonsaiP4Mapping> {
+        let bonsai_p4_mapping = self
+            .open_sql::<SqlBonsaiP4MappingBuilder>(repo_config)
+            .await
+            .context(RepoFactoryError::BonsaiP4Mapping)?
+            .build(repo_identity.id());
+        if let Some(cache_handler_factory) = self.cache_handler_factory("bonsai_p4_mapping")? {
+            Ok(Arc::new(CachingBonsaiP4Mapping::new(
+                Arc::new(bonsai_p4_mapping),
+                cache_handler_factory,
+            )))
+        } else {
+            Ok(Arc::new(bonsai_p4_mapping))
         }
     }
 
@@ -2146,7 +2177,12 @@ impl RepoFactory {
             .open_sql_shardable::<SqlCommitDerivedDataMapping>(repo_config)
             .await
             .context(RepoFactoryError::CommitDerivedDataMapping)?;
-        Ok(Arc::new(CommitDerivedDataMapping { sql }))
+        let mapping = CommitDerivedDataMapping::new(sql);
+        let mapping = match self.cache_handler_factory("commit_derived_data_mapping")? {
+            Some(factory) => mapping.with_caching(factory),
+            None => mapping,
+        };
+        Ok(Arc::new(mapping))
     }
 
     pub async fn repo_event_publisher(

@@ -146,7 +146,11 @@ export default class ServerToClientAPI {
 
     repo.fetchAndSetRecommendedBookmarks(async bookmarks => {
       await this.connection.readySignal?.promise;
-      this.postMessage({type: 'fetchedRecommendedBookmarks', bookmarks});
+      this.postMessage({
+        type: 'fetchedRecommendedBookmarks',
+        repoRoot: repo.info.repoRoot,
+        bookmarks,
+      });
     });
 
     repo.pullFetchedDiffs().catch((err: unknown) => {
@@ -313,7 +317,7 @@ export default class ServerToClientAPI {
           info: {
             platformName: this.platform.platformName,
             version: this.connection.version,
-            logFilePath: this.connection.logFileLocation ?? '(no log file, logging to stdout)',
+            logFilePath: this.connection.logFileLocation,
             isBasecamp: this.platform.isBasecamp ?? false,
           },
         });
@@ -660,7 +664,11 @@ export default class ServerToClientAPI {
       case 'refresh': {
         logger?.log('refresh requested');
         repo.fetchAndSetRecommendedBookmarks(bookmarks => {
-          this.postMessage({type: 'fetchedRecommendedBookmarks', bookmarks});
+          this.postMessage({
+            type: 'fetchedRecommendedBookmarks',
+            repoRoot: repo.info.repoRoot,
+            bookmarks,
+          });
         });
         repo.pullFetchedDiffs().catch((err: unknown) => {
           this.logger.error('error pulling authored diff commit hashes:', err);
@@ -877,8 +885,8 @@ export default class ServerToClientAPI {
         // would leave the server with nothing recorded to refetch after a submit.
         repo.codeReviewProvider?.triggerDiffSummariesFetch(
           data.diffIds ?? repo.getAllDiffIds(),
-          /* force */ false,
-          /* partial */ data.partial === true,
+          data.force === true,
+          data.partial === true,
         );
         break;
       }
@@ -1039,19 +1047,33 @@ export default class ServerToClientAPI {
         break;
       }
       case 'fetchFeatureFlag': {
-        Internal.fetchFeatureFlag?.(repo.initialConnectionContext, data.name).then(
-          (passes: boolean) => {
+        Promise.resolve(Internal.fetchFeatureFlag?.(repo.initialConnectionContext, data.name)).then(
+          passes => {
             this.logger.info(`feature flag ${data.name} ${passes ? 'PASSES' : 'FAILS'}`);
-            this.postMessage({type: 'fetchedFeatureFlag', name: data.name, passes});
+            this.postMessage({
+              type: 'fetchedFeatureFlag',
+              name: data.name,
+              passes: passes ?? false,
+            });
+          },
+          err => {
+            this.logger.error(`failed to fetch feature flag ${data.name}: `, err);
+            this.postMessage({type: 'fetchedFeatureFlag', name: data.name, passes: false});
           },
         );
         break;
       }
       case 'bulkFetchFeatureFlags': {
-        Internal.bulkFetchFeatureFlags?.(repo.initialConnectionContext, data.names).then(
-          (result: Record<string, boolean>) => {
+        Promise.resolve(
+          Internal.bulkFetchFeatureFlags?.(repo.initialConnectionContext, data.names),
+        ).then(
+          result => {
             this.logger.info(`feature flags ${JSON.stringify(result, null, 2)}`);
-            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result});
+            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result: result ?? {}});
+          },
+          err => {
+            this.logger.error('failed to bulk fetch feature flags: ', err);
+            this.postMessage({type: 'bulkFetchedFeatureFlags', id: data.id, result: {}});
           },
         );
         break;

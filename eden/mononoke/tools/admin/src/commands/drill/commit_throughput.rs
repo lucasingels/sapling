@@ -6,12 +6,15 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
@@ -34,6 +37,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
 use hook_manager::manager::HookManagerRef;
+use manifest::Entry;
 use manifest::ManifestOps;
 use manifest::PathOrPrefix;
 #[cfg(fbcode_build)]
@@ -43,11 +47,14 @@ use metaconfig_types::PushrebaseRemoteMode;
 #[cfg(fbcode_build)]
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangesetMut;
+use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
+use mononoke_types::FileType;
 use mononoke_types::GitLfs;
 use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
+use pushrebase_client::BatchedPushrebaseClient;
 // land_service is FB-internal only; keep it out of OSS builds.
 #[cfg(fbcode_build)]
 use pushrebase_client::LandServicePushrebaseClient;
@@ -57,9 +64,9 @@ use repo_authorization::AuthorizationContext;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
 use restricted_paths::RestrictedPathsRef;
-use sha2::Digest;
-use sha2::Sha256;
 use skeleton_manifest::RootSkeletonManifestId;
+use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use super::Repo;
 
@@ -67,9 +74,10 @@ use super::Repo;
 enum LandBackend {
     LandService,
     Local,
+    LocalBatched,
 }
 
-/// Land many file-disjoint stacks in parallel onto a single test bookmark and measure commit throughput
+/// Land file-disjoint stacks onto mononoke_commit_throughput_test and measure commit throughput
 #[derive(Parser)]
 pub struct CommitThroughputArgs {
     /// Number of stacks to land.
@@ -84,13 +92,14 @@ pub struct CommitThroughputArgs {
     #[clap(long, default_value_t = 1000)]
     max_scan: usize,
 
-    /// Target bookmark.
-    #[clap(long, default_value = "mononoke_commit_throughput_test")]
-    bookmark: String,
-
     /// Bookmark whose history is replayed.
     #[clap(long, default_value = "master")]
     source_bookmark: String,
+
+    /// Only replay commits whose changed paths all match one of these prefixes.
+    /// Repeat to allow multiple prefixes; unset allows any path.
+    #[clap(long, value_parser = |s: &str| NonRootMPath::new(s.as_bytes()))]
+    path_prefix: Vec<NonRootMPath>,
 
     /// Commit author.
     #[clap(
@@ -103,7 +112,7 @@ pub struct CommitThroughputArgs {
     #[clap(long, default_value_t = 0)]
     concurrency: usize,
 
-    /// Where the land happens: the prod land_service, or in-process pushrebase.
+    /// Where the land happens: land_service, local pushrebase, or local batching.
     #[clap(long, value_enum, default_value_t = LandBackend::LandService)]
     land_backend: LandBackend,
 
@@ -134,8 +143,8 @@ pub async fn commit_throughput(
     repo: &Repo,
     args: CommitThroughputArgs,
 ) -> Result<()> {
-    let bookmark = BookmarkKey::new(&args.bookmark)?;
-    if args.bookmark == args.source_bookmark {
+    let bookmark = BookmarkKey::new("mononoke_commit_throughput_test")?;
+    if bookmark.as_str() == args.source_bookmark {
         bail!("refusing to land onto {bookmark}, the bookmark being replayed");
     }
 
@@ -165,6 +174,7 @@ pub async fn commit_throughput(
     }
     let nodes: Vec<_> = walked.into_iter().rev().collect();
 
+    let path_prefixes = &args.path_prefix;
     let changes: HashMap<_, (Vec<_>, Vec<_>, DateTime)> = stream::iter(nodes.iter().copied())
         .map(|cs_id| async move {
             let bonsai = cs_id.load(ctx, repo.repo_blobstore()).await?;
@@ -172,6 +182,11 @@ pub async fn commit_throughput(
             let mut files = Vec::new();
             let mut deletions = Vec::new();
             for (path, change) in bonsai.file_changes() {
+                if !path_prefixes.is_empty()
+                    && !path_prefixes.iter().any(|prefix| prefix.is_prefix_of(path))
+                {
+                    return anyhow::Ok(None);
+                }
                 changed.push(path.clone());
                 let Some(basic) = change.simplify() else {
                     deletions.push(path.clone());
@@ -198,43 +213,20 @@ pub async fn commit_throughput(
         .try_collect()
         .await?;
 
-    let mut owner: HashMap<NonRootMPath, usize> = HashMap::new();
-    let mut stacks: Vec<Vec<_>> = Vec::new();
-    for cs_id in &nodes {
-        let Some((files, deletions, _)) = changes.get(cs_id) else {
-            continue;
-        };
+    let stacks = group_disjoint_stacks(nodes.iter().filter_map(|cs_id| {
+        let (files, deletions, _) = changes.get(cs_id)?;
         if files.is_empty() {
-            continue;
+            return None;
         }
-        let paths: Vec<NonRootMPath> = files
-            .iter()
-            .map(|(path, ..)| path.clone())
-            .chain(deletions.iter().cloned())
-            .collect();
-
-        let overlapping: HashSet<usize> = paths
-            .iter()
-            .filter_map(|path| owner.get(path).copied())
-            .collect();
-        let mut overlapping = overlapping.into_iter();
-        let target = match (overlapping.next(), overlapping.next()) {
-            (None, _) => {
-                stacks.push(Vec::new());
-                Some(stacks.len() - 1)
-            }
-            (Some(stack), None) => Some(stack),
-            _ => None,
-        };
-        let Some(target) = target else {
-            continue;
-        };
-
-        stacks[target].push(*cs_id);
-        for path in paths {
-            owner.insert(path, target);
-        }
-    }
+        Some((
+            *cs_id,
+            files
+                .iter()
+                .map(|(path, ..)| path.clone())
+                .chain(deletions.iter().cloned())
+                .collect(),
+        ))
+    }));
 
     let mut shaped: Vec<Vec<_>> = Vec::new();
     let mut current: Vec<_> = Vec::new();
@@ -303,94 +295,142 @@ pub async fn commit_throughput(
         .derive::<RootSkeletonManifestId>(ctx, base, DerivationPriority::LOW)
         .await?
         .into_skeleton_manifest_id();
-    let present_at_base: HashSet<MPath> = base_skeleton
+    let base_files: HashSet<MPath> = base_skeleton
         .find_entries(
             ctx.clone(),
             repo.repo_blobstore().clone(),
             shaped
                 .iter()
                 .flatten()
-                .flat_map(|cs_id| changes[cs_id].1.iter())
-                .map(|path| PathOrPrefix::Path(path.clone().into()))
+                .flat_map(|cs_id| {
+                    let (files, deletions, _) = &changes[cs_id];
+                    files.iter().map(|(path, ..)| path).chain(deletions)
+                })
+                .flat_map(|path| path.clone().into_non_root_ancestors())
+                .map(MPath::from)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .map(PathOrPrefix::Path)
                 .collect::<Vec<_>>(),
         )
-        .map_ok(|(path, _)| path)
+        .try_filter_map(async |(path, entry)| Ok(matches!(entry, Entry::Leaf(_)).then_some(path)))
         .try_collect()
         .await?;
 
-    let mut built: Vec<Vec<_>> = Vec::new();
-    let mut all = Vec::new();
-    for stack in &shaped {
-        let mut parents = vec![base];
-        let mut changesets = Vec::new();
-        let mut live: HashSet<NonRootMPath> = stack
-            .iter()
-            .flat_map(|cs_id| changes[cs_id].1.iter())
-            .filter(|path| present_at_base.contains(&MPath::from((*path).clone())))
-            .cloned()
-            .collect();
-        for cs_id in stack {
-            let (files, deletions, author_date) = &changes[cs_id];
-            let mut file_changes: Vec<_> = stream::iter(files.iter())
-                .map(|(path, content_id, file_type, size)| async move {
-                    let data = filestore::fetch_concat_exact(
-                        repo.repo_blobstore(),
-                        ctx,
-                        *content_id,
-                        *size,
-                    )
-                    .await?;
-                    let digest = hex::encode(Sha256::digest(&data));
-                    let nonced = Bytes::from(
-                        [&data[..], format!("\n# drill-nonce {digest}\n").as_bytes()].concat(),
-                    );
-                    let len = nonced.len() as u64;
-                    let stored = filestore::store(
-                        repo.repo_blobstore(),
-                        *repo.filestore_config(),
-                        ctx,
-                        &StoreRequest::new(len),
-                        stream::once(async move { Ok(nonced) }),
-                    )
-                    .await?;
-                    anyhow::Ok((
-                        path.clone(),
-                        FileChange::tracked(
-                            stored.content_id,
-                            *file_type,
-                            len,
-                            None,
-                            GitLfs::FullContent,
-                        ),
-                    ))
+    let run_id = Uuid::new_v4();
+    println!("Run ID: {run_id}");
+    let preparation = Instant::now();
+    let file_operations = Semaphore::new(64);
+    let built: Vec<Vec<_>> = stream::iter(shaped.iter().enumerate())
+        .map(async |(index, stack)| {
+            let mut parents = vec![base];
+            let mut changesets = Vec::new();
+            let mut live: BTreeSet<NonRootMPath> = stack
+                .iter()
+                .flat_map(|cs_id| {
+                    let (files, deletions, _) = &changes[cs_id];
+                    files.iter().map(|(path, ..)| path).chain(deletions)
                 })
-                .buffer_unordered(64)
-                .try_collect()
-                .await?;
-            for (path, _) in &file_changes {
-                live.insert(path.clone());
-            }
-            for path in deletions {
-                if live.remove(path) {
-                    file_changes.push((path.clone(), FileChange::Deletion));
+                .flat_map(|path| path.clone().into_non_root_ancestors())
+                .filter(|path| base_files.contains(path.as_mpath()))
+                .collect();
+            for cs_id in stack {
+                let (files, deletions, author_date) = &changes[cs_id];
+                let deletions: Vec<_> = deletions
+                    .iter()
+                    .filter(|path| live.remove(*path))
+                    .cloned()
+                    .collect();
+                for (path, ..) in files {
+                    if let Some(prefix) = path
+                        .clone()
+                        .into_non_root_ancestors()
+                        .skip(1)
+                        .find(|prefix| live.contains(prefix))
+                    {
+                        bail!(
+                            "cannot replay {cs_id}: creating {path} requires deleting the file at {prefix}"
+                        );
+                    }
+                    // A file replacing a directory implicitly deletes its descendants.
+                    let replaced: Vec<_> = live
+                        .range(path.clone()..)
+                        .take_while(|other| path.is_prefix_of(*other))
+                        .cloned()
+                        .collect();
+                    for other in replaced {
+                        live.remove(&other);
+                    }
+                    live.insert(path.clone());
                 }
+                let file_changes: Vec<_> = stream::iter(files.iter())
+                    .map(async |(path, content_id, file_type, size)| {
+                        if *file_type == FileType::GitSubmodule {
+                            bail!(
+                                "cannot replay {cs_id}: Git submodule at {path} cannot carry a drill nonce"
+                            );
+                        }
+                        let _permit = file_operations.acquire().await?;
+                        let data = filestore::fetch_concat_exact(
+                            repo.repo_blobstore(),
+                            ctx,
+                            *content_id,
+                            *size,
+                        )
+                        .await?;
+                        let nonced = Bytes::from(
+                            [&data[..], format!("\n# drill-nonce {run_id}\n").as_bytes()].concat(),
+                        );
+                        let len = nonced.len() as u64;
+                        let stored = filestore::store(
+                            repo.repo_blobstore(),
+                            *repo.filestore_config(),
+                            ctx,
+                            &StoreRequest::new(len),
+                            stream::once(async move { Ok(nonced) }),
+                        )
+                        .await?;
+                        anyhow::Ok((
+                            path.clone(),
+                            FileChange::tracked(
+                                stored.content_id,
+                                *file_type,
+                                len,
+                                None,
+                                GitLfs::FullContent,
+                            ),
+                        ))
+                    })
+                    .buffer_unordered(64)
+                    .try_collect()
+                    .await?;
+                let changeset = BonsaiChangesetMut {
+                    parents: parents.clone(),
+                    author: args.author.clone(),
+                    author_date: *author_date,
+                    message: format!("[drill] synthetic replay of {cs_id}"),
+                    file_changes: file_changes
+                        .into_iter()
+                        .chain(deletions.into_iter().map(|path| (path, FileChange::Deletion)))
+                        .collect(),
+                    ..Default::default()
+                }
+                .freeze()?;
+                parents = vec![changeset.get_changeset_id()];
+                changesets.push(changeset);
             }
-
-            let changeset = BonsaiChangesetMut {
-                parents: parents.clone(),
-                author: args.author.clone(),
-                author_date: *author_date,
-                message: format!("[drill] synthetic replay of {cs_id}"),
-                file_changes: file_changes.into_iter().collect(),
-                ..Default::default()
-            }
-            .freeze()?;
-            parents = vec![changeset.get_changeset_id()];
-            changesets.push(changeset);
-        }
-        all.extend(changesets.iter().cloned());
-        built.push(changesets);
-    }
+            println!(
+                "Prepared stack {}/{} ({} commit(s)) at +{:.3}s.",
+                index + 1,
+                shaped.len(),
+                changesets.len(),
+                preparation.elapsed().as_secs_f64(),
+            );
+            anyhow::Ok(changesets)
+        })
+        .buffered(20)
+        .try_collect()
+        .await?;
     if built.len() != args.stacks || built.iter().any(|stack| stack.len() != args.stack_size) {
         bail!(
             "built {} stacks with sizes {:?}, expected exactly {} x {}",
@@ -400,7 +440,9 @@ pub async fn commit_throughput(
             args.stack_size
         );
     }
+    let all: Vec<_> = built.iter().flatten().cloned().collect();
     let commits = all.len();
+    println!("Saving {commits} commits...");
     save_changesets(ctx, repo, all).await?;
     println!(
         "Built {} stacks / {commits} commits on base {}.",
@@ -421,8 +463,7 @@ pub async fn commit_throughput(
         #[cfg(fbcode_build)]
         LandBackend::LandService => match &args.land_service_host_port {
             Some(host_port) => Box::new(
-                LandServicePushrebaseClient::from_host_port(ctx, host_port.clone(), &authz, repo)
-                    .await?,
+                LandServicePushrebaseClient::from_host_port(ctx, host_port.clone(), repo).await?,
             ),
             None => {
                 let (PushrebaseRemoteMode::RemoteLandService(address)
@@ -433,17 +474,11 @@ pub async fn commit_throughput(
                 };
                 match address {
                     Address::Tier(tier) => Box::new(
-                        LandServicePushrebaseClient::from_tier(ctx, tier.clone(), &authz, repo)
-                            .await?,
+                        LandServicePushrebaseClient::from_tier(ctx, tier.clone(), repo).await?,
                     ),
                     Address::HostPort(host_port) => Box::new(
-                        LandServicePushrebaseClient::from_host_port(
-                            ctx,
-                            host_port.clone(),
-                            &authz,
-                            repo,
-                        )
-                        .await?,
+                        LandServicePushrebaseClient::from_host_port(ctx, host_port.clone(), repo)
+                            .await?,
                     ),
                 }
             }
@@ -453,15 +488,21 @@ pub async fn commit_throughput(
             bail!("the land_service backend is only available in fbcode builds")
         }
         LandBackend::Local => Box::new(LocalPushrebaseClient {
-            ctx,
-            authz: &authz,
             repo,
             hook_manager: repo.hook_manager(),
         }),
+        LandBackend::LocalBatched => {
+            let repo = Arc::new(repo.clone());
+            Box::new(BatchedPushrebaseClient::new(
+                ctx.clone_and_reset(),
+                move || Some(repo.clone()),
+            ))
+        }
     };
 
     println!("Landing {} stacks in parallel...", built.len());
     let wall = Instant::now();
+    let authz = &authz;
     let in_flight = match args.concurrency {
         0 => built.len(),
         limit => limit,
@@ -473,6 +514,8 @@ pub async fn commit_throughput(
             let submitted_at_secs = wall.elapsed().as_secs_f64();
             let outcome = client
                 .pushrebase(
+                    ctx,
+                    authz,
                     bookmark,
                     changesets,
                     None,
@@ -517,10 +560,19 @@ pub async fn commit_throughput(
         commits as f64 / wall,
     );
     for error in results.iter().filter_map(|result| result.as_ref().err()) {
-        println!("  stack land failed: {error:?}");
+        eprintln!("  stack land failed: {error:?}");
     }
+    let result = if landed.len() == built.len() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}/{} stacks failed to land",
+            built.len() - landed.len(),
+            built.len()
+        ))
+    };
     if landed.is_empty() {
-        return Ok(());
+        return result;
     }
 
     let mut submits: Vec<f64> = landed.iter().map(|land| land.submitted_at_secs).collect();
@@ -568,5 +620,91 @@ pub async fn commit_throughput(
         retries[retries.len() / 2],
         retries[retries.len() - 1],
     );
-    Ok(())
+    result
+}
+
+fn group_disjoint_stacks(
+    changesets: impl IntoIterator<Item = (ChangesetId, Vec<NonRootMPath>)>,
+) -> Vec<Vec<ChangesetId>> {
+    let mut owner: BTreeMap<NonRootMPath, usize> = BTreeMap::new();
+    let mut stacks: Vec<Vec<ChangesetId>> = Vec::new();
+    for (cs_id, paths) in changesets {
+        let overlapping: HashSet<usize> = paths
+            .iter()
+            .flat_map(|path| {
+                path.clone()
+                    .into_non_root_ancestors()
+                    .filter_map(|ancestor| owner.get(&ancestor))
+                    .chain(
+                        owner
+                            .range(path.clone()..)
+                            .take_while(move |(other, _)| path.is_prefix_of(*other))
+                            .map(|(_, stack)| stack),
+                    )
+                    .copied()
+            })
+            .collect();
+        let mut overlapping = overlapping.into_iter();
+        let target = match (overlapping.next(), overlapping.next()) {
+            (None, _) => {
+                stacks.push(Vec::new());
+                stacks.len() - 1
+            }
+            (Some(stack), None) => stack,
+            _ => continue,
+        };
+        stacks[target].push(cs_id);
+        for path in paths {
+            owner.insert(path, target);
+        }
+    }
+    stacks
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[mononoke::test]
+    fn group_stacks_by_path_prefix() -> Result<()> {
+        let paths = [
+            vec!["a/b"],
+            vec!["a/b/c"],
+            vec!["a"],
+            vec!["ab"],
+            vec!["other/x"],
+            vec!["other/y"],
+            vec!["other"],
+            vec!["a/b", "ab"],
+        ];
+        let commits: Vec<_> = (0..paths.len())
+            .map(|i| ChangesetId::from_bytes([i as u8; 32]))
+            .collect::<Result<_, _>>()?;
+        let changesets = commits
+            .iter()
+            .copied()
+            .zip(paths)
+            .map(|(id, paths)| {
+                Ok((
+                    id,
+                    paths
+                        .into_iter()
+                        .map(NonRootMPath::new)
+                        .collect::<Result<_, _>>()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            group_disjoint_stacks(changesets),
+            vec![
+                vec![commits[0], commits[1], commits[2]],
+                vec![commits[3]],
+                vec![commits[4]],
+                vec![commits[5]],
+            ],
+        );
+        Ok(())
+    }
 }

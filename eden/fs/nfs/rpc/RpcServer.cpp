@@ -13,6 +13,7 @@
 #include <folly/futures/Future.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/portability/Sockets.h>
 
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/nfs/rpc/Rpc.h"
@@ -37,18 +38,18 @@ FsChannelInfo RpcStopData::extractTakeoverInfo() {
 }
 
 void RpcConnectionHandler::getReadBuffer(void** bufP, size_t* lenP) {
-  // TODO(xavierd): Should maxSize be configured to be at least the
-  // configured NFS iosize?
-  constexpr size_t maxSize = 64 * 1024;
+  // TODO(xavierd): Should kDefaultReadBufferAllocationSize be configured to be
+  // at least the configured NFS iosize?
   constexpr size_t minReadSize = 4 * 1024;
 
-  // We want to issue a recv(2) of at least minReadSize, and bound it to
-  // the available writable size of the readBuf_ to minimize allocation
-  // cost. This guarantees reading large buffers, and minimize the number
-  // of calls to tryConsumeReadBuffer.
+  // We want to issue a recv(2) of at least minReadSize, and to reuse whatever
+  // the readBuf_ already has room for before allocating again, to minimize
+  // allocation cost. This guarantees reading large buffers, and minimize the
+  // number of calls to tryConsumeReadBuffer.
   auto minSize = std::max(readBuf_.tailroom(), minReadSize);
 
-  auto [buf, len] = readBuf_.preallocate(minSize, maxSize);
+  auto [buf, len] =
+      readBuf_.preallocate(minSize, kDefaultReadBufferAllocationSize);
   *lenP = len;
   *bufP = buf;
 }
@@ -526,15 +527,40 @@ class RequestWriteCallback : public folly::AsyncWriter::WriteCallback {
 };
 } // namespace
 
+void RpcConnectionHandler::writeReply(folly::Try<ReplyResult> result) {
+  if (result.hasException()) {
+    XLOGF(
+        DFATAL,
+        "Unexpected exception in RPC response pipeline: {}",
+        folly::exceptionStr(result.exception()));
+    return;
+  }
+  auto [resultBuffer, tl] = std::move(result).value();
+  XLOG(DBG7, "About to write to the socket.");
+  auto* writeCb =
+      new RequestWriteCallback(std::move(tl), this, DestructorGuard(this));
+  sock_->writeChain(writeCb, std::move(resultBuffer));
+}
+
+void RpcConnectionHandler::finishRequest() {
+  XLOG(DBG7, "Request complete");
+  auto& state = state_.get();
+  state.pendingRequests -= 1;
+  XLOGF(DBG7, "{} more requests to process", state.pendingRequests);
+  if (state.pendingRequests == 0 && state.stopReason.has_value()) {
+    // We are shutting down and the last request has been handled, so signal
+    // that all pending requests have completed.
+    pendingRequestsComplete_.setValue();
+  }
+}
+
 void RpcConnectionHandler::dispatchAndReply(
     std::unique_ptr<folly::IOBuf> input,
     DestructorGuard guard,
     std::unique_ptr<RequestPermit> permit,
     RpcRequestTimeline timeline) {
-  makeImmediateFutureWith(
-      [&]() mutable
-          -> ImmediateFuture<
-              std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>> {
+  auto reply =
+      makeImmediateFutureWith([&]() mutable -> ImmediateFuture<ReplyResult> {
         folly::io::Cursor deser(input.get());
         rpc_msg_call call = XdrTrait<rpc_msg_call>::deserialize(deser);
         timeline.procNumber = call.cbody.proc;
@@ -586,11 +612,8 @@ void RpcConnectionHandler::dispatchAndReply(
              input = std::move(input),
              iobufQueue = std::move(iobufQueue),
              call = std::move(call),
-             timeline =
-                 std::move(timeline)](folly::Try<folly::Unit> result) mutable
-                -> std::pair<
-                    std::unique_ptr<folly::IOBuf>,
-                    RpcRequestTimeline> {
+             timeline = std::move(timeline)](
+                folly::Try<folly::Unit> result) mutable -> ReplyResult {
               XLOG(DBG7, "Request done, sending response.");
               if (result.hasException()) {
                 if (auto* err =
@@ -615,50 +638,48 @@ void RpcConnectionHandler::dispatchAndReply(
               return {
                   finalizeFragment(std::move(iobufQueue)), std::move(timeline)};
             });
-      })
+      });
+
+  // Most requests complete inline, on this worker thread. Their reply only
+  // needs the hop to the EventBase that owns the socket; re-queueing them on
+  // the thread pool first, as the deferred path does, woke another worker for
+  // nothing. The permit is released when the request has been accounted for.
+  if (reply.isReady()) {
+    sock_->getEventBase()->runInEventBaseThread(
+        [this,
+         result = std::move(reply).getTry(),
+         guard = std::move(guard),
+         permit = std::move(permit)]() mutable {
+          // The request is accounted for even when the reply cannot be
+          // written, as the deferred path's ensure() guarantees; otherwise
+          // the pending count never reaches zero and shutdown waits forever.
+          try {
+            writeReply(std::move(result));
+          } catch (...) {
+            XLOGF(
+                WARN,
+                "failed to write an NFS reply: {}",
+                folly::exceptionStr(std::current_exception()));
+          }
+          finishRequest();
+        });
+    return;
+  }
+
+  std::move(reply)
       .semi()
-      // Make sure that all the computation occurs on the threadPool.
-      // TODO(xavierd): In the case where the ImmediateFuture is ready adding
-      // it to the thread pool is inefficient. In the case where this shows up
-      // in profiling, this can be slightly optimized by simply pushing the
-      // value to the EventBase directly.
+      // A deferred request is fulfilled on some other thread, such as a
+      // backing store importer; finish serializing its reply on the thread
+      // pool rather than there.
       .via(threadPool_.get())
       // Then move it back to the EventBase to write the result to the socket.
       .via(this->sock_->getEventBase())
-      .then(
-          [this](
-              folly::Try<
-                  std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>>
-                  result) {
-            // This code runs in the EventBase and thus must be as fast as
-            // possible to avoid unnecessary overhead in the EventBase. Always
-            // prefer duplicating work in the future above to adding code here.
-
-            if (result.hasException()) {
-              XLOGF(
-                  DFATAL,
-                  "Unexpected exception in RPC response pipeline: {}",
-                  folly::exceptionStr(result.exception()));
-            } else {
-              auto [resultBuffer, tl] = std::move(result).value();
-              XLOG(DBG7, "About to write to the socket.");
-              auto* writeCb = new RequestWriteCallback(
-                  std::move(tl), this, DestructorGuard(this));
-              sock_->writeChain(writeCb, std::move(resultBuffer));
-            }
-          })
+      .then([this](folly::Try<ReplyResult> result) {
+        writeReply(std::move(result));
+      })
       .ensure([this, guard = std::move(guard), permit = std::move(permit)]() {
         (void)permit; // held for RAII lifetime, released when request completes
-        XLOG(DBG7, "Request complete");
-        auto& state = this->state_.get();
-        state.pendingRequests -= 1;
-        XLOGF(DBG7, "{} more requests to process", state.pendingRequests);
-        if (state.pendingRequests == 0 && state.stopReason.has_value()) {
-          // We are shutting down and the last request has been
-          // handled, so signal that all pending requests have
-          // completed.
-          pendingRequestsComplete_.setValue();
-        }
+        finishRequest();
       });
 }
 
@@ -673,6 +694,7 @@ void RpcServer::connectionAccepted(
     AcceptInfo /* info */) noexcept {
   XLOGF(DBG7, "Accepted connection from: {}", clientAddr.describe());
   auto socket = AsyncSocket::newSocket(evb_, fd);
+  configureSocket(*socket);
   auto& state = state_.get();
 
   // EOF on any connection with a handler stops the server (see readEOF), so
@@ -754,7 +776,8 @@ std::shared_ptr<RpcServer> RpcServer::create(
     std::shared_ptr<folly::Executor> threadPool,
     const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     size_t maximumInFlightRequests,
-    std::chrono::nanoseconds highNfsRequestsLogInterval) {
+    std::chrono::nanoseconds highNfsRequestsLogInterval,
+    size_t socketBufferSize) {
   return std::shared_ptr<RpcServer>{
       new RpcServer{
           std::move(proc),
@@ -762,7 +785,8 @@ std::shared_ptr<RpcServer> RpcServer::create(
           std::move(threadPool),
           edenFsEventsLogger,
           maximumInFlightRequests,
-          highNfsRequestsLogInterval},
+          highNfsRequestsLogInterval,
+          socketBufferSize},
       [](RpcServer* p) { p->destroy(); }};
 }
 
@@ -772,7 +796,8 @@ RpcServer::RpcServer(
     std::shared_ptr<folly::Executor> threadPool,
     const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
     size_t maximumInFlightRequests,
-    std::chrono::nanoseconds highNfsRequestsLogInterval)
+    std::chrono::nanoseconds highNfsRequestsLogInterval,
+    size_t socketBufferSize)
     : evb_(evb),
       threadPool_(threadPool),
       edenFsEventsLogger_(edenFsEventsLogger),
@@ -780,7 +805,37 @@ RpcServer::RpcServer(
       proc_(std::move(proc)),
       state_{evb},
       maximumInFlightRequests_{maximumInFlightRequests},
-      highNfsRequestsLogInterval_{highNfsRequestsLogInterval} {}
+      highNfsRequestsLogInterval_{highNfsRequestsLogInterval},
+      socketBufferSize_{socketBufferSize} {}
+
+void RpcServer::configureSocket(folly::AsyncSocket& socket) {
+  if (socketBufferSize_ == 0) {
+    return;
+  }
+  // TCP sockets keep the kernel's buffers: they start out large enough, and
+  // on Linux an explicit size turns off the kernel's autotuning of them.
+  folly::SocketAddress address;
+  try {
+    socket.getLocalAddress(&address);
+  } catch (const std::exception& ex) {
+    XLOGF(WARN, "could not get the RPC socket's address: {}", ex.what());
+    return;
+  }
+  if (address.getFamily() != AF_UNIX) {
+    return;
+  }
+  int err = socket.setSendBufSize(socketBufferSize_);
+  if (err == 0) {
+    err = socket.setRecvBufSize(socketBufferSize_);
+  }
+  if (err != 0) {
+    XLOGF(
+        WARN,
+        "failed to set the RPC socket buffer size to {}: {}",
+        socketBufferSize_,
+        folly::errnoStr(err));
+  }
+}
 
 void RpcServer::destroy() {
   evb_->runInEventBaseThread([this] { delete this; });
@@ -803,12 +858,14 @@ void RpcServer::initializeConnectedSocket(folly::File socket) {
   // meant for server that only ever has one connected socket (nfsd3). Since
   // we already have the one connected socket, we will not need the
   // accepting socket to make any more connections.
+  auto asyncSocket = AsyncSocket::newSocket(
+      evb_, folly::NetworkSocket::fromFd(socket.release()));
+  configureSocket(*asyncSocket);
   auto& state = state_.get();
   state.connectionHandlers.push_back(
       RpcConnectionHandler::create(
           proc_,
-          AsyncSocket::newSocket(
-              evb_, folly::NetworkSocket::fromFd(socket.release())),
+          std::move(asyncSocket),
           threadPool_,
           edenFsEventsLogger_,
           weak_from_this(),

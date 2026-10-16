@@ -50,6 +50,7 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use repo_update_logger::CommitInfo;
 use repo_update_logger::log_new_commits;
+use restricted_paths::RestrictedPathsArc;
 use scuba_ext::FutureStatsScubaExt;
 use smallvec::SmallVec;
 use sorted_vector_map::SortedVectorMap;
@@ -61,6 +62,7 @@ use crate::file::FileId;
 use crate::file::FileType;
 use crate::path::MononokePathPrefixes;
 use crate::repo::RepoContext;
+use crate::restricted_paths::RestrictedPathsPolicy;
 use crate::specifiers::ChangesetSpecifier;
 
 #[derive(Clone, Debug)]
@@ -343,6 +345,14 @@ impl CreateChangeType {
     }
 }
 
+#[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
+pub(crate) enum StackContentChange {
+    #[default]
+    None,
+    Change(FileId),
+    Deletion,
+}
+
 impl CreateChange {
     pub(crate) async fn resolve<R: MononokeRepo>(
         &mut self,
@@ -498,7 +508,7 @@ pub(crate) async fn lookup_file_types_from_parents<R: MononokeRepo>(
             .collect();
 
         let path_contexts = parent_ctx
-            .paths_with_content(paths_to_query.into_iter())
+            .paths_with_content(paths_to_query.into_iter(), &RestrictedPathsPolicy::Strict)
             .await?;
 
         pin_mut!(path_contexts);
@@ -702,7 +712,7 @@ pub(crate) async fn verify_deleted_files_existed_in_a_parent<R: MononokeRepo>(
 
 pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<&PathTree<Option<FileId>>>,
+    stack_changes: Option<&PathTree<StackContentChange>>,
     path: &NonRootMPath,
     change: &CreateChange,
 ) -> Result<bool, MononokeError> {
@@ -719,9 +729,17 @@ pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
     if let Some(stack_changes) = stack_changes
         && let Some(stack_change) = stack_changes.get(path.as_mpath())
     {
-        if *stack_change == Some(content_id) {
+        if *stack_change == StackContentChange::Change(content_id) {
             return Ok(true);
         }
+    } else if let Some(stack_changes) = stack_changes
+        && stack_changes
+            .get_nearest_parent(path.as_mpath(), |change| {
+                *change != StackContentChange::None
+            })
+            .is_some()
+    {
+        return Ok(false);
     } else {
         let parents = stream::iter(parent_ctxs)
             .map(Ok::<_, MononokeError>)
@@ -758,7 +776,7 @@ pub(crate) async fn is_noop_file_change<R: MononokeRepo>(
 
 pub(crate) async fn verify_no_noop_file_changes<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<PathTree<Option<FileId>>>,
+    stack_changes: Option<PathTree<StackContentChange>>,
     file_changes: &SortedVectorMap<NonRootMPath, CreateChange>,
 ) -> Result<(), MononokeError> {
     stream::iter(file_changes)
@@ -776,7 +794,7 @@ pub(crate) async fn verify_no_noop_file_changes<R: MononokeRepo>(
 
 async fn remove_noop_file_changes<R: MononokeRepo>(
     parent_ctxs: &[ChangesetContext<R>],
-    stack_changes: Option<PathTree<Option<FileId>>>,
+    stack_changes: Option<PathTree<StackContentChange>>,
     file_changes: SortedVectorMap<NonRootMPath, CreateChange>,
 ) -> Result<SortedVectorMap<NonRootMPath, CreateChange>, MononokeError> {
     stream::iter(file_changes)
@@ -1131,6 +1149,8 @@ impl<R: MononokeRepo> RepoContext<R> {
             .require_repo_write(self.ctx(), self.repo(), RepoWriteOperation::CreateChangeset)
             .await?;
 
+        validate_acl_file_changes(self, &stack_parents, &changes_stack).await?;
+
         let allowed_no_parents = self
             .config()
             .source_control_service
@@ -1412,11 +1432,14 @@ impl<R: MononokeRepo> RepoContext<R> {
                     for (path, change) in path_changes.iter() {
                         match change.content_id()? {
                             Some(content_id) => {
-                                stack_changes
-                                    .insert_and_prune(path.clone().into(), Some(content_id));
+                                stack_changes.insert_and_prune(
+                                    path.clone().into(),
+                                    StackContentChange::Change(content_id),
+                                );
                             }
                             None => {
-                                stack_changes.insert(path.clone().into(), None);
+                                stack_changes
+                                    .insert(path.clone().into(), StackContentChange::Deletion);
                             }
                         }
                     }
@@ -1583,4 +1606,48 @@ impl<R: MononokeRepo> RepoContext<R> {
             })
             .collect())
     }
+}
+
+/// Validate `.slacl` file changes for a stack of `CreateChange` maps,
+/// delegating to `RestrictedPaths::validate_acl_file_changes_in_changesets`.
+/// All policy and JustKnob gating live in the chokepoint method.
+async fn validate_acl_file_changes<R: MononokeRepo>(
+    repo_ctx: &RepoContext<R>,
+    stack_parents: &[ChangesetId],
+    changes_stack: &[BTreeMap<MPath, CreateChange>],
+) -> Result<(), MononokeError> {
+    let restricted_paths = repo_ctx.repo().restricted_paths_arc();
+    let repo_name = repo_ctx.repo().repo_identity().name();
+    let acl_file_name = restricted_paths.config().acl_file_name();
+
+    // Build per-changeset list of touched ACL file paths, keeping only
+    // `.slacl` basenames so ordinary paths are never cloned. Root-path
+    // entries can't be `.slacl` (the root has no basename), so dropping
+    // them via `try_from(...).ok()` is safe.
+    let touched_per_changeset: Vec<Vec<NonRootMPath>> = changes_stack
+        .iter()
+        .map(|changes| {
+            changes
+                .keys()
+                .filter(|path| {
+                    path.basename()
+                        .is_some_and(|name| name.as_ref() == acl_file_name.as_bytes())
+                })
+                .filter_map(|path| NonRootMPath::try_from(path.clone()).ok())
+                .collect()
+        })
+        .collect();
+
+    let touched_refs: Vec<&[NonRootMPath]> =
+        touched_per_changeset.iter().map(Vec::as_slice).collect();
+
+    restricted_paths
+        .validate_acl_file_changes_in_changesets(
+            repo_ctx.ctx(),
+            repo_name,
+            stack_parents,
+            &touched_refs,
+        )
+        .await
+        .map_err(MononokeError::from)
 }

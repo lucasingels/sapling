@@ -14,6 +14,8 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace folly {
 class EventBase;
@@ -35,8 +37,6 @@ struct NFSMountOptions {
   folly::SocketAddress mountdAddr;
   folly::SocketAddress nfsdAddr;
   bool readOnly = false;
-  // DEPRECATED: use readIOSize and writeIOSize instead
-  uint32_t iosize{};
   bool useReaddirplus = false;
   bool useSoftMount = false;
   uint32_t readIOSize{};
@@ -100,21 +100,46 @@ inline constexpr folly::StringPiece kEdenFsFirstRestartAtEnv{
 uint64_t readEdenFsRestartCounterEnv(folly::StringPiece name);
 
 /*
+ * How long a crash relaunch waits for the startup below it, and how long it
+ * then gives that startup to exit once it stops waiting.
+ *
+ * A relaunch is best effort, so these are deliberately far shorter than the
+ * restart window the circuit breaker counts over. `kRelaunchStartupTimeout` is
+ * the daemon waiting on the process it spawned and `kSupervisorStartupTimeout`
+ * is the privhelper waiting on that daemon; the static_assert holds the
+ * daemon's wait, plus the budget it spends terminating a hung child, inside
+ * the privhelper's, whose expiry is a SIGKILL that would leave that child
+ * unsupervised.
+ *
+ * The termination budget matches the daemon's own SIGTERM budget:
+ * core:sigterm-shutdown-timeout defaults to 20s, plus slack to finish exiting.
+ */
+inline constexpr std::chrono::seconds kRestartTerminationTimeout{30};
+inline constexpr std::chrono::seconds kRelaunchStartupTimeout{120};
+inline constexpr std::chrono::seconds kSupervisorStartupTimeout{180};
+static_assert(
+    kRelaunchStartupTimeout + kRestartTerminationTimeout <
+    kSupervisorStartupTimeout);
+
+/*
  * Everything the privhelper needs in order to relaunch edenfs after a crash.
  *
  * The privhelper reads no configuration of its own: edenfs delivers the backoff
- * policy here and the command to relaunch with in the sentinel below.
+ * policy and the command to relaunch with here.
  */
 struct EdenFsRestartArgs {
   bool enabled = false;
-  // The daemon's restart sentinel. Its existence is the "still armed" flag:
-  // edenfs removes it when it shuts down on purpose. Its contents are the
-  // relaunch command, as {"argv": [...], "env": {...}, "nonce": N} JSON.
+  // The daemon's restart sentinel: an empty file whose existence is the "still
+  // armed" flag, and whose name carries the pid and a per-arm token that
+  // identify the generation that created it. A clean shutdown removes it.
   std::string sentinelPath;
-  // Identifies the generation that wrote the sentinel. The path is fixed per
-  // state dir, so without this a privhelper that outlives its daemon can read a
-  // sentinel a newer generation has since overwritten.
-  uint64_t sentinelNonce = 0;
+  // The command line to relaunch edenfs with, already stripped of sudo,
+  // `--takeover` and inherited file descriptor arguments.
+  std::vector<std::string> relaunchArgv;
+  // The environment to relaunch with. The privhelper replaces the child's
+  // environment wholesale, so an incomplete one leaves the new daemon without
+  // a PATH, HOME or USER. Applied in order, so a later entry for a key wins.
+  std::vector<std::pair<std::string, std::string>> relaunchEnv;
   // Restarts already performed within the current window. The privhelper exits
   // after restarting, so the count travels to the new daemon through the
   // environment and comes back here from the new daemon.
@@ -246,14 +271,16 @@ class PrivHelper {
    * Start File Access Monitor(FAM).
    *
    * @param paths A list of paths to be monitored by FAM.
-   * @param outputPath The path to the output file.
+   * @param outputFile File opened by the daemon for FAM's stdout.
+   * Output paths are metadata returned when monitoring stops.
    * @return pid of the started FAM process
    */
   [[nodiscard]] virtual folly::Future<pid_t> startFam(
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
       const std::string& specifiedOutputPath,
-      const bool shouldUpload) = 0;
+      const bool shouldUpload,
+      folly::File outputFile) = 0;
 
   /**
    * Stop File Access Monitor(FAM).
@@ -278,6 +305,16 @@ class PrivHelper {
   [[nodiscard]] virtual folly::Future<folly::Unit> setFuseReadAhead(
       folly::StringPiece mountPath,
       uint32_t readAheadKb) = 0;
+
+  /**
+   * Whether NFS mounts served over a Unix domain socket get their filesystem
+   * type overridden to "edenfs:" (macOS only). The privhelper starts with it
+   * on and keeps the last value it was sent, so the daemon sends the current
+   * setting at every start. A privhelper that predates the request rejects
+   * it and keeps the override.
+   */
+  [[nodiscard]] virtual folly::Future<folly::Unit> setNfsFstypeOverride(
+      bool enabled) = 0;
 
   /**
    * setLogFileBlocking() is a wrapper around setLogFile() that blocks until

@@ -167,7 +167,7 @@ function mononoke_cas_sync {
     --repo-name $HG_REPO_NAME \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --tracing-test-format \
-     sync-loop --start-id "$START_ID" --batch-size 20
+     sync-loop --start-id "$START_ID" --batch-size 20 "$@"
 }
 
 
@@ -831,12 +831,28 @@ CREATE TABLE IF NOT EXISTS `repo_manifest_mapping` (
   PRIMARY KEY (`manifest_repo_id`, `manifest_branch`, `repo_name`, `repo_branch`)
 );
 CREATE INDEX IF NOT EXISTS `reverse_idx` ON `repo_manifest_mapping` (`repo_name`, `repo_branch`);
+CREATE TABLE IF NOT EXISTS `manifest_watermark` (
+  `repo_id` INTEGER NOT NULL,
+  `manifest_branch` VARBINARY(255) NOT NULL,
+  `log_id` BIGINT NOT NULL,
+  `last_landed_at` BIGINT NULL,
+  PRIMARY KEY (`repo_id`, `manifest_branch`)
+);
+CREATE INDEX IF NOT EXISTS `read_cursor_idx` ON `manifest_watermark` (`repo_id`, `log_id`);
 EOSQL
   local manifest_branch=${2//"'"/"''"}
   local repo_name=${3//"'"/"''"}
   local repo_branch=${4//"'"/"''"}
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
     "INSERT OR REPLACE INTO repo_manifest_mapping (manifest_repo_id, manifest_branch, repo_name, repo_branch) VALUES ($1, CAST('$manifest_branch' AS BLOB), CAST('$repo_name' AS BLOB), CAST('$repo_branch' AS BLOB))"
+}
+
+function set_manifest_branch_activity {
+  # Stamps a manifest branch's last_landed_at (unix seconds), as the tailer or
+  # the land service would; the branch must already have a mapping entry.
+  local manifest_branch=${2//"'"/"''"}
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
+    "INSERT INTO manifest_watermark (repo_id, manifest_branch, log_id, last_landed_at) VALUES ($1, CAST('$manifest_branch' AS BLOB), 0, $3) ON CONFLICT(repo_id, manifest_branch) DO UPDATE SET last_landed_at = $3"
 }
 
 function multi_repo_land_service {
@@ -996,6 +1012,9 @@ function enable_scmquery_scs_direct {
     "scm/scmquery:client_library_blame_v2_direct": true,
     "scm/scmquery:client_library_get_branches_direct": true,
     "scm/scmquery:client_library_get_metadata_diff_direct": true
+  },
+  "ints": {
+    "scm/scmquery:changed_file_groups_limit": 1000
   }
 }
 EOF

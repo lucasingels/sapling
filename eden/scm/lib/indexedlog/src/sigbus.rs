@@ -5,10 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::c_void;
 use std::mem;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 static mut ORIG_HANDLER: Option<libc::sigaction> = None;
 
@@ -30,7 +33,7 @@ pub fn register_sigbus_handler() {
     crate::page_out::NEED_FIND_REGION.store(true, Ordering::Release);
     let mut new_action: libc::sigaction = unsafe { mem::zeroed() };
     new_action.sa_sigaction = signal_handler as *const () as usize;
-    new_action.sa_flags = libc::SA_SIGINFO;
+    new_action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     tracing::debug!("registering SIGBUS handler");
     unsafe {
         ORIG_HANDLER = Some(mem::zeroed());
@@ -44,7 +47,7 @@ pub fn register_sigbus_handler() {
 unsafe extern "C" fn signal_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
-    _ucontext: usize,
+    ucontext: *mut c_void,
 ) {
     unsafe {
         if let Some(info) = info.as_ref() {
@@ -53,7 +56,7 @@ unsafe extern "C" fn signal_handler(
             // it async signal safe it typically means extra pipes, threads, more complexity with
             // `fork`, etc. We're crashing (and in relatively rare cases) anyway, so don't bother
             // async signal safety for now.
-            if let Some((_start, _end, writable)) = crate::page_out::find_region(addr) {
+            if let Some((_start, _end, writable)) = find_region_with_retry(addr) {
                 if zero_fill_page(addr, writable).is_ok() {
                     // Retry, since zero_fill_page probably made it accessible.
                     return;
@@ -61,15 +64,58 @@ unsafe extern "C" fn signal_handler(
             }
         }
 
-        // Fallback to the original handler. Restore the old handler and re-raise the signal.
+        // Call a previous handler directly so multiple recoverable SIGBUS
+        // handlers can coexist. An ignored or default disposition still has to
+        // be restored so the fault can be raised again by the kernel.
         // This can happen when (but not limited to):
         // - The address in question is not tracked by indexedlog's (file-backed) mmap buffers.
-        // - Already tried fixing the same page before, to prevent infinite loop.
+        // - The same page kept faulting after being fixed (see `zero_fill_page`).
         #[expect(static_mut_refs)]
-        if let Some(old_handler_mut) = ORIG_HANDLER.as_mut() {
-            libc::sigaction(sig, old_handler_mut, std::ptr::null_mut());
-            // Retry as a way to re-raise.
+        if let Some(old_handler) = ORIG_HANDLER.as_ref() {
+            call_original_handler(old_handler, sig, info, ucontext);
         }
+    }
+}
+
+/// Look up `addr` in the buffer registries, waiting while a registry lock is
+/// held by another thread. Faults in several threads at once do this to each
+/// other, since every faulting thread runs this handler at the same time.
+/// `sched_yield` and the monotonic clock are async-signal-safe.
+fn find_region_with_retry(addr: usize) -> Option<(usize, usize, bool)> {
+    const MAX_WAIT: Duration = Duration::from_secs(1);
+    let started = Instant::now();
+    loop {
+        match crate::page_out::find_region(addr) {
+            Ok(region) => return region,
+            Err(_) if started.elapsed() < MAX_WAIT => unsafe {
+                libc::sched_yield();
+            },
+            Err(_) => return None,
+        }
+    }
+}
+
+unsafe fn call_original_handler(
+    action: &libc::sigaction,
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut c_void,
+) {
+    let handler = action.sa_sigaction;
+    if handler == libc::SIG_IGN || handler == libc::SIG_DFL {
+        unsafe {
+            libc::sigaction(sig, action, std::ptr::null_mut());
+        }
+        return;
+    }
+
+    if action.sa_flags & libc::SA_SIGINFO != 0 {
+        let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut c_void) =
+            unsafe { mem::transmute(handler) };
+        unsafe { handler(sig, info, ucontext) };
+    } else {
+        let handler: unsafe extern "C" fn(libc::c_int) = unsafe { mem::transmute(handler) };
+        unsafe { handler(sig) };
     }
 }
 
@@ -78,11 +124,20 @@ fn zero_fill_page(addr: usize, writable: bool) -> Result<(), ()> {
     let page_size = crate::page_out::page_size().ok_or(())?;
     let start: usize = addr / page_size * page_size;
 
+    // A zero-filled page cannot fault again on its own. The same address
+    // faults again when the process maps a file there again, which is common:
+    // mmap reuses freed addresses, and `open_with_repair` re-opens a Log whose
+    // first open failed. Keep a bound so a fix that somehow does not take
+    // effect ends in a crash instead of an endless signal loop.
+    const MAX_REPEATED_FIXES: usize = 64;
     static LAST_START: AtomicUsize = AtomicUsize::new(0);
-    let last_start = LAST_START.swap(start, Ordering::AcqRel);
-    if last_start == start {
-        // Just attempted fixing this page. Do not try again.
-        return Err(());
+    static REPEATED_FIXES: AtomicUsize = AtomicUsize::new(0);
+    if LAST_START.swap(start, Ordering::AcqRel) == start {
+        if REPEATED_FIXES.fetch_add(1, Ordering::AcqRel) >= MAX_REPEATED_FIXES {
+            return Err(());
+        }
+    } else {
+        REPEATED_FIXES.store(0, Ordering::Release);
     }
 
     // Use mmap MAP_FIXED | MAP_ANONYMOUS to zero-fill the page.
@@ -103,12 +158,87 @@ fn zero_fill_page(addr: usize, writable: bool) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
     use std::fs::OpenOptions;
+    use std::mem;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
+    use crate::change_detect::SharedChangeDetector;
+    use crate::lock::DirLockOptions;
+    use crate::lock::ScopedDirLock;
     use crate::log::Log;
     use crate::log::PRIMARY_FILE;
+
+    #[test]
+    fn test_call_original_siginfo_handler() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn handler(
+            sig: libc::c_int,
+            _info: *mut libc::siginfo_t,
+            _ucontext: *mut c_void,
+        ) {
+            assert_eq!(sig, libc::SIGBUS);
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut action: libc::sigaction = unsafe { mem::zeroed() };
+        action.sa_sigaction = handler as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        unsafe {
+            super::call_original_handler(
+                &action,
+                libc::SIGBUS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            super::call_original_handler(
+                &action,
+                libc::SIGBUS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_call_original_ignored_handler_restores_disposition() {
+        unsafe extern "C" fn handler(_sig: libc::c_int) {}
+
+        let mut current_action: libc::sigaction = unsafe { mem::zeroed() };
+        current_action.sa_sigaction = handler as *const () as usize;
+        let mut ignored_action: libc::sigaction = unsafe { mem::zeroed() };
+        ignored_action.sa_sigaction = libc::SIG_IGN;
+        let mut original_action: libc::sigaction = unsafe { mem::zeroed() };
+
+        let signal = libc::SIGUSR2;
+        unsafe {
+            assert_eq!(
+                libc::sigaction(signal, &current_action, &mut original_action),
+                0
+            );
+            super::call_original_handler(
+                &ignored_action,
+                signal,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+
+        let mut installed_action: libc::sigaction = unsafe { mem::zeroed() };
+        let query_result =
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut installed_action) };
+        unsafe {
+            libc::sigaction(signal, &original_action, std::ptr::null_mut());
+        }
+        assert_eq!(query_result, 0);
+        assert_eq!(installed_action.sa_sigaction, libc::SIG_IGN);
+    }
 
     #[test]
     fn test_sigbus_truncate_log() {
@@ -167,6 +297,82 @@ mod tests {
                 assert!(error_count > 0);
             }
         }
+    }
+
+    #[test]
+    fn test_zero_fill_same_page_again() {
+        // A page faults again whenever a file is mapped at its address again,
+        // so fixing the same page several times in a row must keep working.
+        let page_size = crate::page_out::page_size().unwrap();
+        // SAFETY: An anonymous mapping takes no caller-provided pointers.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        for _ in 0..8 {
+            assert_eq!(super::zero_fill_page(page as usize, false), Ok(()));
+        }
+        // SAFETY: `page` came from the `mmap` above with this length and is
+        // not used afterwards.
+        unsafe {
+            libc::munmap(page, page_size);
+        }
+    }
+
+    #[test]
+    fn test_sigbus_truncate_rlock_before_first_read() {
+        super::register_sigbus_handler();
+
+        let dir = tempdir().unwrap();
+        let opts = DirLockOptions {
+            exclusive: false,
+            non_blocking: false,
+            file_name: "rlock",
+        };
+        let lock = ScopedDirLock::new_with_options(dir.path(), &opts).unwrap();
+        let mmap = lock.shared_mmap_mut(std::mem::size_of::<u64>()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("rlock"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        // The first read faults. The handler must already know the buffer.
+        let detector = SharedChangeDetector::new(mmap);
+        assert!(!detector.is_changed());
+    }
+
+    #[test]
+    fn test_sigbus_lookup_waits_for_busy_registry() {
+        super::register_sigbus_handler();
+
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("log");
+        let mut log = Log::open(&log_path, Vec::new()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(log_path.join("rlock"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        log.append([b'a'; 10]).unwrap();
+
+        // Hold the change detector registry, as a concurrent fault handler or
+        // `SharedChangeDetector::new` does, while the sync below faults on the
+        // truncated rlock page.
+        let registry = crate::change_detect::BUFFERS.lock().unwrap();
+        let syncer = std::thread::spawn(move || log.sync().map(|_| ()));
+        std::thread::sleep(Duration::from_millis(10));
+        drop(registry);
+        syncer.join().unwrap().unwrap();
     }
 
     #[test]

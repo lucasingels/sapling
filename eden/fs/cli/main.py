@@ -13,7 +13,6 @@ import concurrent.futures
 import enum
 import errno
 import inspect
-import io
 import json
 import os
 import platform
@@ -171,6 +170,7 @@ from . import (
     daemon_util,
     debug as debug_mod,
     doctor as doctor_mod,
+    error_report,
     filesystem as fs_mod,
     mtab,
     prefetch as prefetch_mod,
@@ -220,15 +220,31 @@ except ImportError:
 
 subcmd = subcmd_mod.Decorator()
 
+# The AI-backed commands shell out to a local `claude` and log to internal
+# telemetry, so they live under facebook/ and are absent from the OSS export.
+_AI_DIAGNOSIS_MODULE = "eden.fs.cli.facebook.ai_diagnosis"
+try:
+    from .facebook.ai_diagnosis import register as _register_ai_commands
+except ImportError as ex:
+    # Only tolerate the module itself being absent, which is how the OSS export
+    # is built. An ImportError from *inside* it means the module is present but
+    # broken, and swallowing that would drop both commands with no signal.
+    if ex.name is None or not _AI_DIAGNOSIS_MODULE.startswith(ex.name):
+        raise
+else:
+    _register_ai_commands(subcmd)
+
 # For a non-unix system (like Windows), we will define our own error codes.
 try:
     EX_OK: int = os.EX_OK
     EX_SOFTWARE: int = os.EX_SOFTWARE
     EX_OSFILE: int = os.EX_OSFILE
+    EX_UNAVAILABLE: int = os.EX_UNAVAILABLE
 except AttributeError:  # On a non-unix system
     EX_OK: int = 0
     EX_SOFTWARE: int = 70
     EX_OSFILE: int = 72
+    EX_UNAVAILABLE: int = 69
 
 # The Rust CLI depends on this value staying constant. Instead of fetching it
 # from the os library, let's just define it here.
@@ -479,10 +495,9 @@ class ListCmd(Subcmd):
 
             transport_str = ""
             if verbose and mount_info.fs_channel_type is not None:
-                if mount_info.fuse_transport is not None:
-                    transport_str = (
-                        f" ({mount_info.fs_channel_type}, {mount_info.fuse_transport})"
-                    )
+                transport = mount_info.fuse_transport or mount_info.nfs_transport
+                if transport is not None:
+                    transport_str = f" ({mount_info.fs_channel_type}, {transport})"
                 else:
                     transport_str = f" ({mount_info.fs_channel_type})"
 
@@ -742,7 +757,9 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                 off_mount_repo_dir=instance.get_config_bool(
                     "clone.off-mount-repo-dir",
                     # Enable by default in tests.
-                    any(v in os.environ for v in ("INTEGRATION_TEST", "TESTTMP")),
+                    any(
+                        v in os.environ for v in ("EDENFS_INTEGRATION_TEST", "TESTTMP")
+                    ),
                 ),
             )
         except util.RepoError as ex:
@@ -949,9 +966,6 @@ class ReloadConfigCmd(Subcmd):
         raise NotImplementedError("Stub -- only implemented in Rust")
 
 
-CLAUDE_TIMEOUT_SECS = 120
-
-
 @subcmd("doctor", "Debug and fix issues with EdenFS")
 class DoctorCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -1004,93 +1018,6 @@ class DoctorCmd(Subcmd):
         if args.current_edenfs_only:
             doctor.run_system_wide_checks = False
         return doctor.cure_what_ails_you()
-
-
-@subcmd("doctor-ai", "Run eden doctor and, on failure, ask local AI for diagnosis")
-class DoctorAICmd(Subcmd):
-    def setup_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument(
-            "--claude-timeout-secs",
-            type=int,
-            default=CLAUDE_TIMEOUT_SECS,
-            help="Timeout for the local claude diagnosis subprocess.",
-        )
-
-    def run(self, args: argparse.Namespace) -> int:
-        instance = get_eden_instance(args)
-        doctor_output = io.StringIO()
-        doctor_returncode = doctor_mod.cure_what_ails_you(
-            instance,
-            dry_run=False,
-            debug=args.debug,
-            fast=False,
-            wait=False,
-            min_severity_to_report=ProblemSeverity.ALL,
-            out=ui.PlainOutput(doctor_output),
-        )
-
-        doctor_text = doctor_output.getvalue()
-        if doctor_text:
-            sys.stdout.write(doctor_text)
-            if not doctor_text.endswith("\n"):
-                sys.stdout.write("\n")
-        if doctor_returncode == 0:
-            return doctor_returncode
-
-        print("\nAI diagnosis follows.\n", file=sys.stderr)
-        prompt = f"""Use the local `diagnose-sapling` skill on this `eden doctor` output.
-
-{doctor_text.strip()}
-"""
-        claude_env = os.environ.copy()
-        claude_env.pop("CLAUDECODE", None)
-        try:
-            claude_result = subprocess.run(
-                ["claude", "--print"],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=args.claude_timeout_secs,
-                env=claude_env,
-                check=False,
-            )
-        except FileNotFoundError:
-            print(
-                "Local `claude` was not found on PATH; skipping AI diagnosis.",
-                file=sys.stderr,
-            )
-            return doctor_returncode
-        except subprocess.TimeoutExpired as ex:
-            stdout = (
-                ex.stdout.decode(errors="replace")
-                if isinstance(ex.stdout, bytes)
-                else (ex.stdout or "")
-            )
-            stderr = (
-                ex.stderr.decode(errors="replace")
-                if isinstance(ex.stderr, bytes)
-                else (ex.stderr or "")
-            )
-            print(
-                "Local `claude` timed out while generating the diagnosis.",
-                file=sys.stderr,
-            )
-            if stdout:
-                sys.stdout.write(stdout)
-            if stderr:
-                sys.stderr.write(stderr)
-            return doctor_returncode
-
-        if claude_result.returncode != 0:
-            print(
-                "Local `claude` failed while generating the diagnosis.",
-                file=sys.stderr,
-            )
-        if claude_result.stdout:
-            sys.stdout.write(claude_result.stdout)
-        if claude_result.stderr:
-            sys.stderr.write(claude_result.stderr)
-        return doctor_returncode
 
 
 @subcmd("health-report", "Notify critical eden issues")
@@ -2382,7 +2309,8 @@ class StartCmd(Subcmd):
         parser.add_argument(
             "--if-necessary",
             action="store_true",
-            help="Only start edenfs daemon if there are EdenFS checkouts configured.",
+            help="Only start edenfs daemon if there are EdenFS checkouts configured. "
+            "Implies --if-not-running.",
         )
         parser.add_argument(
             "--if-not-running",
@@ -2496,7 +2424,10 @@ class StartCmd(Subcmd):
                 msg = f"EdenFS is already starting (pid {health_info.pid})"
 
             if msg:
-                if args.if_not_running:
+                # --if-necessary means "start only if this host needs EdenFS", so a
+                # daemon that is already up satisfies the request. Callers reach for
+                # it expecting that and are surprised by a nonzero exit.
+                if args.if_not_running or args.if_necessary:
                     print(msg)
                     return 0
                 raise subcmd_mod.CmdError(msg)
@@ -2659,10 +2590,10 @@ class SystemdStartCmd(Subcmd):
 def unmount_redirections_for_path(
     repo_path: str, complain_about_failing_to_unmount_redirs: bool
 ) -> None:
-    parser = create_parser()
-    args = parser.parse_args(["redirect", "unmount", "--mount", repo_path])
     try:
-        args.func(args)
+        args = create_parser().parse_args([])
+        instance, checkout, _rel_path = require_checkout(args, repo_path)
+        redirect_mod.unmount_redirections(instance, checkout)
     except Exception as exc:
         if complain_about_failing_to_unmount_redirs:
             print(
@@ -2766,6 +2697,11 @@ def stop_aux_processes(client: EdenService.Sync) -> None:
 RESTART_MODE_FULL = "full"
 RESTART_MODE_GRACEFUL = "graceful"
 RESTART_MODE_FORCE = "force"
+
+
+def _fail_restart(telemetry_sample: TelemetrySample, message: str) -> None:
+    telemetry_sample.fail(message)
+    error_report.record(message)
 
 
 @subcmd("restart", "Restart the EdenFS service")
@@ -2934,6 +2870,10 @@ class RestartCmd(Subcmd):
                 print(
                     "Use `eden restart --force` if you want to forcibly restart the current daemon"
                 )
+                error_report.record(
+                    f"edenfs daemon is not healthy (status {health.status.name}) "
+                    "and --force was not given"
+                )
                 return 4
             return self._force_restart(instance, edenfs_pid, stop_timeout)
 
@@ -2947,7 +2887,9 @@ class RestartCmd(Subcmd):
             print(
                 "The daemon is not running after failed graceful restart, starting it"
             )
-            telemetry_sample.fail("EdenFS was not running after graceful restart")
+            _fail_restart(
+                telemetry_sample, "EdenFS was not running after graceful restart"
+            )
             return self._start(instance)
 
         print(
@@ -2962,8 +2904,9 @@ class RestartCmd(Subcmd):
             # want to wait for a reasonable time before we force
             # kill the process (if it is stuck somewhere)
             wait_for_instance_healthy(instance, 600)
-            telemetry_sample.fail(
-                "Graceful restart failed, and old EdenFS process resumed"
+            _fail_restart(
+                telemetry_sample,
+                "Graceful restart failed, and old EdenFS process resumed",
             )
             print(
                 "error: failed to perform graceful restart. The old "
@@ -2986,15 +2929,17 @@ class RestartCmd(Subcmd):
             # continue on with the restart
             pass
         if self._finish_restart(instance) == 0:
-            telemetry_sample.fail(
+            _fail_restart(
+                telemetry_sample,
                 "EdenFS was not healthy after graceful restart; performed a "
-                "hard restart"
+                "hard restart",
             )
             return 2
         else:
-            telemetry_sample.fail(
+            _fail_restart(
+                telemetry_sample,
                 "EdenFS was not healthy after graceful restart, and we failed "
-                "to restart it"
+                "to restart it",
             )
             return 3
 
@@ -3013,8 +2958,15 @@ class RestartCmd(Subcmd):
         return normalized, is_default_config_dir
 
     @staticmethod
-    def _get_fuse_transport_mismatch_direction(
-        transport_mismatches: Sequence[config_mod.FuseTransportMismatch],
+    def _get_transport_mismatch_channel(
+        transport_mismatches: Sequence[config_mod.TransportMismatch],
+    ) -> str:
+        channels = {mismatch.channel for mismatch in transport_mismatches}
+        return next(iter(channels)) if len(channels) == 1 else "mixed"
+
+    @staticmethod
+    def _get_transport_mismatch_direction(
+        transport_mismatches: Sequence[config_mod.TransportMismatch],
     ) -> str:
         def get_transport_name(transports: Set[str]) -> str:
             if len(transports) == 1:
@@ -3041,21 +2993,18 @@ class RestartCmd(Subcmd):
             )
             telemetry_sample.add_string("eden_dir", eden_dir_normalized)
             telemetry_sample.add_bool("is_default_config_dir", is_default_config_dir)
-            if config_mod.is_fuse_transport_mismatch_restart_enabled(instance):
-                transport_mismatches = config_mod.get_fuse_transport_mismatches(
-                    instance
-                )
-            else:
-                transport_mismatches = []
+            transport_mismatches = config_mod.get_transport_mismatches(instance)
 
             if transport_mismatches:
-                telemetry_sample.add_string("reason", "fuse_transport_mismatch")
+                channel = self._get_transport_mismatch_channel(transport_mismatches)
+                reason = f"{channel}_transport_mismatch"
+                telemetry_sample.add_string("reason", reason)
                 telemetry_sample.add_string(
                     "transport_name",
-                    self._get_fuse_transport_mismatch_direction(transport_mismatches),
+                    self._get_transport_mismatch_direction(transport_mismatches),
                 )
                 print(
-                    "FUSE transport config changed; performing a full restart instead of graceful restart."
+                    f"{channel.upper()} transport config changed; performing a full restart instead of graceful restart."
                 )
                 for mismatch in transport_mismatches:
                     print(
@@ -3064,8 +3013,9 @@ class RestartCmd(Subcmd):
                 health = instance.check_health()
                 edenfs_pid = health.pid
                 if edenfs_pid is None:
-                    telemetry_sample.fail(
-                        "FUSE transport mismatch required full restart, but EdenFS was not running"
+                    _fail_restart(
+                        telemetry_sample,
+                        "Transport mismatch required a full restart, but EdenFS was not running",
                     )
                     return self._start(instance)
 
@@ -3079,11 +3029,12 @@ class RestartCmd(Subcmd):
                 instance.log_sample(
                     "full_restart",
                     success=status == 0,
-                    triggered_by="fuse_transport_mismatch",
+                    triggered_by=reason,
                 )
                 if status != 0:
-                    telemetry_sample.fail(
-                        "FUSE transport mismatch fallback full restart failed"
+                    _fail_restart(
+                        telemetry_sample,
+                        "Transport mismatch fallback full restart failed",
                     )
                 return status
 
@@ -3216,6 +3167,7 @@ re-open these files after EdenFS is restarted.
         )
         if exit_code != 0:
             print("Failed to start edenfs daemon!", file=sys.stderr)
+            error_report.record("Failed to start edenfs daemon during restart")
             return exit_code
 
         print()
@@ -3519,7 +3471,6 @@ def create_parser() -> argparse.ArgumentParser:
         subcmd_mod.HelpCmd,
         stats_mod.StatsCmd,
         trace_mod.TraceCmd,
-        redirect_mod.RedirectCmd,
         prefetch_mod.GlobCmd,
         prefetch_mod.PrefetchCmd,
     ]
@@ -3582,6 +3533,7 @@ def set_working_directory(args: argparse.Namespace) -> Optional[int]:
         os.chdir(args.checkout_dir)
     except OSError as e:
         print(f"Unable to change to checkout directory: {e}", file=sys.stderr)
+        error_report.record(f"Unable to change to checkout directory: {e}", e)
         return EX_OSFILE
 
 
@@ -3604,6 +3556,7 @@ def check_for_stale_working_directory() -> Optional[int]:
             f"error: unable to determine current working directory: {ex}",
             file=sys.stderr,
         )
+        error_report.record(f"unable to determine current working directory: {ex}", ex)
         return EX_OSFILE
 
     # See if we can figure out what the current working directory should be
@@ -3627,6 +3580,7 @@ mount point from a previous edenfs daemon instance.
 Please run "cd / && cd -" to update your shell's working directory."""
     if not can_continue:
         print(f"Error: {msg}", file=sys.stderr)
+        error_report.record(msg)
         return EX_OSFILE
 
     print(f"Warning: {msg}", file=sys.stderr)
@@ -3664,12 +3618,15 @@ async def async_main(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         return result
     except subcmd_mod.CmdError as ex:
         print(f"error: {ex}", file=sys.stderr)
+        error_report.record(str(ex), ex)
         return EX_SOFTWARE
     except daemon_util.DaemonBinaryNotFound as ex:
         print(f"error: {ex}", file=sys.stderr)
-        return EX_SOFTWARE
+        error_report.record(str(ex), ex)
+        return EX_UNAVAILABLE
     except config_mod.UsageError as ex:
         print(f"error: {ex}", file=sys.stderr)
+        error_report.record(str(ex), ex)
         return EX_USAGE
 
 
@@ -3682,6 +3639,18 @@ except AttributeError:
 
 
 def main() -> int:
+    error_report.init()
+    try:
+        ret = _main()
+    except Exception as ex:
+        error_report.record(str(ex), ex)
+        error_report.write(1)
+        raise
+    error_report.write(ret)
+    return ret
+
+
+def _main() -> int:
     # Ensure stdout/stderr use UTF-8 encoding. On Windows, Python defaults to
     # the system code page (e.g. cp1252) which cannot encode non-Latin paths.
     # This matches Sapling's utf8_mode=1 pre-initialization (python.rs).

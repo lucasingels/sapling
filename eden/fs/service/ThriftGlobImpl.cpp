@@ -21,7 +21,6 @@
 #include "eden/fs/inodes/GlobNode.h"
 #include "eden/fs/inodes/ServerState.h"
 #include "eden/fs/inodes/TreeInode.h"
-#include "eden/fs/model/LocalFiles.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/ObjectFetchContext.h"
@@ -54,78 +53,6 @@ void compileGlobs(const std::vector<std::string>& globs, GlobNodeImpl& root) {
   }
 }
 
-folly::coro::now_task<std::unique_ptr<LocalFiles>> computeLocalFiles(
-    const std::shared_ptr<EdenMount>& edenMount,
-    const std::shared_ptr<ServerState>& serverState,
-    bool includeDotfiles,
-    const RootId& rootId,
-    const TreeInodePtr& rootInode,
-    const std::vector<std::string>& suffixGlobs,
-    const ObjectFetchContextPtr& context) {
-  auto enforceParents = serverState->getReloadableConfig()
-                            ->getEdenConfig()
-                            ->enforceParents.getValue();
-  bool caseSensitive =
-      serverState->getEdenConfig()->globUseMountCaseSensitivity.getValue();
-
-  auto status = co_await edenMount->co_diff(
-      rootInode,
-      rootId,
-      folly::CancellationToken(),
-      context,
-      /*listIgnored=*/true,
-      enforceParents);
-
-  // Everything below is synchronous processing
-  if (!status->errors_ref().value().empty()) {
-    XLOG(DBG4, "Error getting local changes");
-    throw newEdenError(
-        EINVAL, EdenErrorType::POSIX_ERROR, "unable to look up local files");
-  }
-  std::vector<GlobMatcher> globMatchers{};
-  GlobOptions options =
-      includeDotfiles ? GlobOptions::DEFAULT : GlobOptions::IGNORE_DOTFILES;
-  if (caseSensitive) {
-    if (edenMount->getCheckoutConfig()->getCaseSensitive() ==
-        CaseSensitivity::Insensitive) {
-      options |= GlobOptions::CASE_INSENSITIVE;
-    }
-  }
-  for (auto& glob : suffixGlobs) {
-    XLOGF(DBG4, "Creating glob matcher for glob: {}", glob);
-    auto expectGlobMatcher = GlobMatcher::create("**/*" + glob, options);
-    if (expectGlobMatcher.hasValue()) {
-      XLOGF(DBG4, "Successfully created glob matcher for glob: {}", glob);
-      globMatchers.push_back(expectGlobMatcher.value());
-    } else {
-      XLOGF(ERR, "Invalid glob: {}", glob);
-    }
-  }
-
-  std::unique_ptr<LocalFiles> localFiles = std::make_unique<LocalFiles>();
-  for (auto const& [pathString, scmFileStatus] :
-       status->entries_ref().value()) {
-    if (scmFileStatus == ScmFileStatus::ADDED) {
-      for (auto& matcher : globMatchers) {
-        if (matcher.match(pathString)) {
-          localFiles->addedFiles.insert(pathString);
-        }
-      }
-    } else if (scmFileStatus == ScmFileStatus::REMOVED) {
-      localFiles->removedFiles.insert(pathString);
-    } else if (scmFileStatus == ScmFileStatus::MODIFIED) {
-      for (auto& matcher : globMatchers) {
-        if (matcher.match(pathString)) {
-          localFiles->modifiedFiles.insert(pathString);
-        }
-      }
-    } else if (scmFileStatus == ScmFileStatus::IGNORED) {
-      localFiles->ignoredFiles.insert(pathString);
-    }
-  }
-  co_return localFiles;
-}
-
 } // namespace
 
 ThriftGlobImpl::ThriftGlobImpl(const GlobParams& params)
@@ -150,6 +77,7 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     std::vector<std::string> globs,
     const ObjectFetchContextPtr& fetchContext) {
   auto config = serverState->getEdenConfig();
+  auto globMatchOptions = serverState->getGlobMatchOptions();
   size_t prefetchBlobBatchSize = config->prefetchBlobBatchSize.getValue();
   if (prefetchBlobBatchSize == 0) {
     XLOG_EVERY_MS(ERR, 60'000)
@@ -189,7 +117,8 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
     globTree = std::make_shared<GlobTree>(
         bool(includeDotfiles_),
         caseSensitivity,
-        serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue());
+        serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue(),
+        globMatchOptions);
     compileGlobs(globs, *globTree);
     for (auto& rootId : rootIds_) {
       const RootId& originRootId = originRootIds->emplace_back(
@@ -232,8 +161,8 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
         : CaseSensitivity::Sensitive;
     uint32_t asyncDepth =
         serverState->getEdenConfig()->globRecursiveAsyncDepth.getValue();
-    globNode =
-        std::make_shared<GlobNode>(includeDotfiles, caseSensitive, asyncDepth);
+    globNode = std::make_shared<GlobNode>(
+        includeDotfiles, caseSensitive, asyncDepth, globMatchOptions);
     compileGlobs(globs, *globNode);
     const RootId& originRootId =
         originRootIds->emplace_back(edenMount->getCheckedOutRootId());
@@ -337,8 +266,11 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
   // Prefetch blobs in parallel batches
   if (fileBlobsToPrefetch) {
     auto store = edenMount->getObjectStore();
-    auto blobs = fileBlobsToPrefetch->rlock();
-    auto range = folly::Range{blobs->data(), blobs->size()};
+    // All glob tasks have finished writing the list. Own its storage locally
+    // so the batch ranges stay valid without holding a lock across co_await.
+    std::vector<ObjectId> blobs;
+    std::swap(blobs, *fileBlobsToPrefetch->wlock());
+    auto range = folly::Range{blobs.data(), blobs.size()};
 
     std::vector<folly::coro::Task<void>> prefetchTasks;
     while (range.size() > prefetchBlobBatchSize) {
@@ -369,56 +301,6 @@ folly::coro::now_task<std::unique_ptr<Glob>> ThriftGlobImpl::glob(
   }
 
   co_return out;
-}
-
-folly::coro::now_task<std::vector<BackingStore::GetGlobFilesResult>>
-getLocalGlobResults(
-    const std::shared_ptr<EdenMount>& edenMount,
-    const std::shared_ptr<ServerState>& serverState,
-    bool includeDotfiles,
-    const std::vector<std::string>& suffixGlobs,
-    const std::vector<std::string>& prefixes,
-    const TreeInodePtr& rootInode,
-    const ObjectFetchContextPtr& context) {
-  XLOG(DBG3, "No commit id in input, using current id");
-  auto rootId = edenMount->getCheckedOutRootId();
-  auto& store = edenMount->getObjectStore();
-
-  auto remoteGlobFiles =
-      co_await store->getGlobFiles(rootId, suffixGlobs, prefixes, context);
-
-  auto localFiles = co_await computeLocalFiles(
-      edenMount,
-      serverState,
-      includeDotfiles,
-      rootId,
-      rootInode,
-      suffixGlobs,
-      context);
-
-  BackingStore::GetGlobFilesResult filteredRemoteGlobFiles;
-  filteredRemoteGlobFiles.rootId = remoteGlobFiles.rootId;
-  for (auto& entry : remoteGlobFiles.globFiles) {
-    if (localFiles->removedFiles.contains(entry) ||
-        localFiles->addedFiles.contains(entry) ||
-        localFiles->modifiedFiles.contains(entry)) {
-      continue;
-    }
-    filteredRemoteGlobFiles.globFiles.emplace_back(entry);
-  }
-
-  BackingStore::GetGlobFilesResult localGlobFiles;
-  localGlobFiles.isLocal = true;
-  localGlobFiles.rootId = rootId;
-  for (auto& entry : localFiles->addedFiles) {
-    localGlobFiles.globFiles.emplace_back(entry);
-  }
-  for (auto& entry : localFiles->modifiedFiles) {
-    localGlobFiles.globFiles.emplace_back(entry);
-  }
-
-  co_return std::vector<BackingStore::GetGlobFilesResult>{
-      filteredRemoteGlobFiles, localGlobFiles};
 }
 
 std::string ThriftGlobImpl::logString() {

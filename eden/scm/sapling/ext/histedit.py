@@ -45,6 +45,7 @@ file open in your editor::
  #  e, edit = use commit, but stop for amending
  #  f, fold = use commit, but combine it with the one above
  #  r, roll = like fold, but discard this commit's description and date
+ #  i, into = like fold, but keep only this commit's description
  #  d, drop = remove commit from history
  #  m, mess = edit commit message without changing commit content
  #  b, base = checkout changeset and apply further changesets from there
@@ -68,6 +69,7 @@ would reorganize the file to look like this::
  #  e, edit = use commit, but stop for amending
  #  f, fold = use commit, but combine it with the one above
  #  r, roll = like fold, but discard this commit's description and date
+ #  i, into = like fold, but keep only this commit's description
  #  d, drop = remove commit from history
  #  m, mess = edit commit message without changing commit content
  #  b, base = checkout changeset and apply further changesets from there
@@ -186,6 +188,7 @@ present it to you for final fixes before you close the editor:
  #  e, edit = use commit, but stop for amending
  #  f, fold = use commit, but combine it with the one above
  #  r, roll = like fold, but discard this commit's description and date
+ #  i, into = like fold, but keep only this commit's description
  #  d, drop = remove commit from history
  #  m, mess = edit commit message without changing commit content
  #  b, base = checkout changeset and apply further changesets from there
@@ -732,6 +735,12 @@ def collapse(repo, first, commitopts, skipprompt=False):
                 repo.dirstate.delete(f)
         repo.dirstate.setparents(n)
 
+    # Write the new parent out now, as workingctx.markcommitted does. EdenFS
+    # only learns of it when the dirstate is written; until then, a status
+    # check (such as the dirty check in "histedit --continue") gets an
+    # "out-of-date parent" error and resets the parent to the old commit.
+    repo.dirstate.write(repo.currenttransaction())
+
     return n
 
 
@@ -839,14 +848,6 @@ class fold(histeditaction):
         """
         return False
 
-    def mergedescs(self):
-        """Returns true if the rule should merge messages of multiple changes.
-
-        This exists mainly so that 'rollup' rules can be a subclass of
-        'fold'.
-        """
-        return True
-
     def firstdate(self):
         """Returns true if the rule should preserve the date of the first
         change.
@@ -855,6 +856,22 @@ class fold(histeditaction):
         'fold'.
         """
         return False
+
+    def foldmessage(self, ctx, oldctx, newnodes):
+        """Returns the message for the combined commit, before any editing.
+
+        ctx is the commit being folded into, oldctx the commit being folded
+        in, and newnodes any commits created between them.
+        """
+        repo = self.repo
+        return (
+            "\n***\n".join(
+                [ctx.description()]
+                + [repo[r].description() for r in newnodes]
+                + [oldctx.description()]
+            )
+            + "\n"
+        )
 
     def finishfold(self):
         repo = self.repo
@@ -869,19 +886,7 @@ class fold(histeditaction):
         ### prepare new commit data
         commitopts = {}
         commitopts["user"] = ctx.user()
-        # commit message
-        if not self.mergedescs():
-            newmessage = ctx.description()
-        else:
-            newmessage = (
-                "\n***\n".join(
-                    [ctx.description()]
-                    + [repo[r].description() for r in newnodes]
-                    + [oldctx.description()]
-                )
-                + "\n"
-            )
-        commitopts["message"] = newmessage
+        commitopts["message"] = self.foldmessage(ctx, oldctx, newnodes)
         # date
         if self.firstdate():
             commitopts["date"] = ctx.date()
@@ -961,10 +966,19 @@ class _multifold(fold):
         return True
 
 
+@action(["into", "i"], _("like fold, but keep only this commit's description"))
+class foldinto(fold):
+    def foldmessage(self, ctx, oldctx, newnodes):
+        return oldctx.description()
+
+    def skipprompt(self):
+        return True
+
+
 @action(["roll", "r"], _("like fold, but discard this commit's description and date"))
 class rollup(fold):
-    def mergedescs(self):
-        return False
+    def foldmessage(self, ctx, oldctx, newnodes):
+        return ctx.description()
 
     def skipprompt(self):
         return True
@@ -1000,6 +1014,13 @@ class message(histeditaction):
             _("read history edits from the specified file"),
             _("FILE"),
         ),
+        (
+            "",
+            "plan",
+            [],
+            _("run this history edit, e.g. 'pick HASH' (one per commit, oldest first)"),
+            _("RULE"),
+        ),
         ("c", "continue", False, _("continue an edit already in progress")),
         ("", "edit-plan", False, _("edit remaining actions list")),
         ("k", "keep", False, _("don't strip old nodes after edit is complete")),
@@ -1030,6 +1051,42 @@ def histedit(ui, repo, *freeargs, **opts):
     - `edit` to edit a commit, preserving date
 
     - `base` to checkout a commit and continue applying subsequent commits
+
+    .. container:: agent
+
+       Running histedit without an editor:
+
+       Do not run histedit with only ANCESTOR: it opens an editor. Instead:
+
+       1. Check out the top of the stack, then print the current plan::
+
+            @prog@ histedit --show-plan [ANCESTOR]
+
+       2. Run the edited plan, giving each line with ``--plan``, oldest
+          commit first::
+
+            @prog@ histedit --plan 'pick 8ef592ce7cc4' --plan 'roll 5339bf82f0ca' --plan 'drop 252a1af424ad'
+
+          Give a rule for every commit from the oldest one in the plan up
+          to the working copy parent. Anything after the hash is ignored,
+          and ``drop`` lines can go anywhere in the plan. To combine a
+          commit with the kept commit before it, use ``roll`` to keep the
+          earlier commit's message, or ``into`` to keep this commit's
+          message. Avoid ``fold``, ``mess`` and ``edit``: they open an
+          editor or stop for changes.
+
+       3. If histedit stops for a conflict, resolve it and run
+          ``@prog@ histedit --continue``, or ``@prog@ histedit --abort`` to
+          undo the whole edit. ``@prog@ histedit --show-plan`` shows the
+          remaining steps.
+
+       For long or generated plans, use ``--commands FILE`` instead, where
+       FILE (or ``-`` for standard input) contains the same lines, or JSON,
+       which can also run commands between steps::
+
+         {"histedit": [{"action": "pick", "node": "8ef592ce7cc4"},
+                       {"action": "exec", "command": "make test"},
+                       {"action": "roll", "node": "5339bf82f0ca"}]}
 
     There are multiple ways to select the root changeset:
 
@@ -1161,7 +1218,16 @@ def _histedit(ui, repo, state, *freeargs, **opts):
     goal = _getgoal(opts)
     revs = opts.get("rev", [])
     rules = opts.get("commands", "")
+    plan = opts.get("plan")
     state.keep = opts.get("keep", False)
+
+    if plan:
+        if rules:
+            raise error.Abort(_("cannot use both --plan and --commands"))
+        if goal != goalnew:
+            raise error.Abort(_("--plan can only be used to start a new histedit"))
+        if not revs and not freeargs:
+            revs.append(_planroot(repo, state, "\n".join(plan)))
 
     _validateargs(ui, repo, state, freeargs, opts, goal, rules, revs)
 
@@ -1280,6 +1346,9 @@ def _finishhistedit(ui, repo, state, fm):
         if k in nodemap and all(n in nodemap for n in v)
     }
     scmutil.cleanupnodes(repo, mapping, "histedit")
+    # Not for scripts: HGPLAIN or structured (-T) output.
+    if not ui.plain() and fm.isplain():
+        _showresult(ui, repo, mapping)
     hf = fm.hexfunc
     fl = fm.formatlist
     fd = fm.formatdict
@@ -1298,6 +1367,42 @@ def _finishhistedit(ui, repo, state, fm):
         os.unlink(repo.sjoin("undo"))
     if repo.localvfs.exists("histedit-last-edit.txt"):
         repo.localvfs.unlink("histedit-last-edit.txt")
+
+
+def _showresult(ui, repo, mapping) -> None:
+    """Summarise a finished histedit.
+
+    Lists the commits that were combined (the per-commit map alone doesn't make
+    that obvious), and, for agents, the new bottom of the stack, so it is clear
+    where to look for the result.
+    """
+    combined = {}
+    for oldnode, newnodes in mapping.items():
+        if len(newnodes) == 1:
+            combined.setdefault(newnodes[0], []).append(oldnode)
+    combined = {new: olds for new, olds in combined.items() if len(olds) > 1}
+    for newnode in repo.nodes("sort(%ln, -topo)", list(combined)):
+        olds = repo.nodes("sort(%ln, -topo)", combined[newnode])
+        ui.status(
+            _('folded %s -> %s "%s"\n')
+            % (
+                ", ".join(node.short(n) for n in olds),
+                node.short(newnode),
+                _getsummary(repo[newnode]),
+            )
+        )
+
+    # Tells an agent where to look for the result without guessing a revset.
+    if not ui.agent():
+        return
+    bases = list(repo.nodes("roots(draft() & ::.)"))
+    if bases:
+        ui.status(_("new stack base: %s\n") % node.short(bases[0]))
+    else:
+        ui.status(
+            _("no commits left in the stack (working copy is at %s)\n")
+            % node.short(repo["."].node())
+        )
 
 
 def _aborthistedit(ui, repo, state):
@@ -1357,13 +1462,51 @@ def _edithisteditplan(ui, repo, state, rules):
     state.write()
 
 
-def _newhistedit(ui, repo, state, revs, freeargs, opts):
-    rules = opts.get("commands", "")
+def _showdrops(ui, repo, actions) -> None:
+    """List the commits a plan drops, which otherwise go unreported."""
+    displayer = cmdutil.show_changeset(
+        ui,
+        repo,
+        {
+            "template": "dropping changeset "
+            '{shortest(node, 6)}{if(bookmarks, " ({bookmarks})")}'
+            ": {desc|firstline}\n"
+        },
+    )
+    for action in actions:
+        if action.verb == "drop":
+            displayer.show(repo[action.node])
 
-    cmdutil.checkunfinished(repo)
-    cmdutil.bailifchanged(repo)
 
-    topmost, empty = repo.dirstate.parents()
+def _planroot(repo, state, rules):
+    """Return the oldest commit named by a plan, to use as the base when none
+    is given."""
+    nodes = []
+    for action in parserules(rules, state):
+        if action.node is None or action.verb == "base":
+            continue
+        try:
+            nodes.append(repo[node.hex(action.node)].node())
+        except error.RepoError:
+            raise error.Abort(
+                _("unknown changeset %s listed") % node.hex(action.node)[:12]
+            )
+    roots = list(repo.nodes("roots(%ln)", nodes))
+    if len(roots) != 1:
+        raise error.Abort(
+            _("the commits in the plan must have exactly one common root"),
+            hint=_("pass the commit to start from as ANCESTOR"),
+        )
+    return node.hex(roots[0])
+
+
+def histeditrevs(repo, state, revs):
+    """Find the commits a new histedit of ``revs`` would edit.
+
+    Returns ``(root, topmost, nodes)``: the oldest edited commit, the working
+    copy parent, and every commit from ``root`` to ``topmost``.
+    """
+    topmost = repo.dirstate.p1()
     rr = list(repo.set("roots(%ld)", scmutil.revrange(repo, revs)))
     if len(rr) != 1:
         raise error.Abort(
@@ -1371,23 +1514,41 @@ def _newhistedit(ui, repo, state, revs, freeargs, opts):
         )
     root = rr[0].node()
 
-    revs = between(repo, root, topmost, state.keep)
-    if not revs:
+    nodes = between(repo, root, topmost, state.keep)
+    if not nodes:
         raise error.Abort(
             _("%s is not an ancestor of working directory") % node.short(root)
         )
+    return root, topmost, nodes
+
+
+def _newhistedit(ui, repo, state, revs, freeargs, opts):
+    rules = opts.get("commands", "")
+
+    cmdutil.checkunfinished(repo)
+    cmdutil.bailifchanged(repo)
+
+    root, topmost, revs = histeditrevs(repo, state, revs)
 
     ctxs = [repo[r] for r in revs]
-    if not rules:
+    if opts.get("plan"):
+        rules = "\n".join(opts["plan"])
+    elif not rules:
         comment = geteditcomment(ui, node.short(root), node.short(topmost))
         actions = [pick(state, r) for r in revs]
         rules = ruleeditor(repo, ui, actions, comment)
     else:
         rules = _readfile(ui, rules)
     actions = parserules(rules, state)
-    warnverifyactions(ui, repo, actions, state, ctxs)
+    # Commits left out of a --plan are an error rather than silently dropped,
+    # since a plan on the command line is easy to get wrong.
+    overrides = {("histedit", "dropmissing"): False} if opts.get("plan") else {}
+    with ui.configoverride(overrides, "histedit"):
+        warnverifyactions(ui, repo, actions, state, ctxs)
     if not state.keep:
         rewriteutil.precheck(repo, [ctx.rev() for ctx in ctxs], "histedit")
+    if opts.get("plan") or not (ui.plain() or opts.get("template")):
+        _showdrops(ui, repo, actions)
 
     parentctxnode = repo[root].p1().node()
 
@@ -1566,9 +1727,13 @@ def verifyactions(actions, state, ctxs):
     seen = set()
     prev = None
 
-    if actions and actions[0].verb in ["roll", "fold"]:
+    # Dropped commits are skipped, so a fold after only drops would combine
+    # with the commit below the edited range.
+    first = next((a for a in actions if a.verb != "drop"), None)
+    if isinstance(first, fold):
         raise error.ParseError(
-            _('first changeset cannot use verb "%s"') % actions[0].verb
+            _('first changeset cannot use verb "%s"') % first.verb,
+            hint=_("%s combines a commit with the kept commit before it") % first.verb,
         )
 
     for action in actions:

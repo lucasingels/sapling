@@ -56,6 +56,14 @@ Doesn't having warning since it uses dirstate to walk.
     'restricted' is restricted by ACL 'some-acl'
   [1]
 
+The server's denial message, when it sends one, prints after the ACL line:
+  $ sl files -r . restricted/secret.txt --config slacl.server-denial-message='Ask the repo owners for access.'
+  restricted/secret.txt: restricted path
+  warning: results may be incomplete due to path ACLs
+    'restricted' is restricted by ACL 'some-acl'
+    Ask the repo owners for access.
+  [1]
+
 Experimental fallback can treat matching Python manifest lookups as not found:
   $ cat > check_manifest_get.py <<'PY'
   > from sapling import error, hg, ui as uimod
@@ -389,6 +397,10 @@ but aborts when the source is a restricted file.
   [1]
   $ sl subtree copy --from-path parent/restricted/secret.txt --to-path public/copied-secret.txt -m "copy restricted file"
   abort: path 'parent/restricted' is restricted by ACL 'some-acl'
+  [255]
+  $ sl subtree copy --from-path parent/restricted/secret.txt --to-path public/copied-secret.txt -m "copy restricted file" --config slacl.server-denial-message='Ask the repo owners for access.'
+  abort: path 'parent/restricted' is restricted by ACL 'some-acl'
+  Ask the repo owners for access.
   [255]
   $ test ! -e public/copied-secret.txt || echo BUG: restricted path leaked
 
@@ -760,6 +772,7 @@ reports the restricted path warning.
   > EOF
   warning: rewriting commits with restricted paths (slacl.mixed-commit-mode=warn)
     'restricted' is restricted by ACL 'some-acl'
+  folded 375b4a524931, 8c7b41a4bb4e -> 4579aeb1695c "B"
   warning: results may be incomplete due to path ACLs
     'restricted' is restricted by ACL 'some-acl'
   [1]

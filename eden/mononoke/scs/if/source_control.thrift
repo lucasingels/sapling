@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-include "fb303/thrift/fb303_core.thrift"
 include "thrift/annotation/thrift.thrift"
 include "eden/mononoke/megarepo_api/if/megarepo_configs.thrift"
 include "eden/mononoke/derived_data/if/derived_data_type.thrift"
@@ -132,7 +131,7 @@ struct CommitPathSpecifier {
 
 /// The type of manifest backing a tree ID.
 enum TreeIdType {
-  /// An FsnodeId (legacy default).
+  /// An FsnodeId. No longer supported; retained for wire compatibility.
   FSNODE = 0,
 
   /// A ContentManifestId.
@@ -147,8 +146,7 @@ struct TreeIdSpecifier {
   /// The ID of the tree, obtained from a previous call to the service.
   2: binary id;
 
-  /// The type of the tree ID. If absent, defaults to FSNODE for backward
-  /// compatibility with existing clients.
+  /// Must be CONTENT_MANIFEST. Requests with FSNODE or no type are rejected.
   3: optional TreeIdType id_type;
 }
 
@@ -157,7 +155,7 @@ union TreeSpecifier {
   /// Specify a tree by its path in a commit.
   1: CommitPathSpecifier by_commit_path;
 
-  /// Specify a tree by its id.
+  /// Deprecated: use `by_commit_path` instead.
   2: TreeIdSpecifier by_id;
 }
 
@@ -1289,6 +1287,44 @@ struct RepoLandStackParams {
   9: BookmarkKindRestrictions bookmark_restrictions = BookmarkKindRestrictions.ANY_KIND;
 }
 
+enum RepoRebaseStackMergeResolution {
+  /// Follow the repo's `pushrebase_enable_merge_resolution` knob, the same
+  /// one that governs merge resolution at land time.
+  DEFAULT = 0,
+  /// Any path changed on both sides is a conflict; pure parent swap. This
+  /// includes a commit already present in `onto`, which is only dropped
+  /// when content merging is on.
+  DISABLED = 1,
+}
+
+struct RepoRebaseStackParams {
+  /// Top of the stack to rebase. Must be a draft.
+  1: CommitId head;
+
+  /// The commit the stack sits on; `base..head` is rebased. Must be an
+  /// ancestor of `head` and have derived manifests.
+  2: CommitId base;
+
+  /// Destination. Any ancestry relationship to `base` is allowed: it may be
+  /// a descendant, an ancestor, or unrelated. Must have derived manifests.
+  3: CommitId onto;
+
+  /// The set of commit identity schemes to return in the response.
+  4: set<CommitIdentityScheme> identity_schemes;
+
+  /// Identity schemes for the old commit ids in the response. Defaults to
+  /// `identity_schemes`.
+  5: optional set<CommitIdentityScheme> old_identity_schemes;
+
+  /// Whether paths changed on both sides may be content-merged.
+  6: RepoRebaseStackMergeResolution merge_resolution = RepoRebaseStackMergeResolution.DEFAULT;
+
+  /// Service identity to authorize as.
+  7: optional string service_identity;
+  // 8: reserved for dry_run
+  // 9: reserved for inferring base when absent
+}
+
 struct RepoPrepareCommitsParams {
   /// The list of commits for which data must be derived
   1: list<CommitId> commits;
@@ -1381,7 +1417,7 @@ enum CommitFingerprintVersion {
   /// where available.
   V1 = 1,
   /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
-  /// Requires `derived_data_use_content_manifests` enabled for the repo;
+  /// Requires ContentManifests derived data enabled for the repo;
   /// otherwise the request fails with InvalidRequest (no auto-fallback).
   V2 = 2,
 }
@@ -1450,7 +1486,12 @@ struct CommitCompareOrderedParams {
   // to continue diffing after a previous ordered request reached
   // its limit.
   1: optional Path after_path;
-  // Limit the number of returned paths to this many.
+  // Limit the number of returned paths to this many. Paths omitted by
+  // partial responses (restricted-path denials) never consume this budget:
+  // pages are filled up to the limit with visible entries. The end of
+  // pagination is signaled by the absence of `last_path` in the response
+  // (feed it back as `after_path` to continue), even if a page holds
+  // fewer entries than the limit or is empty.
   2: i64 limit;
 }
 
@@ -1707,6 +1748,18 @@ struct CommitRunHooksParams {
   /// (instead of the calling client's identities). Does not affect
   /// repository access control, which still uses the caller's identity.
   3: optional RunAsIdentities run_as;
+  /// If set, hooks evaluate the commit as if it carried this message instead
+  /// of the stored one. Lets callers preview the outcome for a commit whose
+  /// message will be regenerated before landing (e.g. from live review
+  /// state). Only affects this dry run's reported verdicts; a real push
+  /// always evaluates the pushed commit.
+  4: optional string override_commit_message;
+  /// If set, the response includes rejections from hooks configured as
+  /// log-only instead of showing them as accepted. Lets callers preview what
+  /// a hook would do once enforcing while it is still being rolled out.
+  /// Does not make anything enforce: it only changes what this dry run
+  /// reports.
+  5: optional bool include_log_only_rejections;
 }
 
 /// Parameters for checking commit rate limits.
@@ -2046,6 +2099,10 @@ struct RepoCreationRequest {
   /// symref is written; clones of the repo will have no default branch until
   /// one is created manually (mononoke_admin git-symref).
   6: optional string default_branch;
+  /// Create the repo read-only. Writers must hold `bypass_readonly` on the
+  /// repo's ACL; the GitHub mirror sync does, and passes gitimport
+  /// --bypass-readonly. Defaults to false (writable).
+  7: optional bool readonly;
 }
 
 struct CreateReposParams {
@@ -2411,6 +2468,33 @@ struct RepoLandStackResponse {
   1: PushrebaseOutcome pushrebase_outcome;
 }
 
+struct RepoRebaseStackRebasedCommit {
+  1: map<CommitIdentityScheme, CommitId> old_ids;
+  /// Empty when `dropped`.
+  2: map<CommitIdentityScheme, CommitId> new_ids;
+  /// Paths whose content the server 3-way merged in this commit. Empty
+  /// means a pure parent swap, where a client merge driver would not have
+  /// run either.
+  3: list<Path> merged_paths;
+  /// Every change in this commit was already present in the new parent, so
+  /// no commit was created, as `sl rebase` would do. Nothing records a
+  /// successor for it.
+  4: bool dropped;
+}
+
+struct RepoRebaseStackResponse {
+  /// The new head. Equal to `onto` when every commit was dropped.
+  1: map<CommitIdentityScheme, CommitId> head;
+  /// Bottom to top, one entry per commit in `base..head`.
+  2: list<RepoRebaseStackRebasedCommit> rebased_commits;
+  /// Paths changed both in the stack and between `base` and `onto`. Always
+  /// 0 on a successful call with merging disabled, since any overlap is
+  /// then a conflict.
+  3: i64 overlapping_path_count;
+  /// Distinct paths the server content-merged.
+  4: i64 merged_path_count;
+}
+
 struct RepoPrepareCommitsResponse {}
 
 struct RepoUploadFileContentResponse {
@@ -2431,6 +2515,24 @@ union RepoUpdateSubmoduleExpansionResult {
   2: MegarepoAsynchronousRequestError error;
 }
 
+/// Partial-response signal: when the server omits entries due to
+/// restricted-path denials instead of failing the request, it sets this
+/// field so typed clients get an exact verdict. `partial` is true iff
+/// entries were omitted; `omitted_restricted_paths_count` carries the count
+/// when known up front (unary) and is absent when the count lives only in
+/// Scuba (streams). The field is populated when partial responses are
+/// allowed for the request: the `scs_enable_partial_responses` killswitch
+/// is on for the repo, or the client sent the opt-in request header,
+/// unless the client sent the opt-out request header. Its
+/// absence means the server does not support partial responses, or they
+/// are not allowed for this request. For diffs, both sides of an entry
+/// are counted separately: one omitted entry can contribute 2 to the
+/// count.
+struct PartialResponseInfo {
+  1: bool partial;
+  2: optional i64 omitted_restricted_paths_count;
+}
+
 struct CommitCompareResponse {
   /// List of the files that are different between commits with their metadata
   /// Can be used for subsequent `commit_path_diff` calls for file-level diffs.
@@ -2445,12 +2547,17 @@ struct CommitCompareResponse {
   /// This is the last path that was produced, suitable for passing into
   /// the `after_path` parameter of a subsequent ordered request.
   4: optional Path last_path;
+  /// Partial-response verdict. See PartialResponseInfo.
+  5: optional PartialResponseInfo partial_info;
 }
 
 struct CommitFileDiffsResponseElement {
   1: optional Path base_path;
   2: optional Path other_path;
-  3: Diff diff;
+  /// Absent when both sides of the requested pair were denied: a
+  /// placeholder preserving request order, so clients correlate by
+  /// position. Both paths are absent too.
+  3: optional Diff diff;
   4: optional CommitId other_commit_id;
 }
 
@@ -2463,6 +2570,8 @@ struct CommitFileDiffsResponse {
   1: list<CommitFileDiffsResponseElement> path_diffs;
   /// The first pair for which a diff was not returned. Start next request from this pair if you want to resume.
   2: optional CommitFileDiffsStoppedAtPair stopped_at_pair;
+  /// Partial-response verdict. See PartialResponseInfo.
+  3: optional PartialResponseInfo partial_info;
 }
 
 struct CommitLookupResponse {
@@ -2491,6 +2600,8 @@ struct CommitLookupPushrebaseHistoryResponse {
 struct CommitFindFilesResponse {
   /// The files that match.
   1: list<string> files;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitFindFilesStreamResponse {}
@@ -2498,6 +2609,14 @@ struct CommitFindFilesStreamResponse {}
 struct CommitFindFilesStreamItem {
   /// The files that match.
   1: list<string> files;
+  /// Partial-response verdict, set only on the terminal item.
+  /// The server appends a final item carrying this (with an empty file
+  /// list) when the stream filtered restricted paths; its absence on the
+  /// last item means a complete stream. The end of pagination is signaled
+  /// by a short (or empty) non-terminal page: consume pages
+  /// with `after` until one returns fewer than `limit` files. See
+  /// PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitHistoryResponse {
@@ -2660,6 +2779,8 @@ struct CommitMultiplePathInfoResponse {
   ///
   /// Note: requested paths that do not exist are omitted from the map.
   1: map<Path, CommitPathInfoResponse> path_info;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitPathBlameResponse {
@@ -2700,6 +2821,8 @@ struct CommitMultiplePathLastChangedResponse {
   ///
   /// Requested paths that have never existed are omitted.
   1: map<Path, CommitPathLastChange> path_last_change;
+  /// Partial-response verdict. See PartialResponseInfo.
+  2: optional PartialResponseInfo partial_info;
 }
 
 struct CommitRestrictedPathsAccessResponse {
@@ -3052,6 +3175,9 @@ struct DeriveBoundariesParams {
   5: bool use_predecessor_derivation;
   /// Optional config name to select an alternative derived data configuration.
   6: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  7: optional string mapping_key_prefix;
 }
 
 /// Result for derive_boundaries request
@@ -3084,6 +3210,9 @@ struct DeriveSliceParams {
   3: list<DeriveSliceSegment> segments;
   /// Optional config name to select an alternative derived data configuration.
   4: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  5: optional string mapping_key_prefix;
 }
 
 /// Result for derive_slice request
@@ -3135,6 +3264,17 @@ struct DeriveBackfillParams {
   /// Whether to enqueue a MarkTypeEnabled node per repo (cascade-dependent on the
   /// repo's backfill leaves) that records the type as enabled once backfill succeeds.
   10: optional bool auto_enable;
+  /// Optional mapping key prefix to derive under, overriding whatever the selected
+  /// config holds in `mapping_key_prefixes` for this type. Set it to backfill into a
+  /// fresh key namespace (e.g. "r5.") while production keeps serving from the old
+  /// one, then land the same prefix in config to cut over. Unset (the default)
+  /// derives under the config's own prefix, preserving the previous behavior.
+  ///
+  /// The prefix must match the one later written to the repo's config, otherwise the
+  /// backfilled data is unreachable and will be silently re-derived. Because of that
+  /// this is rejected together with `auto_enable`, whose enablement path cannot write
+  /// a prefix.
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill request
@@ -3176,6 +3316,9 @@ struct DeriveBackfillRepoParams {
   /// Whether to enqueue a MarkTypeEnabled node (cascade-dependent on this repo's
   /// backfill leaves) that records the type as enabled once backfill succeeds.
   10: bool auto_enable;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill_repo request
@@ -3236,6 +3379,8 @@ enum RequestErrorKind {
   MERGE_CONFLICTS = 11,
   LARGE_REPO_NOT_FOUND = 12,
   REDACTED = 13,
+  /// A commit the request needs a derived manifest for has none yet.
+  MANIFEST_NOT_DERIVED = 14,
 }
 
 stateful client exception RequestError {
@@ -3326,6 +3471,9 @@ stateful client exception RestrictedPathsAuthorizationError {
   2: RestrictedPathAccess access;
   /// Group name only, e.g. "gradient_source_control".
   3: string permission_request_group;
+  /// Repo-configured text appended to `reason`; exposed separately so clients
+  /// that format their own message can show it.
+  4: optional string denial_message;
 }
 
 /// Service Definition
@@ -3334,7 +3482,7 @@ stateful client exception RestrictedPathsAuthorizationError {
 @thrift.DeprecatedUnvalidatedAnnotations{
   items = {"sr.service_name": "mononoke-scs-server"},
 }
-service SourceControlService extends fb303_core.BaseService {
+service SourceControlService {
   /// Global methods
   /// ==============
 
@@ -3530,6 +3678,19 @@ service SourceControlService extends fb303_core.BaseService {
     3: PushrebaseConflictsException pushrebase_conflicts,
     4: HookRejectionsException hook_rejections,
     5: OverloadError overload_error,
+  );
+
+  /// Rebase a draft stack onto a commit without moving any bookmark. Runs
+  /// no hooks and never derives data for the inputs; see
+  /// `RepoRebaseStackParams`.
+  RepoRebaseStackResponse repo_rebase_stack(
+    1: RepoSpecifier repo,
+    2: RepoRebaseStackParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: PushrebaseConflictsException pushrebase_conflicts,
+    4: OverloadError overload_error,
   );
 
   /// Derive data for commits in a repo

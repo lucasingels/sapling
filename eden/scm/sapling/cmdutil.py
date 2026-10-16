@@ -337,17 +337,21 @@ def setupwrapcolorwrite(ui):
     return oldwrite
 
 
-def filterchunks(ui, originalhunks, usecurses, testfile, operation=None):
-    if usecurses:
+def filterchunks(ui, originalhunks, interface, testfile, operation=None):
+    if interface == "curses":
         if testfile:
             recordfn = crecordmod.testdecorator(testfile, crecordmod.testchunkselector)
         else:
             recordfn = crecordmod.chunkselector
 
         return crecordmod.filterpatch(ui, originalhunks, recordfn, operation)
+    if interface == "repl":
+        from . import repl_record
 
-    else:
-        return patch.filterpatch(ui, originalhunks, operation)
+        return crecordmod.filterpatch(
+            ui, originalhunks, repl_record.chunkselector, operation
+        )
+    return patch.filterpatch(ui, originalhunks, operation)
 
 
 def recordfilter(ui, originalhunks, operation=None):
@@ -357,15 +361,20 @@ def recordfilter(ui, originalhunks, operation=None):
     kind of filtering they are doing: reverting, committing, shelving, etc.
     (see patch.filterpatch).
     """
-    usecurses = crecordmod.checkcurses(ui)
+    interface = ui.interface("chunkselector")
+    if interface == "curses" and not crecordmod.checkcurses(ui):
+        interface = "text"
     testfile = ui.config("experimental", "crecordtest")
-    oldwrite = setupwrapcolorwrite(ui)
+    oldwrite = None
+    if interface != "repl":
+        oldwrite = setupwrapcolorwrite(ui)
     try:
         newchunks, newopts = filterchunks(
-            ui, originalhunks, usecurses, testfile, operation
+            ui, originalhunks, interface, testfile, operation
         )
     finally:
-        ui.writebytes = oldwrite
+        if oldwrite is not None:
+            ui.writebytes = oldwrite
     return newchunks, newopts
 
 
@@ -877,6 +886,9 @@ def logmessage(repo, opts):
 
     message = opts.get("message")
     logfile = opts.get("logfile")
+    # Typed -m values are lists. Commands that fill in an existing message
+    # (amend, graft, shelve, --reuse-message) pass a str, which is not checked.
+    typed = isinstance(message, list) or bool(logfile)
 
     if message and logfile:
         raise error.Abort(_("options --message and --logfile are mutually exclusive"))
@@ -892,6 +904,8 @@ def logmessage(repo, opts):
             raise error.Abort(
                 _("can't read commit message '%s': %s") % (logfile, inst.strerror)
             )
+    if typed and message:
+        _checkescapednewlines(ui, message)
 
     message = _update_commit_message_fields(
         message,
@@ -900,6 +914,43 @@ def logmessage(repo, opts):
     )
 
     return message
+
+
+def _checkescapednewlines(ui, message):
+    r"""Abort agents and warn humans if the title has a typed "\n" before a field.
+
+    The "\n" is stored as two characters, so the whole message becomes the
+    title. Only the title is checked: a body may quote "\n" on purpose.
+    """
+    title = message.lstrip().split("\n", 1)[0]
+    fields = ui.configlist("committemplate", "commit-message-fields")
+    if "\\n" not in title or not fields:
+        return
+    if not ui.configbool("commit", "check-escaped-newlines", True):
+        return
+    match = re.search(
+        r"\\n\s*(%s):" % "|".join(re.escape(field) for field in fields),
+        title,
+        re.IGNORECASE,
+    )
+    if not match:
+        return
+    if ui.plain():
+        ui.metrics.inc("commit.escapednewline.automation_allowed", 1)
+        return
+
+    msg = _("commit message title contains a '\\n' escape sequence before '%s:'") % (
+        match.group(1)
+    )
+    hint = _(
+        "use literal newlines instead of '\\n' escape sequences, "
+        "which @Product@ does not interpret"
+    )
+    if bindings.agentdetect.is_agent():
+        ui.metrics.inc("commit.escapednewline.agent_rejected", 1)
+        raise error.Abort(msg, hint=hint)
+    ui.metrics.inc("commit.escapednewline.human_warned", 1)
+    ui.warn(_("warning: %s\n(%s)\n") % (msg, hint))
 
 
 def _update_commit_message_fields(
@@ -4073,6 +4124,15 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
 
         changes = len(filestoamend) > 0
         if changes:
+            if mergemod.is_noconflict_merge(old):
+                raise error.Abort(
+                    _(
+                        "cannot amend conflict-free merge %s: it must stay the "
+                        "automatic merge of its parents"
+                    )
+                    % old,
+                    hint=_("commit the change on top of it instead"),
+                )
             # Recompute copies (avoid recording a -> b -> a)
             copied = copies.pathcopies(base, wctx, matcher)
             if old.p2:
@@ -4466,19 +4526,16 @@ def commitforceeditor(
     # make in-memory changes visible to external process
     tr = repo.currenttransaction()
     repo.dirstate.write(tr)
-    if tr and tr.writepending():
-        pending = repo.root
-        sharedpending = repo.sharedroot
-    else:
-        pending = sharedpending = None
+    pendingenv = {}
+    if tr:
+        tr.writepending(env=pendingenv)
 
     editortext = repo.ui.edit(
         committext,
         ctx.user(),
         ctx.extra(),
         editform=editform,
-        pending=pending,
-        sharedpending=sharedpending,
+        env=pendingenv,
         repopath=repo.path,
         action="commit",
     )

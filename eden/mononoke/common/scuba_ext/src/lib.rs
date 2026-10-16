@@ -109,7 +109,13 @@ impl MononokeScubaSampleBuilder {
         scuba_logging_type: ScubaLoggingType,
     ) -> Result<ScubaSampleBuilder, IoError> {
         Ok(match scuba_logging_type {
+            #[cfg(fbcode_build)]
             ScubaLoggingType::ScubaTable(scuba_table) => ScubaSampleBuilder::new(fb, scuba_table),
+            #[cfg(not(fbcode_build))]
+            ScubaLoggingType::ScubaTable(scuba_table) => {
+                let _ = fb;
+                ScubaSampleBuilder::new(scuba_table)
+            }
             ScubaLoggingType::LocalFile(path) => {
                 ScubaSampleBuilder::with_discard().with_log_file(path)?
             }
@@ -167,14 +173,20 @@ impl MononokeScubaSampleBuilder {
 
     /// Log the tenancy-relevant client fields to Scuba
     pub fn add_tenant_info(&mut self, tenant: &TenantInfo) -> &mut Self {
-        self.inner.add("client_category", tenant.category.as_str());
+        let tenancy_path_v2 = tenant.tenancy_path_v2().map(|path| path.join("/"));
+
         self.inner
-            .add_opt("ci_purpose", tenant.ci_purpose.as_deref());
+            .add("client_category", tenant.category().as_str());
+        self.inner.add_opt("ci_purpose", tenant.ci_purpose());
         self.inner
-            .add_opt("client_atlas_env_id", tenant.atlas_env_id.as_deref());
-        self.inner.add_opt("client_atlas_rl", tenant.atlas_rl);
+            .add_opt("client_atlas_env_id", tenant.atlas_env_id());
+        self.inner.add_opt("client_atlas_rl", tenant.atlas_rl());
         self.inner
-            .add_opt("client_faas_job_name", tenant.faas_job_name.as_deref());
+            .add_opt("client_atlas_purpose", tenant.atlas_purpose());
+        self.inner
+            .add_opt("client_faas_job_name", tenant.faas_job_name());
+        self.inner
+            .add_opt("rim_tenancy_path_v2", tenancy_path_v2.as_deref());
         self
     }
 
@@ -199,6 +211,23 @@ impl MononokeScubaSampleBuilder {
                 .map(|i| i.to_typed_string())
                 .collect::<Vec<_>>(),
         );
+
+        if let Some(forwarded) = metadata.unverified_forwarded_identities() {
+            self.inner.add(
+                "unverified_forwarded_identities",
+                forwarded.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            );
+        }
+        self.inner.add_opt(
+            "forwarded_cats_verifier",
+            metadata.forwarded_cats_verifier(),
+        );
+        if let Some(verifiers) = metadata.forwarded_cats_token_verifiers() {
+            self.inner.add(
+                "forwarded_cats_token_verifiers",
+                verifiers.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            );
+        }
 
         if let Some(client_hostname) = metadata.client_hostname() {
             // "source_hostname" to remain compatible with historical logging

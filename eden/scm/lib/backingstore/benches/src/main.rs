@@ -209,10 +209,10 @@ impl TempDirExt for tempfile::TempDir {
             match identity::sniff_dir(&root).unwrap() {
                 Some(id) => {
                     let dot_path = root.join(id.dot_dir());
-                    if let Some((_shared_dot_path, shared_root, _ident)) =
+                    if let Some((shared_path, _ident)) =
                         repo::repo::read_sharedpath(&dot_path).unwrap()
                     {
-                        root = shared_root;
+                        root = shared_path;
                     }
                     break;
                 }

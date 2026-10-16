@@ -20,10 +20,7 @@ from eden.fs.cli.doctor.problem import (
     ProblemTracker,
     RemediationError,
 )
-from eden.fs.cli.util import (
-    get_environment_suitable_for_subprocess,
-    is_edenfs_mount_device,
-)
+from eden.fs.cli.util import get_environment_suitable_for_subprocess, is_edenfs_mount
 
 
 def check_for_stale_mounts(
@@ -231,15 +228,15 @@ def get_stale_eden_mount_points(
 
         try:
             mount_table.check_path_access(eden_dir, mount_type)
-        except OSError as e:
-            if e.errno == errno.ENOTCONN or e.errno == errno.ENXIO:
+        except OSError as error:
+            if error.errno == errno.ENOTCONN or error.errno == errno.ENXIO:
                 stale_eden_mount_points.add(mount_point)
-            elif e.errno == errno.ETIMEDOUT:
+            elif error.errno == errno.ETIMEDOUT:
                 hung_eden_mount_points.add(mount_point)
             else:
                 log.warning(
                     f"Unclear whether {printable_bytes(mount_point)} "
-                    f"is stale or not. lstat() failed: {e}"
+                    f"is stale or not. lstat() failed: {error}"
                 )
                 unknown_status_eden_mount_points.add(mount_point)
 
@@ -270,7 +267,7 @@ def get_all_eden_mount_points(mount_table: mtab.MountTable) -> Set[Tuple[bytes, 
     all_system_mounts = mount_table.read()
     eden_mounts = set()
     for mount in all_system_mounts:
-        if is_edenfs_mount_device(mount.device):
+        if is_edenfs_mount(mount.device, mount.vfstype):
             if (
                 mount.vfstype == b"fuse"
                 or mount.vfstype == b"macfuse_eden"

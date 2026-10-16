@@ -41,6 +41,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+mod auth;
 mod claimer;
 mod client;
 mod dispatcher;
@@ -57,6 +58,8 @@ mod response;
 mod stats;
 mod stream;
 
+pub use auth::AuthResolver;
+pub use auth::ResolvedAuth;
 pub use client::Config;
 pub use client::HttpClient;
 pub use client::ResponseFuture;
@@ -99,11 +102,11 @@ pub fn shutdown() {
     SHUTTING_DOWN.store(true, Ordering::Release);
 }
 
-pub(crate) fn init_openssl() {
+pub fn init_openssl() {
     // Force openssl to initialize to to work around openssl bug
     // https://github.com/openssl/openssl/issues/6214. Initializing openssl explicitly
     // causes openssl to use OPENSSL_INIT_NO_ATEXIT which avoids shutdown race conditions
-    // (but not shutting down openssl). If we don't explicitly innitialize, curl
+    // (but not shutting down openssl). If we don't explicitly initialize, curl
     // initializes openssl without OPENSSL_INIT_NO_ATEXIT and we get the race conditions.
     openssl::init();
 }

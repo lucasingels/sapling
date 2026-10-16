@@ -214,6 +214,11 @@ pub struct RepoConfig {
     pub readonly: RepoReadOnly,
     /// Should files be checked for redaction
     pub redaction: Redaction,
+    /// When true, an upload to this repo may bypass redaction (log-only, not
+    /// blocked) if the caller holds the mirror_upload permission. Set only on
+    /// AWS Operational Shadow replica repos, which modern_sync keeps identical
+    /// to a source repo. Defaults to false: redaction is enforced.
+    pub mirror_upload_redaction_bypass_enabled: bool,
     /// Params for the hook manager
     pub hook_manager_params: Option<HookManagerParams>,
     /// Max number of results in listkeyspatterns.
@@ -255,6 +260,8 @@ pub struct RepoConfig {
     /// deep-sharded: In addition to requests, repo is also sharded, i.e. present
     /// on select servers.
     pub deep_sharding_config: Option<ShardingModeConfig>,
+    /// Whether the repo is built on its first request rather than on assignment.
+    pub lazy_loading_config: Option<LazyLoadingConfig>,
     /// Local directory to write files to instead of uploading to everstore
     pub everstore_local_path: Option<String>,
     /// Configuration for the repo metadata logger
@@ -317,6 +324,17 @@ pub struct ShardingModeConfig {
     pub status: HashMap<ShardedService, bool>,
 }
 
+/// Lazy is opt-in: anything short of an explicit `true` is eager, so neither
+/// field is optional here although both are in the thrift.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct LazyLoadingConfig {
+    /// Per sharded service.
+    pub sharded: HashMap<ShardedService, bool>,
+    /// For a task running without ShardManager, which has no per-service
+    /// identity in config.
+    pub unsharded: bool,
+}
+
 /// Mononoke services for which sharding can be enabled.
 #[derive(Eq, Clone, Debug, PartialEq, Hash)]
 pub enum ShardedService {
@@ -358,6 +376,8 @@ pub enum ShardedService {
     GitBundleGenerator,
     /// Derivation Pipeline Tailer
     DerivationPipelineTailer,
+    /// Derivation Pipeline Worker
+    DerivationPipelineWorker,
 }
 
 /// Indicates types of commit hashes used in a repo context.
@@ -1041,9 +1061,6 @@ pub struct PushrebaseFlags {
     /// them will be rejected as before so downstream checks (e.g. Hack
     /// type-checking in CI land) still trigger.
     pub merge_resolution_excluded_path_prefixes: PrefixTrie,
-    /// Bookmarks that use pessimistic locking for pushrebase.
-    /// Only effective when the pushrebase_pessimistic_locking JustKnob is enabled.
-    pub pessimistic_locking_bookmarks: Vec<BookmarkKey>,
     /// Per-request override for `pushrebase_enable_merge_resolution`.
     /// `UseJk` defers to the JustKnob; `ForceOn`/`ForceOff` wins. Request-scoped,
     /// never loaded from configerator — set on a cloned `PushrebaseFlags`
@@ -1180,7 +1197,6 @@ impl Default for PushrebaseFlags {
             not_generated_filenodes_limit: 500,
             monitoring_bookmark: None,
             merge_resolution_excluded_path_prefixes: PrefixTrie::new(),
-            pessimistic_locking_bookmarks: Vec::new(),
             merge_resolution_override: MergeResolutionOverride::UseJk,
             land_instance_id: None,
             phab_diff_id: None,
@@ -2550,13 +2566,12 @@ impl AclManifestMode {
 /// Multiple sets are evaluated with OR semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnforcementConditionSet {
-    /// If true, this set always matches — skips entry_points and
+    /// If true, this set always matches — skips the request matchers and
     /// require_client_request_flag checks.
     pub always_enabled: bool,
-    /// Client entry points that trigger enforcement (e.g. "ScsServer", "EdenApi").
-    /// Empty = match all entry points.
-    pub entry_points: Vec<String>,
-    /// Temporary: if true, client must send server_side_tenting=true in metadata.
+    /// Temporary: if true, the client must also flag enforcement support:
+    /// server_side_tenting=true in SLAPI request metadata, or either
+    /// partial-responses header on SCS thrift requests.
     /// Used during the initial rollout stage so clients can opt in to enforcement
     /// and disable it if it causes issues. Should be removed once rollout is complete.
     // TODO(T248658346): Remove this field once path ACL enforcement is fully rolled out.
@@ -2565,18 +2580,79 @@ pub struct EnforcementConditionSet {
     /// Non-empty = match only when the access result's `restriction_acls`
     /// overlaps this list.
     pub restriction_acls: Vec<MononokeIdentity>,
-    /// Machine tiers (MACHINE_TIER identity values) that trigger enforcement.
+    /// Request-metadata matchers that trigger enforcement.
+    pub matchers: RequestMatchers,
+}
+
+/// Request-metadata matchers of an enforcement condition or exemption set.
+/// All non-empty fields must match (AND); `is_agent: None` does not filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestMatchers {
+    /// Client entry points to match, in their `ClientEntryPoint` display form
+    /// (e.g. "scs", "eden_api").
+    /// Empty = don't filter on this dimension.
+    pub entry_points: Vec<String>,
+    /// Caller machine tiers (MACHINE_TIER identity values) to match.
     /// Empty = don't filter on this dimension.
     pub machine_tiers: Vec<String>,
-    /// Server build rules (the running binary's `build_info` build rule) that
-    /// trigger enforcement. Empty = don't filter on this dimension. Match = the
-    /// server's own build_rule (the value `add_common_server_data` logs to scuba)
-    /// appears in this list.
+    /// Server build rules (the running binary's `build_info` build rule) to
+    /// match. Empty = don't filter on this dimension. Match = the server's own
+    /// build_rule (the value `add_common_server_data` logs to scuba) appears in
+    /// this list.
     pub build_rules: Vec<String>,
     /// Regexes evaluated against each caller identity's `"TYPE:value"` form.
     /// Empty = don't filter on this dimension. Substring semantics
     /// (`Regex::is_match`). Invalid regexes are rejected at config parse time.
     pub client_identity_regexes: Vec<ComparableRegex>,
+    /// `None` = don't filter on this dimension; `Some(want)` = match only callers
+    /// whose `Metadata::likely_an_agent()` equals `want`.
+    pub is_agent: Option<bool>,
+}
+
+impl RequestMatchers {
+    /// Whether any matcher filters on anything at all.
+    pub fn has_matcher(&self) -> bool {
+        !self.entry_points.is_empty()
+            || !self.machine_tiers.is_empty()
+            || !self.build_rules.is_empty()
+            || !self.client_identity_regexes.is_empty()
+            || self.is_agent.is_some()
+    }
+}
+
+/// A set of request-metadata matchers that switches path ACL enforcement off
+/// for accesses it matches, overriding every matching
+/// [`EnforcementConditionSet`].
+///
+/// An exemption only changes whether an access is enforced, never whether the
+/// caller is authorized. Unlike a condition set it has no `always_enabled`,
+/// `require_client_request_flag` or `restriction_acls`: those would exempt
+/// every access, let a client switch its own enforcement off, or exempt a
+/// whole multi-tent access when only one of its tents matched.
+///
+/// An exemption always has at least one matcher: one without would match, and
+/// so exempt, every access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcementExemptionSet {
+    matchers: RequestMatchers,
+}
+
+impl EnforcementExemptionSet {
+    /// An exemption that applies to requests matching `matchers`, which must
+    /// filter on at least one dimension.
+    pub fn new(matchers: RequestMatchers) -> Result<Self> {
+        if !matchers.has_matcher() {
+            bail!(
+                "exemptions must set at least one of `entry_points`, `machine_tiers`, `build_rules`, `client_identity_regexes` or `is_agent`"
+            );
+        }
+        Ok(Self { matchers })
+    }
+
+    /// The request-metadata matchers the exemption applies to.
+    pub fn matchers(&self) -> &RequestMatchers {
+        &self.matchers
+    }
 }
 
 /// Parse a bare AMP group name into a `GROUP:` identity.
@@ -2654,11 +2730,17 @@ pub struct RestrictedPathsConfig {
     pub acl_file_name: String,
     /// Condition sets for conditional enforcement. OR across sets, AND within.
     pub enforcement_condition_sets: Vec<EnforcementConditionSet>,
+    /// Sets that switch enforcement off for accesses they match, overriding
+    /// every matching condition set (including `always_enabled` ones). OR
+    /// across sets, AND within.
+    pub enforcement_exemption_sets: Vec<EnforcementExemptionSet>,
     /// Master kill switch for path ACL enforcement.
     /// Defaults to `false` so a repo with no explicit value gets no enforcement.
     pub enforcement_enabled: bool,
     /// 4-stage rollout state for AclManifest. Defaults to `Disabled`.
     pub acl_manifest_mode: AclManifestMode,
+    /// Free text appended to restricted-path denial errors.
+    pub denial_message: Option<String>,
 }
 
 const DEFAULT_ACL_FILE_NAME: &str = ".slacl";
@@ -2673,8 +2755,10 @@ impl Default for RestrictedPathsConfig {
             admin_bypass_group: None,
             acl_file_name: DEFAULT_ACL_FILE_NAME.to_string(),
             enforcement_condition_sets: Vec::new(),
+            enforcement_exemption_sets: Vec::new(),
             enforcement_enabled: false,
             acl_manifest_mode: AclManifestMode::Disabled,
+            denial_message: None,
         }
     }
 }
@@ -2791,6 +2875,27 @@ mod tests {
 
     fn mp(s: &str) -> MPath {
         MPath::new(s.as_bytes()).unwrap()
+    }
+
+    // What it tests: an exemption set must filter on at least one request
+    // dimension.
+    // Expected: empty matchers are rejected, and a single matcher is accepted.
+    #[mononoke::test]
+    fn test_enforcement_exemption_set_requires_a_matcher() -> Result<()> {
+        assert!(
+            EnforcementExemptionSet::new(RequestMatchers::default()).is_err(),
+            "an exemption without a matcher would exempt every access"
+        );
+        let exemption = EnforcementExemptionSet::new(RequestMatchers {
+            is_agent: Some(true),
+            ..Default::default()
+        })?;
+        assert_eq!(
+            exemption.matchers().is_agent,
+            Some(true),
+            "an exemption with a matcher should keep it"
+        );
+        Ok(())
     }
 
     #[mononoke::test]

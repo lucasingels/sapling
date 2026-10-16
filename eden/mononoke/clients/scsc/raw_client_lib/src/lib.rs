@@ -7,9 +7,13 @@
 
 //! Raw SCS Client.
 
+use std::collections::HashMap;
+use std::iter::once;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Error;
@@ -22,13 +26,15 @@ use clientinfo::ClientRequestInfo;
 use fbinit::FacebookInit;
 #[cfg(not(target_os = "windows"))]
 use identity::IdentitySet;
-use maplit::hashmap;
 use sharding_ext::encode_repo_name;
 pub use source_control as thrift;
 use source_control_clients::SourceControlService;
 use source_control_x2pclients::build_SourceControlService_client;
 
 pub const SCS_DEFAULT_TIER: &str = "shardmanager:mononoke.scs";
+const SCS_PATH_ACL_COMPATIBLE_HEADER: &str = "scs_path_acl_compatible";
+const SCS_PARTIAL_RESPONSES_OPT_IN_HEADER: &str = "scs_partial_responses_opt_in";
+const SCS_PARTIAL_RESPONSES_OPT_OUT_HEADER: &str = "scs_partial_responses_opt_out";
 
 #[cfg(not(target_os = "windows"))]
 const CONN_TIMEOUT_MS: u32 = 5000;
@@ -44,6 +50,7 @@ pub struct ScsClientBuilder {
     processing_timeout: Option<Duration>,
     cat: Option<String>,
     client_correlator: Option<String>,
+    extra_headers: HashMap<String, String>,
 }
 
 impl ScsClientBuilder {
@@ -57,6 +64,7 @@ impl ScsClientBuilder {
             processing_timeout: None,
             cat: None,
             client_correlator: None,
+            extra_headers: HashMap::new(),
         }
     }
 
@@ -94,6 +102,39 @@ impl ScsClientBuilder {
         self
     }
 
+    /// Test/admin-only hook: extra persistent request headers.
+    pub fn with_extra_headers(mut self, extra_headers: HashMap<String, String>) -> Self {
+        self.extra_headers = extra_headers;
+        self
+    }
+
+    /// Mark every request made by this client as compatible with path ACL enforcement.
+    pub fn with_path_acl_compatible(mut self) -> Self {
+        self.extra_headers
+            .insert(SCS_PATH_ACL_COMPATIBLE_HEADER.to_owned(), "1".to_owned());
+        self
+    }
+
+    /// Ask the server for partial responses to restricted-path denials
+    /// instead of whole-request failures.
+    pub fn with_partial_responses_opt_in(mut self) -> Self {
+        self.extra_headers.insert(
+            SCS_PARTIAL_RESPONSES_OPT_IN_HEADER.to_owned(),
+            "1".to_owned(),
+        );
+        self
+    }
+
+    /// Ask the server to fail restricted-path denials instead of returning
+    /// partial responses.
+    pub fn with_partial_responses_opt_out(mut self) -> Self {
+        self.extra_headers.insert(
+            SCS_PARTIAL_RESPONSES_OPT_OUT_HEADER.to_owned(),
+            "1".to_owned(),
+        );
+        self
+    }
+
     pub fn build(self) -> Result<ScsClient, Error> {
         build_from_tier_name(
             self.fb,
@@ -104,8 +145,14 @@ impl ScsClientBuilder {
             self.processing_timeout,
             self.cat,
             self.client_correlator,
+            self.extra_headers,
         )
     }
+}
+
+/// The active Artillery trace context (if any) as outgoing header key/value pairs
+fn artillery_trace_headers() -> Vec<(String, String)> {
+    art_cli_lite_rs::outgoing("thrift", "SourceControlService")
 }
 
 /// Build a scsclient from a tier name via servicerouter.
@@ -119,14 +166,17 @@ fn build_from_tier_name_via_sr(
     processing_timeout: Option<Duration>,
     cat: Option<String>,
     client_correlator: Option<String>,
+    extra_headers: HashMap<String, String>,
 ) -> Result<ScsClient, Error> {
     use source_control_srclients::make_SourceControlService_srclient;
     use srclient::ClientParams;
 
     let (client_info, correlator) = new_scs_client_info(client_correlator);
-    let headers = hashmap! {
-        String::from(CLIENT_INFO_HEADER) => client_info.to_json()?,
-    };
+    let headers: HashMap<String, String> =
+        once((String::from(CLIENT_INFO_HEADER), client_info.to_json()?))
+            .chain(artillery_trace_headers())
+            .chain(extra_headers)
+            .collect();
 
     let client_params = ClientParams::new()
         .with_client_id(client_id)
@@ -156,6 +206,7 @@ fn build_from_tier_name_via_sr(
 
     Ok(ScsClient {
         client,
+        partial_response: Arc::new(AtomicBool::new(false)),
         correlator: Some(correlator),
     })
 }
@@ -171,6 +222,7 @@ fn build_from_tier_name_via_sr(
     _processing_timeout: Option<Duration>,
     _cat: Option<String>,
     _client_correlator: Option<String>,
+    _extra_headers: HashMap<String, String>,
 ) -> Result<ScsClient, Error> {
     Err(anyhow!(
         "Connection via ServiceRouter is not supported on this platform"
@@ -187,11 +239,14 @@ fn build_from_tier_name_via_x2p(
     _processing_timeout: Option<Duration>,
     cat: Option<String>,
     client_correlator: Option<String>,
+    extra_headers: HashMap<String, String>,
 ) -> Result<ScsClient, Error> {
     let (client_info, correlator) = new_scs_client_info(client_correlator);
-    let headers = hashmap! {
-        String::from(CLIENT_INFO_HEADER) => client_info.to_json()?,
-    };
+    let headers: HashMap<String, String> =
+        once((String::from(CLIENT_INFO_HEADER), client_info.to_json()?))
+            .chain(artillery_trace_headers())
+            .chain(extra_headers)
+            .collect();
 
     let channel = x2pclient::X2pClientBuilder::from_service_name(fb, tier.as_ref())
         .with_client_id(client_id)
@@ -206,6 +261,7 @@ fn build_from_tier_name_via_x2p(
 
     Ok(ScsClient {
         client,
+        partial_response: Arc::new(AtomicBool::new(false)),
         correlator: Some(correlator),
     })
 }
@@ -220,6 +276,7 @@ fn build_from_tier_name(
     processing_timeout: Option<Duration>,
     cat: Option<String>,
     client_correlator: Option<String>,
+    extra_headers: HashMap<String, String>,
 ) -> Result<ScsClient, Error> {
     match x2pclient::get_env(fb) {
         x2pclient::Environment::Prod => {
@@ -233,6 +290,7 @@ fn build_from_tier_name(
                     processing_timeout,
                     cat,
                     client_correlator,
+                    extra_headers,
                 )
             } else {
                 build_from_tier_name_via_x2p(
@@ -244,6 +302,7 @@ fn build_from_tier_name(
                     processing_timeout,
                     cat,
                     client_correlator,
+                    extra_headers,
                 )
             }
         }
@@ -256,6 +315,7 @@ fn build_from_tier_name(
             processing_timeout,
             cat,
             client_correlator,
+            extra_headers,
         ),
         other_env => Err(anyhow!("{other_env} not supported")),
     }
@@ -263,17 +323,52 @@ fn build_from_tier_name(
 
 pub struct ScsClientHostBuilder {
     client_correlator: Option<String>,
+    extra_headers: HashMap<String, String>,
 }
 
 impl ScsClientHostBuilder {
     pub fn new() -> Self {
         Self {
             client_correlator: None,
+            extra_headers: HashMap::new(),
         }
     }
 
     pub fn with_client_correlator(mut self, client_correlator: Option<String>) -> Self {
         self.client_correlator = client_correlator;
+        self
+    }
+
+    /// Test/admin-only hook: extra persistent request headers.
+    pub fn with_extra_headers(mut self, extra_headers: HashMap<String, String>) -> Self {
+        self.extra_headers = extra_headers;
+        self
+    }
+
+    /// Mark every request made by this client as compatible with path ACL enforcement.
+    pub fn with_path_acl_compatible(mut self) -> Self {
+        self.extra_headers
+            .insert(SCS_PATH_ACL_COMPATIBLE_HEADER.to_owned(), "1".to_owned());
+        self
+    }
+
+    /// Ask the server for partial responses to restricted-path denials
+    /// instead of whole-request failures.
+    pub fn with_partial_responses_opt_in(mut self) -> Self {
+        self.extra_headers.insert(
+            SCS_PARTIAL_RESPONSES_OPT_IN_HEADER.to_owned(),
+            "1".to_owned(),
+        );
+        self
+    }
+
+    /// Ask the server to fail restricted-path denials instead of returning
+    /// partial responses.
+    pub fn with_partial_responses_opt_out(mut self) -> Self {
+        self.extra_headers.insert(
+            SCS_PARTIAL_RESPONSES_OPT_OUT_HEADER.to_owned(),
+            "1".to_owned(),
+        );
         self
     }
 
@@ -284,12 +379,13 @@ impl ScsClientHostBuilder {
         fb: FacebookInit,
         host_port: impl AsRef<str>,
     ) -> Result<ScsClient, Error> {
-        use source_control_thriftclients::make_SourceControlService_thriftclient;
+        use source_control_thriftclients::build_SourceControlService_client;
+        use thriftclient::ThriftChannelBuilder;
 
         let expected_identities = if let Ok(identity) =
             std::env::var("MONONOKE_INTEGRATION_TEST_EXPECTED_THRIFT_SERVER_IDENTITY")
         {
-            IdentitySet::from_iter(std::iter::once(identity.parse()?))
+            IdentitySet::from_iter(once(identity.parse()?))
         } else {
             IdentitySet::new()
         };
@@ -297,16 +393,23 @@ impl ScsClientHostBuilder {
         let mut addrs = host_port.as_ref().to_socket_addrs()?;
         let addr = addrs.next().expect("no address found");
         let (_client_info, correlator) = new_scs_client_info(self.client_correlator);
-        let client = make_SourceControlService_thriftclient!(
-            fb,
-            from_sock_addr = addr,
-            with_conn_timeout = CONN_TIMEOUT_MS,
-            with_recv_timeout = RECV_TIMEOUT_MS,
-            with_secure = true,
-            with_expected_identities = expected_identities,
-        )?;
+
+        let builder = artillery_trace_headers()
+            .into_iter()
+            .chain(self.extra_headers)
+            .fold(
+                ThriftChannelBuilder::from_sock_addr(fb, addr)?
+                    .with_conn_timeout(CONN_TIMEOUT_MS)
+                    .with_recv_timeout(RECV_TIMEOUT_MS)
+                    .with_secure(true)
+                    .with_expected_identities(expected_identities),
+                |b, header| b.with_persistent_header(header),
+            );
+
+        let client = build_SourceControlService_client(builder)?;
         Ok(ScsClient {
             client,
+            partial_response: Arc::new(AtomicBool::new(false)),
             correlator: Some(correlator),
         })
     }
@@ -327,6 +430,7 @@ impl ScsClientHostBuilder {
 #[derive(Clone)]
 pub struct ScsClient {
     client: Arc<dyn SourceControlService + Sync>,
+    partial_response: Arc<AtomicBool>,
     correlator: Option<String>,
 }
 
@@ -334,6 +438,18 @@ impl ScsClient {
     /// Return the correlator for this scsclient.
     pub fn get_client_corrrelator(&self) -> Option<String> {
         self.correlator.clone()
+    }
+
+    /// Record that a response seen by this client carried the
+    /// partial-response signal. Never reset: a client serves one invocation,
+    /// and any partial response taints its output.
+    pub fn note_partial(&self) {
+        self.partial_response.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any response seen by this client was partial.
+    pub fn is_partial(&self) -> bool {
+        self.partial_response.load(Ordering::Relaxed)
     }
 }
 
@@ -393,4 +509,73 @@ fn new_scs_client_info(client_correlator: Option<String>) -> (ClientInfo, String
     let client_info = ClientInfo::new_with_client_request_info(request_info);
 
     (client_info, correlator)
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[mononoke::test]
+    fn path_acl_compatibility_header_is_opt_in() {
+        let builder = ScsClientHostBuilder::new();
+        assert!(
+            !builder
+                .extra_headers
+                .contains_key(SCS_PATH_ACL_COMPATIBLE_HEADER)
+        );
+
+        let builder = builder.with_path_acl_compatible();
+        assert_eq!(
+            builder
+                .extra_headers
+                .get(SCS_PATH_ACL_COMPATIBLE_HEADER)
+                .map(String::as_str),
+            Some("1"),
+        );
+    }
+
+    #[mononoke::test]
+    fn partial_responses_header_is_opt_in() {
+        let builder = ScsClientHostBuilder::new();
+        assert!(
+            !builder
+                .extra_headers
+                .contains_key(SCS_PARTIAL_RESPONSES_OPT_IN_HEADER)
+        );
+
+        let builder = builder.with_partial_responses_opt_in();
+        assert_eq!(
+            builder
+                .extra_headers
+                .get(SCS_PARTIAL_RESPONSES_OPT_IN_HEADER)
+                .map(String::as_str),
+            Some("1"),
+        );
+    }
+
+    #[mononoke::test]
+    fn partial_responses_header_is_opt_out() {
+        let builder = ScsClientHostBuilder::new();
+        assert!(
+            !builder
+                .extra_headers
+                .contains_key(SCS_PARTIAL_RESPONSES_OPT_OUT_HEADER)
+        );
+
+        let builder = builder.with_partial_responses_opt_out();
+        assert_eq!(
+            builder
+                .extra_headers
+                .get(SCS_PARTIAL_RESPONSES_OPT_OUT_HEADER)
+                .map(String::as_str),
+            Some("1"),
+        );
+        assert!(
+            !builder
+                .extra_headers
+                .contains_key(SCS_PARTIAL_RESPONSES_OPT_IN_HEADER)
+        );
+    }
 }

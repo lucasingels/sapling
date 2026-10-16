@@ -250,9 +250,11 @@ class InodeMap {
 
   /**
    * Clear the FS refcount for an inode number.
-   * This is used when we are deleting an inode and want to clear the refcount
+   * This is used when we are deleting an inode and want to clear the refcount.
+   *
+   * Returns true if the inode had a non-zero FS refcount.
    */
-  void clearFsRefcount(InodeNumber number);
+  bool clearFsRefcount(InodeNumber number);
 
   /**
    * See EdenMount::forgetStaleInodes
@@ -412,10 +414,15 @@ class InodeMap {
    * inodeLoadFailed() should only be called by TreeInode (or startChildLookup)
    *
    * This should be called when an attempt to load a child inode fails.
+   * A failure that is the expected outcome of a race, such as a lookup of an
+   * inode that was removed meanwhile, passes logAsError=false to skip the
+   * error log and the error logger. The inode trace event is published
+   * either way.
    */
   void inodeLoadFailed(
       InodeNumber number,
-      const folly::exception_wrapper& exception);
+      const folly::exception_wrapper& exception,
+      bool logAsError = true);
 
   void inodeCreated(const InodePtr& inode);
 
@@ -425,6 +432,8 @@ class InodeMap {
     size_t unloadedInodeCount = 0;
     size_t periodicUnlinkedUnloadInodeCount = 0;
     size_t periodicLinkedUnloadInodeCount = 0;
+    /** Cumulative remembered records removed when FS references reach zero. */
+    size_t forgottenInodeCount = 0;
   };
 
   /**
@@ -455,7 +464,7 @@ class InodeMap {
 
   struct UnloadedInodeGcEntry {
     PathComponent name;
-    EdenTimestamp lastFsRequestTime;
+    EdenTimestamp lastGcRefTime;
     uint32_t numFsReferences;
   };
 
@@ -484,7 +493,7 @@ class InodeMap {
         InodeNumber parentNum,
         PathComponentPiece entryName,
         mode_t mode,
-        EdenTimestamp lastFsRequestTime);
+        EdenTimestamp lastGcRefTime);
 
     UnloadedInode(
         InodeNumber parentNum,
@@ -493,7 +502,7 @@ class InodeMap {
         mode_t mode,
         std::optional<ObjectId> id,
         uint32_t fsRefcount,
-        EdenTimestamp lastFsRequestTime);
+        EdenTimestamp lastGcRefTime);
     UnloadedInode(
         FileInode* inode,
         TreeInode* parent,
@@ -530,7 +539,7 @@ class InodeMap {
      */
     std::optional<ObjectId> const id;
 
-    EdenTimestamp const lastFsRequestTime;
+    EdenTimestamp const lastGcRefTime;
 
     /**
      * A list of promises waiting on this inode to be loaded.
@@ -631,6 +640,12 @@ class InodeMap {
      * hold true to make sure our calculations are correct.
      */
     size_t numFileInodes_{0};
+
+    /**
+     * Running total of inodes forgotten outright by clearFsRefcount() while
+     * unloaded, which the GC sweep therefore never counts as unloaded.
+     */
+    size_t numForgottenInodes_{0};
 
     /**
      * A promise to fulfill once shutdown() completes.

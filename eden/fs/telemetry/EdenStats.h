@@ -33,6 +33,7 @@ struct PrjfsStats;
 struct ObjectStoreStats;
 struct SaplingBackingStoreStats;
 struct JournalStats;
+struct GlobStats;
 struct ThriftStats;
 struct OverlayStats;
 struct InodeMapStats;
@@ -42,6 +43,8 @@ struct TreeCacheStats;
 struct ScmStatusCacheStats;
 struct TakeoverStats;
 struct CheckoutStats;
+struct TreeInodeStats;
+struct CgroupFileCacheStats;
 struct FakeStats;
 
 class EdenStats : public RefCounted {
@@ -58,7 +61,7 @@ class EdenStats : public RefCounted {
   }
 
   template <typename T>
-  void increment(StatsGroupBase::Counter T::* counter, double value = 1.0) {
+  void increment(StatsGroupBase::Counter T::* counter, int64_t value = 1) {
     (getStatsForCurrentThread<T>().*counter).addValue(value);
   }
 
@@ -89,6 +92,7 @@ class EdenStats : public RefCounted {
   ThreadLocal<ObjectStoreStats> objectStoreStats_;
   ThreadLocal<SaplingBackingStoreStats> saplingBackingStoreStats_;
   ThreadLocal<JournalStats> journalStats_;
+  ThreadLocal<GlobStats> globStats_;
   ThreadLocal<ThriftStats> thriftStats_;
   ThreadLocal<TelemetryStats> telemetryStats_;
   ThreadLocal<OverlayStats> overlayStats_;
@@ -99,6 +103,8 @@ class EdenStats : public RefCounted {
   ThreadLocal<ScmStatusCacheStats> scmStatusCacheStats_;
   ThreadLocal<TakeoverStats> takeoverStats_;
   ThreadLocal<CheckoutStats> checkoutStats_;
+  ThreadLocal<TreeInodeStats> treeInodeStats_;
+  ThreadLocal<CgroupFileCacheStats> cgroupFileCacheStats_;
   ThreadLocal<FakeStats> fakeStats_;
 };
 
@@ -134,6 +140,11 @@ EdenStats::getStatsForCurrentThread<SaplingBackingStoreStats>() {
 template <>
 inline JournalStats& EdenStats::getStatsForCurrentThread<JournalStats>() {
   return *journalStats_.get();
+}
+
+template <>
+inline GlobStats& EdenStats::getStatsForCurrentThread<GlobStats>() {
+  return *globStats_.get();
 }
 
 template <>
@@ -186,6 +197,17 @@ inline TakeoverStats& EdenStats::getStatsForCurrentThread<TakeoverStats>() {
 template <>
 inline CheckoutStats& EdenStats::getStatsForCurrentThread<CheckoutStats>() {
   return *checkoutStats_.get();
+}
+
+template <>
+inline TreeInodeStats& EdenStats::getStatsForCurrentThread<TreeInodeStats>() {
+  return *treeInodeStats_.get();
+}
+
+template <>
+inline CgroupFileCacheStats&
+EdenStats::getStatsForCurrentThread<CgroupFileCacheStats>() {
+  return *cgroupFileCacheStats_.get();
 }
 
 template <>
@@ -315,6 +337,10 @@ struct FuseStats : StatsGroup<FuseStats> {
 
   Counter ioUringReplySameThread{"fuse.io_uring_reply_same_thread"};
   Counter ioUringReplyCrossThread{"fuse.io_uring_reply_cross_thread"};
+  Counter ioUringPreCreateQueuesSuccess{
+      "fuse.io_uring_pre_create_queues_success"};
+  Counter ioUringPreCreateQueuesFailure{
+      "fuse.io_uring_pre_create_queues_failure"};
   Counter invalidationQueueThrottleWait{
       "fuse.invalidation.queue_throttle_wait"};
 };
@@ -394,14 +420,10 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsBackpressureJukebox{"nfs.backpressure_jukebox"};
   Counter nfsInflightAtRequest{"nfs.inflight_at_request"};
 
-  // Requests whose AUTH_SYS credential claims root (uid 0) or wheel (gid 0,
-  // root-equivalent on macOS, checked against both the primary gid and the
-  // auxiliary gids).
-  Counter nfsPrivilegedAccessUidRoot{"nfs.privileged_access.uid_root"};
-  Counter nfsPrivilegedAccessGidWheel{"nfs.privileged_access.gid_wheel"};
-
-  // Requests rejected because nfs:root-access-mode / nfs:wheel-access-mode
-  // is set to "block" for an identity class the request claims.
+  // Requests rejected by a "block" or over-budget "rate_limit" entry in
+  // nfs:uid-access-policy / nfs:gid-access-policy.
+  // nfs.{access,policed,blocked}.{uid,gid}.<id> take their id from config, so
+  // they are fb303 dynamic timeseries declared in Nfsd3.cpp, not members here.
   Counter nfsBlockedAccess{"nfs.blocked_access"};
 
   // NFS GC invalidation counters
@@ -409,6 +431,7 @@ struct NfsStats : StatsGroup<NfsStats> {
   Counter nfsInvalidationGcSuccess{"nfs.invalidation.gc.success"};
   Counter nfsInvalidationGcFailure{"nfs.invalidation.gc.failure"};
   Counter nfsInvalidationGcEnoent{"nfs.invalidation.gc.enoent"};
+  Counter nfsInvalidationGcStaleReply{"nfs.invalidation.gc.stale_reply"};
 
   Counter nfsInvalidationGcClearFsRefcountAttempt{
       "nfs.invalidation.gc.clear_fs_refcount.attempt"};
@@ -631,9 +654,6 @@ struct SaplingBackingStoreStats : StatsGroup<SaplingBackingStoreStats> {
   Counter fetchBlobAuxDataLocal{"store.sapling.fetch_blob_metadata_local"};
   Counter fetchBlobAuxDataSuccess{"store.sapling.fetch_blob_metadata_success"};
   Counter fetchBlobAuxDataFailure{"store.sapling.fetch_blob_metadata_failure"};
-  Counter fetchGlobFilesSuccess{"store.sapling.fetch_glob_files_success"};
-  Counter fetchGlobFilesFailure{"store.sapling.fetch_glob_files_failure"};
-  Duration fetchGlobFiles{"store.sapling.fetch_glob_files_us"};
   Counter loadProxyHash{"store.sapling.load_proxy_hash"};
 };
 
@@ -647,25 +667,18 @@ struct JournalStats : StatsGroup<JournalStats> {
   Duration accumulateRange{"journal.accumulate_range_us"};
 };
 
+struct GlobStats : StatsGroup<GlobStats> {
+  Counter memoizedFailureStateLimitExceeded{
+      "glob_match.memoized_failure_state_limit_exceeded"};
+  Counter backtrackingStepLimitExceeded{
+      "glob_match.backtracking_step_limit_exceeded"};
+};
+
 struct ThriftStats : StatsGroup<ThriftStats> {
   Duration streamChangesSince{
       "thrift.StreamingEdenService.streamChangesSince.streaming_time_us"};
   Duration streamSelectedChangesSince{
       "thrift.StreamingEdenService.streamSelectedChangesSince.streaming_time_us"};
-
-  Counter globFilesSaplingRemoteAPISuccess{
-      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_success"};
-  Counter globFilesSaplingRemoteAPIFallback{
-      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_fallback"};
-  Counter globFilesLocal{"thrift.EdenServiceHandler.glob_files.local_success"};
-  Duration globFilesSaplingRemoteAPISuccessDuration{
-      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_success_duration_us"};
-  Duration globFilesSaplingRemoteAPIFallbackDuration{
-      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_fallback_duration_us"};
-  Duration globFilesLocalDuration{
-      "thrift.EdenServiceHandler.glob_files.local_duration_us"};
-  Duration globFilesLocalOffloadableDuration{
-      "thrift.EdenServiceHandler.glob_files.local_offloadable_duration_us"};
 
   Counter cancelRequestSuccess{
       "thrift.EdenServiceHandler.cancel_request.success"};
@@ -798,6 +811,22 @@ struct TakeoverStats : StatsGroup<TakeoverStats> {
 
 struct CheckoutStats : StatsGroup<CheckoutStats> {
   Counter avoidedDestinationConflicts{"checkout.avoided_destination_conflicts"};
+};
+
+struct TreeInodeStats : StatsGroup<TreeInodeStats> {
+  Counter readdirIndexHit{"inodes.readdir_index_hit"};
+  Counter readdirIndexCached{"inodes.readdir_index_cached"};
+  Counter readdirIndexDroppedByGc{"inodes.readdir_index_dropped_by_gc"};
+};
+
+/**
+ * The `local.` prefix keeps these out of the ODS export regexes; they are for
+ * inspection on the host. Fleet-wide efficacy shows up as the cgroup's memory
+ * usage itself.
+ */
+struct CgroupFileCacheStats : StatsGroup<CgroupFileCacheStats> {
+  Counter reclaimedBytes{"local.memory.cgroup_file_cache.reclaimed_bytes"};
+  Counter reclaimFailures{"local.memory.cgroup_file_cache.reclaim_failures"};
 };
 
 /*

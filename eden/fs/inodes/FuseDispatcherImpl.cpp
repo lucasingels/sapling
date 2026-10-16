@@ -118,12 +118,20 @@ uint64_t FuseDispatcherImpl::computeNegativeEntryTtl() const {
   return mount_->getEdenConfig()->fuseNegativeDcacheTtlSeconds.getValue();
 }
 
+fuse_entry_out FuseDispatcherImpl::negativeLookupEntry() const {
+  fuse_entry_out entry = {};
+  auto ttl = computeNegativeEntryTtl();
+  entry.attr_valid = ttl;
+  entry.entry_valid = ttl;
+  return entry;
+}
+
 ImmediateFuture<FuseDispatcher::Attr> FuseDispatcherImpl::getattr(
     InodeNumber ino,
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupInode(ino)
       .thenValue([context = context.copy()](const InodePtr& inode) {
-        inode->updateLastFsRequestTime();
+        inode->markGcRef();
         return inode->stat(context);
       })
       .thenValue([this](const struct stat& st) {
@@ -160,49 +168,56 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::lookup(
   return inodeMap_->lookupTreeInode(parent)
       .thenValue([name = PathComponent(namepiece),
                   context = context.copy()](const TreeInodePtr& tree) {
-        return tree->getOrLoadChild(name, context);
+        return tree->getOrLoadChildIfExists(name, context);
       })
-      .thenValue([this, context = context.copy()](const InodePtr& inode) {
-        inode->updateLastFsRequestTime();
-        return makeImmediateFutureWith([&]() { return inode->stat(context); })
-            .thenTry([this, inode](folly::Try<struct stat> maybeStat) {
-              if (maybeStat.hasValue()) {
-                inode->incFsRefcount();
-                const auto& st = maybeStat.value();
-                return computeEntryParam(
-                    FuseDispatcher::Attr{st, computeTtlForStat(st)});
-              } else {
-                // The most common case for stat() failing is if this file is
-                // materialized but the data for it in the overlay is missing
-                // or corrupt.  This can happen after a hard reboot where the
-                // overlay data was not synced to disk first.
-                //
-                // We intentionally want to return a result here rather than
-                // failing; otherwise we can't return the inode number to the
-                // kernel at all.  This blocks other operations on the file,
-                // like FUSE_UNLINK.  By successfully returning from the
-                // lookup we allow clients to remove this corrupt file with an
-                // unlink operation.  (Even though FUSE_UNLINK does not require
-                // the child inode number, the kernel does not appear to send a
-                // FUSE_UNLINK request to us if it could not get the child inode
-                // number first.)
-                XLOGF(
-                    WARN,
-                    "error getting attributes for inode {} ({}): {}",
-                    inode->getNodeId(),
-                    inode->getLogPath(),
-                    maybeStat.exception().what());
-                inode->incFsRefcount();
-                return computeEntryParam(
-                    attrForInodeWithCorruptOverlay(inode->getNodeId()));
-              }
-            });
-      })
+      .thenValue(
+          [this, context = context.copy()](
+              const InodePtr& inode) -> ImmediateFuture<fuse_entry_out> {
+            if (!inode) {
+              return negativeLookupEntry();
+            }
+            inode->markGcRef();
+            return makeImmediateFutureWith(
+                       [&]() { return inode->stat(context); })
+                .thenTry([this, inode](folly::Try<struct stat> maybeStat) {
+                  if (maybeStat.hasValue()) {
+                    inode->incFsRefcount();
+                    const auto& st = maybeStat.value();
+                    return computeEntryParam(
+                        FuseDispatcher::Attr{st, computeTtlForStat(st)});
+                  } else {
+                    // The most common case for stat() failing is if this file
+                    // is materialized but the data for it in the overlay is
+                    // missing or corrupt.  This can happen after a hard reboot
+                    // where the overlay data was not synced to disk first.
+                    //
+                    // We intentionally want to return a result here rather than
+                    // failing; otherwise we can't return the inode number to
+                    // the kernel at all.  This blocks other operations on the
+                    // file, like FUSE_UNLINK.  By successfully returning from
+                    // the lookup we allow clients to remove this corrupt file
+                    // with an unlink operation.  (Even though FUSE_UNLINK does
+                    // not require the child inode number, the kernel does not
+                    // appear to send a FUSE_UNLINK request to us if it could
+                    // not get the child inode number first.)
+                    XLOGF(
+                        WARN,
+                        "error getting attributes for inode {} ({}): {}",
+                        inode->getNodeId(),
+                        inode->getLogPath(),
+                        maybeStat.exception().what());
+                    inode->incFsRefcount();
+                    return computeEntryParam(
+                        attrForInodeWithCorruptOverlay(inode->getNodeId()));
+                  }
+                });
+          })
       .thenTry([this](folly::Try<fuse_entry_out> try_) {
         if (auto* err = try_.tryGetExceptionObject<std::system_error>()) {
           if (isEnoent(*err)) {
-            // Translate ENOENT into a successful response with an inode
-            // number of 0 so the kernel can cache the negative lookup result.
+            // A missing name is normally answered above without an error;
+            // this covers the paths that still report ENOENT, such as a
+            // restricted directory or the .eden entry.
             //
             // Note: if this negative dcache entry becomes incorrect for a
             // name that is still returned by readdir, the kernel will stop
@@ -215,11 +230,7 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::lookup(
             // reducing how long a negative dcache entry can remain incorrect.
             //
             // Example report: https://fburl.com/workplace/329ni6ek
-            fuse_entry_out entry = {};
-            auto ttl = computeNegativeEntryTtl();
-            entry.attr_valid = ttl;
-            entry.entry_valid = ttl;
-            return folly::Try<fuse_entry_out>{entry};
+            return folly::Try<fuse_entry_out>{negativeLookupEntry()};
           }
         }
         return try_;
@@ -231,9 +242,10 @@ ImmediateFuture<FuseDispatcher::Attr> FuseDispatcherImpl::setattr(
     const fuse_setattr_in& attr,
     const ObjectFetchContextPtr& context) {
   // Even though mounts are created with the nosuid flag, explicitly disallow
-  // setting suid, sgid, and sticky bits on any inodes. This lets us avoid
-  // explicitly clearing these bits on writes() which is required for correct
-  // behavior under FUSE_HANDLE_KILLPRIV.
+  // setting suid, sgid, and sticky bits on any inodes. Together with create
+  // and mknod stripping them, this lets us avoid explicitly clearing these
+  // bits on write, truncate and chown, which FUSE_HANDLE_KILLPRIV and
+  // FUSE_HANDLE_KILLPRIV_V2 otherwise require.
   if ((attr.valid & FATTR_MODE) &&
       (attr.mode & (S_ISUID | S_ISGID | S_ISVTX))) {
     folly::throwSystemErrorExplicit(EPERM, "Extra mode bits are disallowed");
@@ -299,6 +311,24 @@ ImmediateFuture<uint64_t> FuseDispatcherImpl::open(
   return 0ull;
 }
 
+ImmediateFuture<folly::Unit> FuseDispatcherImpl::release(
+    InodeNumber /*ino*/,
+    uint64_t /*fh*/) {
+  // A file handle from create is still released by the kernel even though
+  // open is stateless, and the kernel ignores the reply.
+  return folly::unit;
+}
+
+namespace {
+/**
+ * The mode bits a new file never gets: setattr refuses to set them, and the
+ * kernel is told (FUSE_HANDLE_KILLPRIV_V2) that files never carry them.
+ */
+mode_t stripPrivilegeBits(mode_t mode) {
+  return mode & ~static_cast<mode_t>(S_ISUID | S_ISGID | S_ISVTX);
+}
+} // namespace
+
 ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::create(
     InodeNumber parent,
     PathComponentPiece name,
@@ -307,17 +337,16 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::create(
     const ObjectFetchContextPtr& context) {
   // force 'mode' to be regular file, in which case rdev arg to mknod is ignored
   // (and thus can be zero)
-  mode = S_IFREG | (07777 & mode);
+  mode = S_IFREG | stripPrivilegeBits(mode & 07777);
   return inodeMap_->lookupTreeInode(parent).thenValue(
       [this, mode, childName = PathComponent{name}, context = context.copy()](
           const TreeInodePtr& inode) {
         auto child = inode->mknod(childName, mode, 0, InvalidationRequired::No);
-        auto ttl = computeTtl();
-        return child->stat(context).thenValue(
-            [child, ttl](struct stat st) -> fuse_entry_out {
-              child->incFsRefcount();
-              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
-            });
+        FuseDispatcher::Attr attr{
+            child->statNewlyCreated(*context), computeTtl()};
+        // The kernel holds a reference only once the reply reaches it.
+        child->incFsRefcount();
+        return computeEntryParam(attr);
       });
 }
 
@@ -328,7 +357,7 @@ ImmediateFuture<BufVec> FuseDispatcherImpl::read(
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupFileInode(ino).thenValue(
       [context = context.copy(), size, off](FileInodePtr&& inode) {
-        inode->updateLastFsRequestTime();
+        inode->markGcRef();
         return inode->read(size, off, context)
             .thenValue([](std::tuple<BufVec, bool>&& readRes) {
               return std::get<BufVec>(std::move(readRes));
@@ -402,7 +431,7 @@ ImmediateFuture<std::string> FuseDispatcherImpl::readlink(
   return inodeMap_->lookupFileInode(ino).thenValue(
       [kernelCachesReadlink,
        context = context.copy()](const FileInodePtr& inode) {
-        inode->updateLastFsRequestTime();
+        inode->markGcRef();
         // Only release the symlink blob after it's loaded if we can assume the
         // FUSE will cache the result in the kernel's page cache.
         return inode->readlink(
@@ -421,7 +450,7 @@ ImmediateFuture<FuseDirList> FuseDispatcherImpl::readdir(
   return inodeMap_->lookupTreeInode(ino).thenValue(
       [dirList = std::move(dirList), offset, context = context.copy()](
           TreeInodePtr inode) mutable {
-        inode->updateLastFsRequestTime();
+        inode->markGcRef();
         return inode->fuseReaddir(std::move(dirList), offset, context);
       });
 }
@@ -435,17 +464,16 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::mknod(
   return inodeMap_->lookupTreeInode(parent).thenValue(
       [this,
        childName = PathComponent{name},
-       mode,
+       mode = S_ISDIR(mode) ? mode : stripPrivilegeBits(mode),
        rdev,
        context = context.copy()](const TreeInodePtr& inode) {
         auto child =
             inode->mknod(childName, mode, rdev, InvalidationRequired::No);
-        auto ttl = computeTtl();
-        return child->stat(context).thenValue(
-            [child, ttl](struct stat st) -> fuse_entry_out {
-              child->incFsRefcount();
-              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
-            });
+        FuseDispatcher::Attr attr{
+            child->statNewlyCreated(*context), computeTtl()};
+        // The kernel holds a reference only once the reply reaches it.
+        child->incFsRefcount();
+        return computeEntryParam(attr);
       });
 }
 
@@ -458,11 +486,11 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::mkdir(
       [this, childName = PathComponent{name}, mode, context = context.copy()](
           const TreeInodePtr& inode) {
         auto child = inode->mkdir(childName, mode, InvalidationRequired::No);
-        auto ttl = computeTtl();
-        return child->stat(context).thenValue([child, ttl](struct stat st) {
-          child->incFsRefcount();
-          return computeEntryParam(FuseDispatcher::Attr{st, ttl});
-        });
+        FuseDispatcher::Attr attr{
+            child->statNewlyCreated(*context), computeTtl()};
+        // The kernel holds a reference only once the reply reaches it.
+        child->incFsRefcount();
+        return computeEntryParam(attr);
       });
 }
 
@@ -502,12 +530,11 @@ ImmediateFuture<fuse_entry_out> FuseDispatcherImpl::symlink(
        context = context.copy()](const TreeInodePtr& inode) {
         auto symlinkInode =
             inode->symlink(childName, linkContents, InvalidationRequired::No);
+        FuseDispatcher::Attr attr{
+            symlinkInode->statNewlyCreated(*context), computeTtl()};
+        // The kernel holds a reference only once the reply reaches it.
         symlinkInode->incFsRefcount();
-        auto ttl = computeTtl();
-        return symlinkInode->stat(context).thenValue(
-            [symlinkInode, ttl](struct stat st) {
-              return computeEntryParam(FuseDispatcher::Attr{st, ttl});
-            });
+        return computeEntryParam(attr);
       });
 }
 
@@ -600,14 +627,14 @@ ImmediateFuture<string> FuseDispatcherImpl::getxattr(
     const ObjectFetchContextPtr& context) {
   return inodeMap_->lookupInode(ino).thenValue(
       [attrName = name.str(), context = context.copy()](const InodePtr& inode) {
-        inode->updateLastFsRequestTime();
+        inode->markGcRef();
         return inode->getxattr(attrName, context);
       });
 }
 
 ImmediateFuture<vector<string>> FuseDispatcherImpl::listxattr(InodeNumber ino) {
   return inodeMap_->lookupInode(ino).thenValue([](const InodePtr& inode) {
-    inode->updateLastFsRequestTime();
+    inode->markGcRef();
     return inode->listxattr();
   });
 }
