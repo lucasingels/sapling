@@ -195,9 +195,29 @@ the group is rejected:
   abort: $TESTTMP/elsewhere is not in this worktree group, use `git worktree remove` instead
   [255]
 
-Remove worktrees, including one with local changes; git forgets them too:
+A worktree with uncommitted changes, untracked files included, is not removed
+without --force, and nothing else in the same command is removed either:
 
   $ sl worktree remove $TESTTMP/wt4 $TESTTMP/wt3 -y
+  $TESTTMP/wt4 has uncommitted changes:
+    M a
+    A new
+    ? untracked
+  abort: not removing worktrees with uncommitted changes (use --force to remove them anyway)
+  [255]
+  $ test -d $TESTTMP/wt4 && test -d $TESTTMP/wt3 && echo kept
+  kept
+  $ sl worktree remove --all -y
+  $TESTTMP/wt4 has uncommitted changes:
+    M a
+    A new
+    ? untracked
+  abort: not removing worktrees with uncommitted changes (use --force to remove them anyway)
+  [255]
+
+Remove worktrees, including one with local changes; git forgets them too:
+
+  $ sl worktree remove $TESTTMP/wt4 $TESTTMP/wt3 -y --force
   removed $TESTTMP/wt3
   removed $TESTTMP/wt4
   $ test -d $TESTTMP/wt4 || echo gone

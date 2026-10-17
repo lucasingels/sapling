@@ -22,6 +22,9 @@ export class RemoveWorktreeOperation extends Operation {
       'worktree',
       'remove',
       this.worktreePath,
+      // Callers confirm with the user first, warning that uncommitted changes are lost,
+      // so `sl` must not refuse a worktree with uncommitted changes.
+      '--force',
     ];
   }
 }

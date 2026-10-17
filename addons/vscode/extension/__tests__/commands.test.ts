@@ -762,6 +762,7 @@ describe('worktree commands', () => {
             'worktree',
             'remove',
             siblingWorktree.path,
+            '--force',
           ],
         }),
         expect.anything(),

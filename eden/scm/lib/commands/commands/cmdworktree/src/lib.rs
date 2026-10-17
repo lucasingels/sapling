@@ -48,6 +48,10 @@ define_flags! {
         /// remove the label instead of setting it (for 'label')
         remove: bool,
 
+        /// remove worktrees even if they have uncommitted changes (for 'remove')
+        #[short('f')]
+        force: bool,
+
         formatter_opts: FormatterOpts,
 
         #[args]
@@ -170,8 +174,12 @@ pub fn doc() -> &'static str {
 
       list [-Tjson]                                     List all worktrees in the group
       add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
-      remove PATH [PATH...] [--all] [-y]                Remove linked worktree(s)
+      remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
+
+    `remove` refuses to remove a worktree with uncommitted changes, untracked
+    files included, unless `--force` is given; the confirmation prompt then
+    lists the changes that will be lost.
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path when configured. Otherwise, for git-backed

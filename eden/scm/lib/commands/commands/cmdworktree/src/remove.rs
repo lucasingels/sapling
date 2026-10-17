@@ -5,16 +5,19 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Error;
 use clidispatch::ReqCtx;
 use clidispatch::abort;
 use cmdutil::Result;
+use pathmatcher::AlwaysMatcher;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
 use worktree::WorktreeKind;
@@ -103,7 +106,8 @@ fn remove_and_update_registry(
 
     let logger = ctx.logger();
 
-    confirm_remove(ctx, targets)?;
+    let changes = check_uncommitted_changes(ctx, repo, targets)?;
+    confirm_remove(ctx, targets, &changes)?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let multi_target = targets.len() > 1;
@@ -207,7 +211,8 @@ fn run_remove_all(
     }
 
     let path_refs: Vec<&Path> = linked_paths.iter().map(|p| p.as_path()).collect();
-    confirm_remove(ctx, &path_refs)?;
+    let changes = check_uncommitted_changes(ctx, repo, &path_refs)?;
+    confirm_remove(ctx, &path_refs, &changes)?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let mut removed_paths = Vec::new();
@@ -286,7 +291,65 @@ fn remove_checkout(
     }
 }
 
-fn confirm_remove(ctx: &ReqCtx<WorktreeOpts>, paths: &[&Path]) -> Result<()> {
+/// `sl status` lines of each checkout in `paths` that has uncommitted changes.
+/// Untracked files count: they go with the checkout. Without `--force`, list
+/// them and abort; with it, return them for the confirmation prompt (skipped
+/// with `-y`, which has no prompt).
+fn check_uncommitted_changes(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    paths: &[&Path],
+) -> Result<BTreeMap<PathBuf, Vec<String>>> {
+    let mut changes = BTreeMap::new();
+    if ctx.opts.force && ctx.global_opts().noninteractive {
+        return Ok(changes);
+    }
+    for &path in paths {
+        // A checkout already gone behind our back has nothing left to lose.
+        if !path.exists() {
+            continue;
+        }
+        // A git worktree made with plain git has no sl state until the first `sl`
+        // command there; set it up the way that command would.
+        gitcompat::init::maybe_init_inside_dotgit(path, repo.ident())?;
+        let wc = Repo::load(path, &[])?.working_copy()?;
+        let status = wc
+            .read()
+            .status(&ctx.core, Arc::new(AlwaysMatcher::new()), false)?;
+        // In `sl status` order.
+        let mut lines = Vec::new();
+        for (letter, mut files) in [
+            ("M", status.modified().collect::<Vec<_>>()),
+            ("A", status.added().collect()),
+            ("R", status.removed().collect()),
+            ("!", status.deleted().collect()),
+            ("?", status.unknown().collect()),
+        ] {
+            files.sort();
+            lines.extend(files.into_iter().map(|file| format!("{letter} {file}")));
+        }
+        if !lines.is_empty() {
+            changes.insert(path.to_path_buf(), lines);
+        }
+    }
+    if !ctx.opts.force && !changes.is_empty() {
+        for (path, lines) in &changes {
+            ctx.io()
+                .write_err(format!("{} has uncommitted changes:\n", path.display()))?;
+            for line in lines {
+                ctx.io().write_err(format!("  {line}\n"))?;
+            }
+        }
+        abort!("not removing worktrees with uncommitted changes (use --force to remove them anyway)");
+    }
+    Ok(changes)
+}
+
+fn confirm_remove(
+    ctx: &ReqCtx<WorktreeOpts>,
+    paths: &[&Path],
+    changes: &BTreeMap<PathBuf, Vec<String>>,
+) -> Result<()> {
     if ctx.global_opts().noninteractive {
         return Ok(());
     }
@@ -296,14 +359,26 @@ fn confirm_remove(ctx: &ReqCtx<WorktreeOpts>, paths: &[&Path]) -> Result<()> {
         abort!("running non-interactively, use -y instead");
     }
 
+    let write_changes = |path: &Path, indent: &str| -> Result<()> {
+        if let Some(lines) = changes.get(path) {
+            ctx.io()
+                .write(format!("{indent}uncommitted changes that will be lost:\n"))?;
+            for line in lines {
+                ctx.io().write(format!("{indent}  {line}\n"))?;
+            }
+        }
+        Ok(())
+    };
     if paths.len() == 1 {
         ctx.io()
             .write(format!("will remove {}\n", paths[0].display()))?;
+        write_changes(paths[0], "")?;
     } else {
         ctx.io()
             .write(format!("will remove {} worktrees:\n", paths.len()))?;
         for p in paths {
             ctx.io().write(format!("  {}\n", p.display()))?;
+            write_changes(p, "    ")?;
         }
     }
     ctx.io().write("proceed? [y/N] ")?;
