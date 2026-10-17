@@ -172,7 +172,7 @@ pub fn doc() -> &'static str {
 
     Subcommands::
 
-      list [-Tjson]                                     List all worktrees in the group
+      list [-Tjson]                                     List all worktrees in the group, marking stale ones
       add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
@@ -180,6 +180,10 @@ pub fn doc() -> &'static str {
     `remove` refuses to remove a worktree with uncommitted changes, untracked
     files included, unless `--force` is given; the confirmation prompt then
     lists the changes that will be lost.
+
+    With -Tjson, `list` also gives each worktree's checked out commit
+    ("node") and whether it is stale ("stale", "stale_reason"): another
+    worktree rewrote that commit or one below it (see `update-stale`).
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path when configured. Otherwise, for git-backed

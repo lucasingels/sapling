@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 use anyhow::Result;
 use async_runtime::block_on;
@@ -29,6 +30,7 @@ use dag::Vertex;
 use mutationstore::MutationStore;
 use pathmatcher::TreeMatcher;
 use repo::repo::Repo;
+use repo_minimal_info::RepoMinimalInfo;
 use repostate::command_state::Conflict;
 use repostate::command_state::Operation;
 use types::HgId;
@@ -84,10 +86,16 @@ impl StaleState {
 
 /// Whether `repo` is a checkout of a git worktree group with other checkouts.
 pub fn in_group(repo: &Repo) -> bool {
+    in_group_at(repo, repo.path())
+}
+
+/// Whether the checkout at `root`, of the same repo as `repo`, is in a git
+/// worktree group with other checkouts.
+fn in_group_at(repo: &Repo, root: &Path) -> bool {
     if !repo.requirements.contains("dotgit") {
         return false;
     }
-    let dotgit = repo.path().join(".git");
+    let dotgit = root.join(".git");
     if dotgit.is_file() {
         // A linked worktree: ".git" points into the main checkout's git dir.
         return true;
@@ -102,7 +110,31 @@ pub fn in_group(repo: &Repo) -> bool {
 /// group, during a merge or an unfinished rebase, graft, ..., which own the
 /// working copy, or on a public commit.
 pub fn checkout_state(repo: &Repo, parents: &[HgId]) -> Result<Option<StaleState>> {
-    if !in_group(repo) {
+    checkout_state_at(repo, repo.path(), repo.dot_hg_path(), parents)
+}
+
+/// Like [`checkout_state`], for another checkout of `repo`'s group, the one
+/// at `root` with working copy parents `parents`, judged the way that checkout
+/// would judge itself.
+pub fn other_checkout_state(
+    repo: &Repo,
+    root: &Path,
+    parents: &[HgId],
+) -> Result<Option<StaleState>> {
+    if !in_group_at(repo, root) {
+        return Ok(None);
+    }
+    let info = RepoMinimalInfo::from_repo_root(root.to_path_buf())?;
+    checkout_state_at(repo, root, &info.dot_hg_path, parents)
+}
+
+fn checkout_state_at(
+    repo: &Repo,
+    root: &Path,
+    dot_path: &Path,
+    parents: &[HgId],
+) -> Result<Option<StaleState>> {
+    if !in_group_at(repo, root) {
         return Ok(None);
     }
     let mut parents = parents.iter().filter(|p| !p.is_null());
@@ -112,8 +144,7 @@ pub fn checkout_state(repo: &Repo, parents: &[HgId]) -> Result<Option<StaleState
     if parents.next().is_some() {
         return Ok(None);
     }
-    if let Err(err) = repostate::command_state::try_operation(repo.dot_hg_path(), Operation::Other)
-    {
+    if let Err(err) = repostate::command_state::try_operation(dot_path, Operation::Other) {
         if err.downcast_ref::<Conflict>().is_some() {
             return Ok(None);
         }

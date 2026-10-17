@@ -36,13 +36,17 @@ Add a linked worktree at the current commit, with a label:
   {
     "path": "$TESTTMP/repo",
     "role": "main",
-    "current": true
+    "current": true,
+    "node": "*", (glob)
+    "stale": false
   },
   {
     "path": "$TESTTMP/wt1",
     "role": "linked",
     "label": "first",
-    "current": false
+    "current": false,
+    "node": "*", (glob)
+    "stale": false
   }
   ]
 

@@ -22,6 +22,7 @@ sapling-dag = { version = "0.1.0", path = "../../dag" }
 sapling-mutationstore = { version = "0.1.0", path = "../../mutationstore" }
 sapling-pathmatcher = { version = "0.1.0", path = "../../pathmatcher" }
 sapling-repo = { version = "0.1.0", path = "../../repo" }
+sapling-repo-minimal-info = { version = "0.1.0", path = "../../repo/repo-minimal-info" }
 sapling-repostate = { version = "0.1.0", path = "../../workingcopy/repostate" }
 sapling-types = { version = "0.1.0", path = "../../types" }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

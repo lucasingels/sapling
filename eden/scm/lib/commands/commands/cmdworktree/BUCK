@@ -23,6 +23,7 @@ sl_rust_library(
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:fs-err",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tracing",
         "//eden/scm/lib/clidispatch:clidispatch",
         "//eden/scm/lib/clone:clone",
         "//eden/scm/lib/commands/cmdutil:cmdutil",
@@ -43,5 +44,6 @@ sl_rust_library(
         "//eden/scm/lib/vfs:vfs",
         "//eden/scm/lib/workingcopy:workingcopy",
         "//eden/scm/lib/worktree:worktree",
+        "//eden/scm/lib/worktree/stale:worktree-stale",
     ],
 )

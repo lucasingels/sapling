@@ -30,6 +30,21 @@ Rewriting A in the main checkout leaves the other checkouts alone:
   note: worktree $TESTTMP/wt is now stale (it is on 6592f5ce41bd "A"); 'sl update-stale' there moves it onto the latest versions
   $ cat $TESTTMP/wt/a
   a
+
+`worktree list` shows which checkouts are stale, and what each has checked out:
+
+  $ sl worktree list
+  * main    $TESTTMP/repo
+    linked  $TESTTMP/dirty   (stale)
+    linked  $TESTTMP/wt   (stale)
+  $ sl worktree list -Tjson | sl debugpython -- -c "
+  > import json, sys
+  > for entry in json.load(sys.stdin):
+  >     print(entry['node'][:12], entry['stale'], entry.get('stale_reason'))
+  > "
+  414300166dd7 False None
+  6592f5ce41bd True this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree
+  6592f5ce41bd True this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree
   $ sl -R $TESTTMP/wt log -r . -T '{desc}\n'
   note: this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
   A
@@ -94,6 +109,14 @@ too, and update-stale restacks them, uncommitted changes and all:
   hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
   note: worktree $TESTTMP/dirty is now stale (it is on 037085e2525a "P"); 'sl update-stale' there moves it onto the latest versions
   note: worktree $TESTTMP/wt is now stale (it is on 22236f856409 "B"); 'sl update-stale' there moves it onto the latest versions
+  $ sl worktree list -Tjson | sl debugpython -- -c "
+  > import json, sys
+  > for entry in json.load(sys.stdin):
+  >     print(entry['stale'], entry.get('stale_reason'))
+  > "
+  False None
+  True 414300166dd7 "A2", below this worktree's commit, was rewritten in another worktree
+  True 414300166dd7 "A2", below this worktree's commit, was rewritten in another worktree
   $ cd $TESTTMP/wt
   $ echo more > b
   $ sl amend

@@ -33,8 +33,10 @@ sapling-util = { version = "0.1.0", path = "../../../util" }
 sapling-vfs = { version = "0.1.0", path = "../../../vfs" }
 sapling-workingcopy = { version = "0.1.0", path = "../../../workingcopy" }
 sapling-worktree-registry = { version = "0.1.0", path = "../../../worktree" }
+sapling-worktree-stale = { version = "0.1.0", path = "../../../worktree/stale" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 slex = { version = "0.1.0", path = "../../../slex" }
+tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [features]
 eden = ["sapling-clone/eden", "sapling-edenfs-client"]

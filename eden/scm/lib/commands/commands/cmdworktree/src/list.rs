@@ -15,6 +15,7 @@ use formatter::Formattable;
 use formatter::StyleWrite;
 use repo::repo::Repo;
 use serde::Serialize;
+use worktree::ListedWorktree;
 use worktree::Worktrees;
 
 use crate::WorktreeOpts;
@@ -26,6 +27,13 @@ struct ListOutputEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     current: bool,
+    /// The checked out commit (hex), when the checkout has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    /// Whether another worktree rewrote the checked out commit or one below it.
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_reason: Option<String>,
 }
 
 impl Formattable for ListOutputEntry {
@@ -44,6 +52,9 @@ impl Formattable for ListOutputEntry {
         )?;
         if let Some(label) = &self.label {
             write!(writer, "   {label}")?;
+        }
+        if self.stale {
+            write!(writer, "   (stale)")?;
         }
         writeln!(writer)?;
         Ok(())
@@ -76,16 +87,44 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees
 
     formatter.begin_list()?;
     for entry in entries {
-        formatter.format_item(&ListOutputEntry {
-            path: entry.path,
-            role: if entry.is_main { "main" } else { "linked" },
-            label: entry.label,
-            current: entry.current,
-        })?;
+        formatter.format_item(&output_entry(repo, entry))?;
     }
     formatter.end_list()?;
 
     Ok(0)
+}
+
+fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntry {
+    // Read the way `whereami -R <path>` does; a checkout mid-checkout or gone
+    // behind git's back just has no node.
+    let parents = workingcopy::fast_path_wdir_parents(&entry.path, repo.ident())
+        .map(|parents| parents.to_vec())
+        .unwrap_or_default();
+    let node = parents
+        .first()
+        .filter(|p1| !p1.is_null())
+        .map(|p1| p1.to_hex());
+    let stale = if entry.current {
+        worktree_stale::checkout_state(repo, &parents)
+    } else {
+        worktree_stale::other_checkout_state(repo, &entry.path, &parents)
+    }
+    .unwrap_or_else(|err| {
+        tracing::warn!(
+            "cannot check whether {} is stale: {err:?}",
+            entry.path.display()
+        );
+        None
+    });
+    ListOutputEntry {
+        path: entry.path,
+        role: if entry.is_main { "main" } else { "linked" },
+        label: entry.label,
+        current: entry.current,
+        node,
+        stale: stale.is_some(),
+        stale_reason: stale.map(|state| state.message(repo)),
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +162,9 @@ mod tests {
             role: "main",
             label: None,
             current: false,
+            node: None,
+            stale: false,
+            stale_reason: None,
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -138,6 +180,9 @@ mod tests {
             role: "linked",
             label: None,
             current: false,
+            node: None,
+            stale: false,
+            stale_reason: None,
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -153,6 +198,9 @@ mod tests {
             role: "main",
             label: Some("my-label".to_string()),
             current: false,
+            node: None,
+            stale: false,
+            stale_reason: None,
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -168,6 +216,9 @@ mod tests {
             role: "main",
             label: None,
             current: true,
+            node: None,
+            stale: false,
+            stale_reason: None,
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -177,12 +228,33 @@ mod tests {
     }
 
     #[test]
+    fn test_format_plain_stale() {
+        let entry = ListOutputEntry {
+            path: PathBuf::from("/repos/linked"),
+            role: "linked",
+            label: Some("dev".to_string()),
+            current: false,
+            node: Some("1".repeat(40)),
+            stale: true,
+            stale_reason: Some("rewritten".to_string()),
+        };
+        let mut w = MockWriter(Vec::new());
+        entry
+            .format_plain(&FormatOptions::default(), &mut w)
+            .unwrap();
+        assert_eq!(mock_output(&w), "  linked  /repos/linked   dev   (stale)\n");
+    }
+
+    #[test]
     fn test_format_plain_current_with_label() {
         let entry = ListOutputEntry {
             path: PathBuf::from("/repos/linked"),
             role: "linked",
             label: Some("dev".to_string()),
             current: true,
+            node: None,
+            stale: false,
+            stale_reason: None,
         };
         let mut w = MockWriter(Vec::new());
         entry
