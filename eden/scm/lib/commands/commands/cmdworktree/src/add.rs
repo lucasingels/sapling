@@ -31,6 +31,8 @@ use workingcopy::workingcopy::WorkingCopy;
 use worktree::Group;
 use worktree::Reservation;
 use worktree::WorktreeEntry;
+use worktree::WorktreeKind;
+use worktree::Worktrees;
 use worktree::check_dest_not_in_repo;
 use worktree::group_id_for_main_path;
 use worktree::load_registry;
@@ -41,7 +43,6 @@ use worktree::with_worktree_path_op_lock;
 use worktree::write_worktree_name_marker;
 
 use crate::WorktreeOpts;
-use crate::backend::Backend;
 
 fn current_sl_binary() -> OsString {
     std::env::current_exe()
@@ -159,9 +160,19 @@ impl Drop for SlotReservation {
     }
 }
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
+pub(crate) fn run(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    wc: &WorkingCopy,
+    worktrees: &Worktrees,
+) -> Result<u8> {
     let logger = ctx.logger();
-    let backend = Backend::detect(repo)?;
+    let kind = worktrees.kind();
+    // Git knows the group of a git worktree even before anything is registered.
+    let git_group = match kind {
+        WorktreeKind::Git => Some(crate::require_group(repo, worktrees)?),
+        WorktreeKind::Eden => None,
+    };
 
     if ctx.opts.snapshot && !ctx.opts.rev.is_empty() {
         abort!("cannot use --rev with --snapshot");
@@ -196,15 +207,16 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         }
         None => {
             let has_generator = repo.config().get("worktree", "path-generator").is_some();
-            if has_generator || require_generated || backend == Backend::Eden {
-                run_path_generator(
+            match &git_group {
+                Some(group) if !has_generator && !require_generated => {
+                    crate::default_dest::default_nested_dest(&group.main, &ctx.opts.label)
+                }
+                _ => run_path_generator(
                     repo,
                     &ctx.opts.label,
                     &canonical_repo_path,
                     require_generated,
-                )?
-            } else {
-                crate::backend::default_nested_dest(repo, &ctx.opts.label)?
+                )?,
             }
         }
     };
@@ -214,21 +226,26 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         abort!("destination path '{}' already exists", dest.display());
     }
 
-    check_dest(backend, &dest)?;
+    check_dest(kind, &dest)?;
 
     let shared_store_path = repo.store_path().to_path_buf();
     let registry = load_registry(&shared_store_path)?;
-    if registry.find_group_for_path(&dest).is_some() {
+    // A git worktree's registry entry only holds its label and may outlive a
+    // checkout deleted behind git's back; git rejects destinations it still uses.
+    if kind == WorktreeKind::Eden && registry.find_group_for_path(&dest).is_some() {
         abort!(
             "destination path '{}' is already registered as a worktree",
             dest.display()
         );
     }
-    let group_main_path = resolve_group_for_main_path(&registry, &canonical_repo_path);
+    let group_main_path = match &git_group {
+        Some(group) => group.main.clone(),
+        None => resolve_group_for_main_path(&registry, &canonical_repo_path),
+    };
 
     // Fast-fail if worktree limit is already reached (re-checked inside lock).
     if max_count > 0 {
-        let linked = count_linked_worktrees(&registry, &group_main_path);
+        let linked = count_linked_worktrees(worktrees, &registry, &group_main_path)?;
         if linked >= max_count as usize {
             abort!(
                 "{}",
@@ -242,7 +259,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     // (even with no filter paths configured). Otherwise the backing store is hg.
     // Read active filter paths from the source repo's .sl/sparse file.
     #[cfg(feature = "eden")]
-    let clone_filters = (backend == Backend::Eden && repo.requirements.contains("edensparse"))
+    let clone_filters = (kind == WorktreeKind::Eden && repo.requirements.contains("edensparse"))
         .then(|| -> anyhow::Result<_> {
             let paths = filters::util::read_filter_config(repo.dot_hg_path())?
                 .map(|paths| paths.into_iter().map(|p| p.into_string().into()).collect())
@@ -266,7 +283,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
 
     // Git worktrees always use the direct copy: the legacy path goes through
     // `sl snapshot`, which needs a snapshot-capable server.
-    let use_direct_copy: bool = backend == Backend::Git
+    let use_direct_copy: bool = kind == WorktreeKind::Git
         || repo
             .config()
             .get_or("worktree", "snapshot-direct-copy", || false)?;
@@ -302,10 +319,10 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
             )?;
             let target = requested_target.or_else(|| parents.p1().copied());
             let (source_sparse_config, source_user_config): (Option<Vec<u8>>, Option<String>) =
-                match backend {
-                    Backend::Git => (None, None),
+                match kind {
+                    WorktreeKind::Git => (None, None),
                     #[cfg(feature = "eden")]
-                    Backend::Eden => {
+                    WorktreeKind::Eden => {
                         let source_client_dir = edenfs_client::get_client_dir(repo.path())?;
                         (
                             clone::snapshot_sparse_config(repo.dot_hg_path())?,
@@ -313,7 +330,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
                         )
                     }
                     #[cfg(not(feature = "eden"))]
-                    Backend::Eden => (None, None),
+                    WorktreeKind::Eden => (None, None),
                 };
             let source_status = if ctx.opts.snapshot && use_direct_copy {
                 logger.info("computing working copy status...");
@@ -349,7 +366,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
             // Linked worktrees plus every in-flight reservation for this group;
             // each is a distinct slot. Our own reservation is inserted only after
             // this check, so it is not counted here.
-            let in_use = count_linked_worktrees(registry, &group_main_path)
+            let in_use = count_linked_worktrees(worktrees, registry, &group_main_path)?
                 + reservations.count_for_group(&group_main_path);
             if in_use >= max_count as usize {
                 abort!(
@@ -379,21 +396,22 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
         if dest.exists() {
             abort!("destination path '{}' already exists", dest.display());
         }
-        check_dest(backend, &dest)?;
+        check_dest(kind, &dest)?;
 
         let partial_checkout_warning = || {
             ctx.logger().warn(format!(
                 "worktree add may have left a partial checkout; try running `{} {}` to recover",
-                backend.remove_hint(),
+                kind.remove_command(),
                 dest.display()
             ));
         };
-        match backend {
-            Backend::Git => {
-                crate::backend::git_worktree_add(repo, &dest, target)
+        match kind {
+            WorktreeKind::Git => {
+                worktrees
+                    .add(&dest, target.map(|target| target.to_hex()).as_deref())
                     .inspect_err(|_| partial_checkout_warning())?;
             }
-            Backend::Eden => {
+            WorktreeKind::Eden => {
                 #[cfg(feature = "eden")]
                 {
                     clone::eden_clone(repo, &dest, target, clone_filters)
@@ -423,7 +441,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
     })?;
 
     with_registry_lock(&shared_store_path, |registry| {
-        if registry.find_group_for_path(&dest).is_some() {
+        if kind == WorktreeKind::Eden && registry.find_group_for_path(&dest).is_some() {
             // The clone already materialized the checkout, so hint at cleanup
             // mirroring the eden_clone failure path (this is nearly unreachable:
             // same-dest adds serialize on the dest path lock and abort at the
@@ -432,7 +450,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> 
                 "worktree add left a checkout at {} that could not be registered; \
                  try running `{} {}` to recover",
                 dest.display(),
-                backend.remove_hint(),
+                kind.remove_command(),
                 dest.display()
             ));
             abort!(
@@ -558,12 +576,12 @@ fn restore_snapshot_legacy(
 
 /// Validate the destination for the backend. An EdenFS checkout must not live
 /// inside another checkout. A git worktree may: `git worktree add name` at the
-/// repo root nests by design, and `git_worktree_add` excludes the directory from
+/// repo root nests by design, and the git backend excludes the directory from
 /// the parent's status.
-fn check_dest(backend: Backend, dest: &Path) -> Result<()> {
-    match backend {
-        Backend::Eden => check_dest_not_in_repo(dest),
-        Backend::Git => Ok(()),
+fn check_dest(kind: WorktreeKind, dest: &Path) -> Result<()> {
+    match kind {
+        WorktreeKind::Eden => check_dest_not_in_repo(dest),
+        WorktreeKind::Git => Ok(()),
     }
 }
 
@@ -588,12 +606,21 @@ fn resolve_group_id_for_main_path(registry: &worktree::Registry, group_main_path
         .unwrap_or_else(|| group_id_for_main_path(group_main_path))
 }
 
-fn count_linked_worktrees(registry: &worktree::Registry, group_main_path: &Path) -> usize {
-    registry
+/// Linked worktrees already in the group: git's own list for git worktrees,
+/// whose registry entries only hold labels, the registry for EdenFS.
+fn count_linked_worktrees(
+    worktrees: &Worktrees,
+    registry: &worktree::Registry,
+    group_main_path: &Path,
+) -> Result<usize> {
+    if worktrees.kind() == WorktreeKind::Git {
+        return Ok(worktrees.list()?.iter().filter(|wt| !wt.is_main).count());
+    }
+    Ok(registry
         .find_group_for_path(group_main_path)
         .and_then(|group_id| registry.groups.get(&group_id))
         .map(Group::linked_worktree_count)
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 /// Runs the `worktree.path-generator` command and returns the generated path.

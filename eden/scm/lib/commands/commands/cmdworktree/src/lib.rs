@@ -6,11 +6,13 @@
  */
 
 mod add;
-mod backend;
+mod default_dest;
 mod label;
 mod list;
 mod remove;
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,10 +22,11 @@ use cmdutil::ConfigExt;
 use cmdutil::FormatterOpts;
 use cmdutil::Result;
 use cmdutil::define_flags;
-use fs_err as fs;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::WorktreeKind;
 use worktree::Worktrees;
+use worktree::group_id_for_main_path;
 
 define_flags! {
     pub struct WorktreeOpts {
@@ -57,30 +60,34 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
     if !ctx.opts.rev.is_empty() && subcmd != "add" {
         abort!("--rev can only be used with 'worktree add'");
     }
-    let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy) -> Result<u8> = match subcmd {
-        "list" | "ls" => {
-            let worktrees = Worktrees::open(repo, repo.config().as_ref())?;
-            return list::run(&ctx, repo, &worktrees);
-        }
-        "add" => add::run,
-        "remove" | "rm" => remove::run,
-        "label" => label::run,
-        "" => abort!("you need to specify a subcommand (run with --help to see a list)"),
-        other => abort!("unknown worktree subcommand '{}'", other),
-    };
+    let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy, &Worktrees) -> Result<u8> =
+        match subcmd {
+            "list" | "ls" => |ctx, repo, _wc, worktrees| list::run(ctx, repo, worktrees),
+            "add" => add::run,
+            "remove" | "rm" => remove::run,
+            "label" => label::run,
+            "" => abort!("you need to specify a subcommand (run with --help to see a list)"),
+            other => abort!("unknown worktree subcommand '{}'", other),
+        };
 
-    let backend = backend::Backend::detect(repo)?;
-    if backend == backend::Backend::Git {
-        // Worktrees made with plain `git worktree add` join the group too.
-        backend::sync_registry_from_git(repo)?;
-    }
-
-    runner(&ctx, repo, wc)
+    let worktrees = Worktrees::open(repo, repo.config().as_ref())?;
+    runner(&ctx, repo, wc, &worktrees)
 }
 
 pub(crate) struct CurrentGroup {
     pub(crate) shared_store_path: PathBuf,
+    pub(crate) kind: WorktreeKind,
+    /// Registry id of the group. For git it may not be in the registry yet.
     pub(crate) group_id: String,
+    pub(crate) main: PathBuf,
+    /// Every checkout of the group, main included, as canonical paths.
+    pub(crate) members: BTreeSet<PathBuf>,
+}
+
+impl CurrentGroup {
+    pub(crate) fn linked(&self) -> impl Iterator<Item = &PathBuf> {
+        self.members.iter().filter(|path| **path != self.main)
+    }
 }
 
 /// Read the configured slot-reservation TTL in seconds. Reservations older than
@@ -94,17 +101,51 @@ pub(crate) fn reservation_ttl_seconds(repo: &Repo) -> Result<i64> {
     Ok(ttl.as_secs() as i64)
 }
 
-pub(crate) fn require_group(repo: &Repo) -> Result<CurrentGroup> {
-    let shared_store_path = repo.store_path();
-    let registry = worktree::load_registry(shared_store_path)?;
-    let current = util::path::strip_unc_prefix(fs::canonicalize(repo.path())?);
-    match registry.find_group_for_path(&current) {
-        Some(group_id) => Ok(CurrentGroup {
-            shared_store_path: shared_store_path.to_path_buf(),
-            group_id,
-        }),
-        None => abort!("this worktree is not part of a group"),
-    }
+/// The group of the current checkout. Git is the source of truth for which git
+/// worktrees exist, so their group always exists and the registry only keeps
+/// labels. EdenFS groups come from the registry, including entries whose
+/// checkout is gone so `remove` can clean them up.
+pub(crate) fn require_group(repo: &Repo, worktrees: &Worktrees) -> Result<CurrentGroup> {
+    let shared_store_path = repo.store_path().to_path_buf();
+    let mut registry = worktree::load_registry(&shared_store_path)?;
+    let kind = worktrees.kind();
+    let (group_id, main, members) = match kind {
+        WorktreeKind::Git => {
+            let listed = worktrees.list()?;
+            let Some(main) = listed.iter().find(|wt| wt.is_main) else {
+                abort!("this worktree is not part of a group");
+            };
+            let main = canonical(&main.path);
+            let group_id = registry
+                .find_group_for_path(&main)
+                .unwrap_or_else(|| group_id_for_main_path(&main));
+            let members = listed.iter().map(|wt| canonical(&wt.path)).collect();
+            (group_id, main, members)
+        }
+        WorktreeKind::Eden => {
+            let current = canonical(repo.path());
+            let Some((group_id, group)) = registry
+                .find_group_for_path(&current)
+                .and_then(|group_id| registry.groups.remove_entry(&group_id))
+            else {
+                abort!("this worktree is not part of a group");
+            };
+            (group_id, group.main, group.worktrees.into_keys().collect())
+        }
+    };
+    Ok(CurrentGroup {
+        shared_store_path,
+        kind,
+        group_id,
+        main,
+        members,
+    })
+}
+
+pub(crate) fn canonical(path: &Path) -> PathBuf {
+    util::path::strip_unc_prefix(
+        util::path::canonicalize_best_effort(path).unwrap_or_else(|_| path.to_path_buf()),
+    )
 }
 
 pub fn aliases() -> &'static str {

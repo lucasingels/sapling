@@ -13,16 +13,28 @@ use cmdutil::Result;
 use fs_err as fs;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::Group;
+use worktree::WorktreeEntry;
+use worktree::WorktreeKind;
+use worktree::Worktrees;
 use worktree::with_registry_lock;
 use worktree::write_worktree_name_marker;
 
 use crate::WorktreeOpts;
 use crate::require_group;
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) -> Result<u8> {
+pub(crate) fn run(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    _wc: &WorkingCopy,
+    worktrees: &Worktrees,
+) -> Result<u8> {
     let logger = ctx.logger();
-    let current_group = require_group(repo)?;
+    let current_group = require_group(repo, worktrees)?;
     let (target, new_label) = parse_label_args(ctx, repo)?;
+    if !current_group.members.contains(&target) {
+        abort!("'{}' is not in this worktree group", target.display());
+    }
 
     let label = if ctx.opts.remove {
         None
@@ -30,9 +42,25 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
         Some(new_label)
     };
     with_registry_lock(&current_group.shared_store_path, |registry| {
-        let grp = match registry.groups.get_mut(&current_group.group_id) {
-            Some(group) => group,
-            None => abort!("group '{}' not found in registry", current_group.group_id),
+        let grp = match current_group.kind {
+            // The registry only keeps labels of git worktrees; git vouched for `target`.
+            WorktreeKind::Git => {
+                let grp = registry
+                    .groups
+                    .entry(current_group.group_id.clone())
+                    .or_insert_with(|| Group::new(current_group.main.clone()));
+                grp.worktrees
+                    .entry(target.clone())
+                    .or_insert_with(|| WorktreeEntry {
+                        added: chrono::Utc::now().to_rfc3339(),
+                        label: None,
+                    });
+                grp
+            }
+            WorktreeKind::Eden => match registry.groups.get_mut(&current_group.group_id) {
+                Some(group) => group,
+                None => abort!("group '{}' not found in registry", current_group.group_id),
+            },
         };
         let entry = match grp.worktrees.get_mut(&target) {
             Some(entry) => entry,

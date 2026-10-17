@@ -17,23 +17,27 @@ use clidispatch::abort;
 use cmdutil::Result;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::WorktreeKind;
+use worktree::Worktrees;
 use worktree::dissolve_group_if_empty;
-use worktree::load_registry;
 use worktree::lock_worktree_path_op;
 use worktree::with_registry_lock;
 use worktree::with_worktree_path_op_lock;
 
 use crate::CurrentGroup;
 use crate::WorktreeOpts;
-use crate::backend::Backend;
 use crate::require_group;
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) -> Result<u8> {
-    let current_group = require_group(repo)?;
-    let backend = Backend::detect(repo)?;
+pub(crate) fn run(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    _wc: &WorkingCopy,
+    worktrees: &Worktrees,
+) -> Result<u8> {
+    let current_group = require_group(repo, worktrees)?;
 
     if ctx.opts.all {
-        return run_remove_all(ctx, repo, &current_group, backend);
+        return run_remove_all(ctx, repo, &current_group, worktrees);
     }
 
     let path_args = &ctx.opts.args[1..];
@@ -50,9 +54,9 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
         })
         .collect::<Result<_>>()?;
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
-    validate_targets(&current_group, &target_refs, backend)?;
+    validate_targets(&current_group, &target_refs)?;
 
-    remove_and_update_registry(ctx, repo, &current_group, &target_refs, backend)?;
+    remove_and_update_registry(ctx, repo, &current_group, &target_refs, worktrees)?;
 
     // NOTE: Add post-worktree-remove hook if the need arises. Note that the
     // hook's cwd (repo.path()) may not exist if the user removed the worktree
@@ -62,19 +66,10 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
 }
 
 /// Validate that all user-specified paths are removable linked worktrees.
-fn validate_targets(
-    current_group: &CurrentGroup,
-    targets: &[&Path],
-    backend: Backend,
-) -> Result<()> {
-    let registry = load_registry(&current_group.shared_store_path)?;
-    let grp = match registry.groups.get(&current_group.group_id) {
-        Some(group) => group,
-        None => abort!("group '{}' not found in registry", current_group.group_id),
-    };
+fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<()> {
     for target in targets {
-        if !grp.worktrees.contains_key(*target) {
-            if let Some(parent_wt) = grp.worktrees.keys().find(|wt| target.starts_with(wt)) {
+        if !current_group.members.contains(*target) {
+            if let Some(parent_wt) = current_group.members.iter().find(|wt| target.starts_with(wt)) {
                 abort!(
                     "{} is not the root of checkout {}, not removing",
                     target.display(),
@@ -84,10 +79,10 @@ fn validate_targets(
             abort!(
                 "{} is not in this worktree group, use `{}` instead",
                 target.display(),
-                backend.remove_hint()
+                current_group.kind.remove_command()
             );
         }
-        if *target == grp.main {
+        if *target == current_group.main {
             abort!("cannot remove a main worktree with linked worktrees");
         }
     }
@@ -100,7 +95,7 @@ fn remove_and_update_registry(
     repo: &Repo,
     current_group: &CurrentGroup,
     targets: &[&Path],
-    backend: Backend,
+    worktrees: &Worktrees,
 ) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
@@ -124,7 +119,7 @@ fn remove_and_update_registry(
                     target.display().to_string(),
                 )])),
             )?;
-            remove_checkout(ctx, repo, backend, target)?;
+            remove_checkout(ctx, repo, worktrees, target)?;
             Ok(())
         });
         match result {
@@ -162,7 +157,10 @@ fn finalize_registry_removal(current_group: &CurrentGroup, removed_paths: &[&Pat
                 grp.worktrees.remove(*path);
             }
         }
-        dissolve_group_if_empty(registry, &current_group.group_id);
+        // A git group outlives its linked worktrees: it keeps the main checkout's label.
+        if current_group.kind == WorktreeKind::Eden {
+            dissolve_group_if_empty(registry, &current_group.group_id);
+        }
         Ok(())
     })?;
 
@@ -173,20 +171,10 @@ fn run_remove_all(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
     current_group: &CurrentGroup,
-    backend: Backend,
+    worktrees: &Worktrees,
 ) -> Result<u8> {
     let logger = ctx.logger();
-    let registry = load_registry(&current_group.shared_store_path)?;
-    let grp = match registry.groups.get(&current_group.group_id) {
-        Some(group) => group,
-        None => abort!("group '{}' not found in registry", current_group.group_id),
-    };
-    let candidate_paths: Vec<PathBuf> = grp
-        .worktrees
-        .keys()
-        .filter(|p| **p != grp.main)
-        .cloned()
-        .collect();
+    let candidate_paths: Vec<PathBuf> = current_group.linked().cloned().collect();
     if candidate_paths.is_empty() {
         logger.info("no linked worktrees to remove");
         return Ok(0);
@@ -206,15 +194,13 @@ fn run_remove_all(
     // There is still a possible race if a worktree is quickly removed and
     // re-added at the same path before we acquire the path lock; the registry
     // currently tracks worktrees by path, not by per-entry generation.
-    let linked_paths = with_registry_lock(&current_group.shared_store_path, |registry| {
-        let Some(grp) = registry.groups.get(&current_group.group_id) else {
-            return Ok(Vec::new());
-        };
-        Ok(candidate_paths
-            .into_iter()
-            .filter(|path| path.as_path() != grp.main.as_path() && grp.worktrees.contains_key(path))
-            .collect())
-    })?;
+    let still_present = require_group(repo, worktrees)
+        .map(|group| group.members)
+        .unwrap_or_default();
+    let linked_paths: Vec<PathBuf> = candidate_paths
+        .into_iter()
+        .filter(|path| still_present.contains(path))
+        .collect();
     if linked_paths.is_empty() {
         logger.info("no linked worktrees to remove");
         return Ok(0);
@@ -235,7 +221,7 @@ fn run_remove_all(
                 path.display().to_string(),
             )])),
         )?;
-        match remove_checkout(ctx, repo, backend, path) {
+        match remove_checkout(ctx, repo, worktrees, path) {
             Ok(()) => {}
             Err(err) => {
                 logger.warn(format!("failed to remove {}: {}", path.display(), err));
@@ -270,17 +256,16 @@ fn run_remove_all(
 /// removed externally via `eden rm`), skip the call and return Ok so the caller
 /// can proceed to clean the worktree registry.
 ///
-/// Git: `git worktree remove --force`, or `git worktree prune` when the
-/// directory is already gone so the stale admin dir goes too.
+/// Git: see `Worktrees::remove`.
 fn remove_checkout(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
-    backend: Backend,
+    worktrees: &Worktrees,
     path: &Path,
 ) -> Result<()> {
-    match backend {
-        Backend::Git => crate::backend::git_worktree_remove(repo, path),
-        Backend::Eden => {
+    match worktrees.kind() {
+        WorktreeKind::Git => Ok(worktrees.remove(path)?),
+        WorktreeKind::Eden => {
             if !path.exists() {
                 ctx.logger().warn(format!(
                     "eden checkout {} not found on disk, continuing to remove from registry",
@@ -294,6 +279,7 @@ fn remove_checkout(
             }
             #[cfg(not(feature = "eden"))]
             {
+                let _ = repo;
                 abort!("EdenFS support is not compiled in");
             }
         }
