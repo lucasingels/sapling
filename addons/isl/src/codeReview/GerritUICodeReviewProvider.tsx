@@ -16,6 +16,7 @@ import type {SyncStatus} from './syncStatus';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
+import {textFieldStyles} from 'isl-components/TextField';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useState} from 'react';
@@ -388,6 +389,7 @@ function GerritCredentialForm({
       </p>
       <div className="gerrit-credential-fields">
         <input
+          className={textFieldStyles.input}
           placeholder={t('Username')}
           value={username}
           onChange={e => setUsername(e.target.value)}
@@ -395,6 +397,7 @@ function GerritCredentialForm({
           autoFocus
         />
         <input
+          className={textFieldStyles.input}
           type="password"
           placeholder={t('HTTP password')}
           value={password}

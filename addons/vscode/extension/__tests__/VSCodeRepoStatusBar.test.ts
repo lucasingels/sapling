@@ -20,6 +20,7 @@ import type {EnabledSCMApiFeature} from '../types';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {makeServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
 import {Logger} from 'isl-server/src/logger';
+import fs from 'node:fs';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {nextTick} from 'shared/utils';
 import * as vscode from 'vscode';
@@ -138,6 +139,12 @@ describe('VSCodeRepo status bar', () => {
   const ENABLED = new Set<EnabledSCMApiFeature>(['blame', 'sidebar']);
 
   beforeEach(() => {
+    // Same as VSCodeRepo.test.ts: realpath resolves via async threadpool I/O that may not
+    // settle within a single `nextTick()`, so stub it to keep repo creation deterministic.
+    jest
+      .spyOn(fs, 'realpath')
+      .mockImplementation(((p: string, cb: (err: null, resolved: string) => void) =>
+        cb(null, p)) as unknown as typeof fs.realpath);
     foldersEmitter = new TypedEventEmitter();
     (vscode.workspace.onDidChangeWorkspaceFolders as jest.Mock).mockImplementation(cb => {
       foldersEmitter.on('value', cb);

@@ -81,15 +81,6 @@
   gap: var(--halfpad);
 }
 
-.gerrit-credential-fields input {
-  width: 100%;
-  padding: var(--halfpad);
-  background: var(--input-background);
-  color: var(--input-foreground);
-  border: 1px solid var(--input-border);
-  border-radius: 2px;
-}
-
 .gerrit-credential-error {
   color: var(--error-fg-color);
   margin: 0;
