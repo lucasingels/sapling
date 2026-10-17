@@ -21,8 +21,8 @@ use worktree::Worktrees;
 use crate::WorktreeOpts;
 
 #[derive(Serialize)]
-struct ListOutputEntry {
-    path: PathBuf,
+pub(crate) struct ListOutputEntry {
+    pub(crate) path: PathBuf,
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
@@ -94,7 +94,7 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees
     Ok(0)
 }
 
-fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntry {
+pub(crate) fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntry {
     // Read the way `whereami -R <path>` does; a checkout mid-checkout or gone
     // behind git's back just has no node.
     let parents = workingcopy::fast_path_wdir_parents(&entry.path, repo.ident())

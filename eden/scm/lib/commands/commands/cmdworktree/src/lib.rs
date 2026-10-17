@@ -9,6 +9,8 @@ mod add;
 mod default_dest;
 mod label;
 mod list;
+mod path;
+mod prune;
 mod remove;
 
 use std::collections::BTreeSet;
@@ -52,6 +54,10 @@ define_flags! {
         #[short('f')]
         force: bool,
 
+        /// list the worktrees that would be removed, without removing them (for 'prune')
+        #[short('n')]
+        dry_run: bool,
+
         formatter_opts: FormatterOpts,
 
         #[args]
@@ -70,6 +76,8 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
             "add" => add::run,
             "remove" | "rm" => remove::run,
             "label" => label::run,
+            "path" => path::run,
+            "prune" => prune::run,
             "" => abort!("you need to specify a subcommand (run with --help to see a list)"),
             other => abort!("unknown worktree subcommand '{}'", other),
         };
@@ -176,10 +184,25 @@ pub fn doc() -> &'static str {
       add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
+      path LABEL [-Tjson]                               Print the path of the worktree labeled LABEL
+      prune [--dry-run] [-y]                            Remove linked worktrees that landed or were abandoned
 
     `remove` refuses to remove a worktree with uncommitted changes, untracked
     files included, unless `--force` is given; the confirmation prompt then
     lists the changes that will be lost.
+
+    `path` prints the absolute path of the worktree with that label, so
+    `cd "$(sl worktree path LABEL)"` works; with -Tjson it prints that
+    worktree's `list -Tjson` entry.
+
+    `prune` (git worktrees only) removes the linked worktrees that have no
+    uncommitted changes and whose commit is done with: landed (the commit, or
+    a later version of it, is public) or abandoned (the commit is hidden and
+    no later version of it is visible). The main checkout and the current
+    one are never removed, and neither is a stale worktree whose commit was
+    rewritten into a visible draft commit. `--dry-run` lists what would be
+    removed and why. Removal works as in `remove`, including the
+    confirmation prompt (skipped with `-y`) and the pre-worktree-remove hooks.
 
     With -Tjson, `list` also gives each worktree's checked out commit
     ("node") and whether it is stale ("stale", "stale_reason"): another

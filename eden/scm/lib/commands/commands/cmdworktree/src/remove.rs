@@ -59,7 +59,14 @@ pub(crate) fn run(
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
     validate_targets(&current_group, &target_refs)?;
 
-    remove_and_update_registry(ctx, repo, &current_group, &target_refs, worktrees)?;
+    remove_and_update_registry(
+        ctx,
+        repo,
+        &current_group,
+        &target_refs,
+        &BTreeMap::new(),
+        worktrees,
+    )?;
 
     // NOTE: Add post-worktree-remove hook if the need arises. Note that the
     // hook's cwd (repo.path()) may not exist if the user removed the worktree
@@ -93,11 +100,13 @@ fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<(
 }
 
 /// Confirm, run hooks, tear down EdenFS mounts, and update the worktree registry.
-fn remove_and_update_registry(
+/// `reasons` says why some targets go, for the prompt and the report.
+pub(crate) fn remove_and_update_registry(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
     current_group: &CurrentGroup,
     targets: &[&Path],
+    reasons: &BTreeMap<PathBuf, &str>,
     worktrees: &Worktrees,
 ) -> Result<()> {
     if targets.is_empty() {
@@ -107,7 +116,7 @@ fn remove_and_update_registry(
     let logger = ctx.logger();
 
     let changes = check_uncommitted_changes(ctx, repo, targets)?;
-    confirm_remove(ctx, targets, &changes)?;
+    confirm_remove(ctx, targets, &changes, reasons)?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let multi_target = targets.len() > 1;
@@ -129,7 +138,11 @@ fn remove_and_update_registry(
         match result {
             Ok(()) => {
                 removed_paths.push(target);
-                logger.info(format!("removed {}", target.display()));
+                logger.info(format!(
+                    "removed {}{}",
+                    target.display(),
+                    reason_suffix(reasons, target)
+                ));
             }
             Err(err) if multi_target => {
                 logger.warn(format!("failed to remove {}: {}", target.display(), err));
@@ -212,7 +225,7 @@ fn run_remove_all(
 
     let path_refs: Vec<&Path> = linked_paths.iter().map(|p| p.as_path()).collect();
     let changes = check_uncommitted_changes(ctx, repo, &path_refs)?;
-    confirm_remove(ctx, &path_refs, &changes)?;
+    confirm_remove(ctx, &path_refs, &changes, &BTreeMap::new())?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let mut removed_paths = Vec::new();
@@ -305,29 +318,7 @@ fn check_uncommitted_changes(
         return Ok(changes);
     }
     for &path in paths {
-        // A checkout already gone behind our back has nothing left to lose.
-        if !path.exists() {
-            continue;
-        }
-        // A git worktree made with plain git has no sl state until the first `sl`
-        // command there; set it up the way that command would.
-        gitcompat::init::maybe_init_inside_dotgit(path, repo.ident())?;
-        let wc = Repo::load(path, &[])?.working_copy()?;
-        let status = wc
-            .read()
-            .status(&ctx.core, Arc::new(AlwaysMatcher::new()), false)?;
-        // In `sl status` order.
-        let mut lines = Vec::new();
-        for (letter, mut files) in [
-            ("M", status.modified().collect::<Vec<_>>()),
-            ("A", status.added().collect()),
-            ("R", status.removed().collect()),
-            ("!", status.deleted().collect()),
-            ("?", status.unknown().collect()),
-        ] {
-            files.sort();
-            lines.extend(files.into_iter().map(|file| format!("{letter} {file}")));
-        }
+        let lines = uncommitted_changes(ctx, repo, path)?;
         if !lines.is_empty() {
             changes.insert(path.to_path_buf(), lines);
         }
@@ -345,10 +336,50 @@ fn check_uncommitted_changes(
     Ok(changes)
 }
 
+/// The `sl status` lines of the checkout at `path`, untracked files included.
+pub(crate) fn uncommitted_changes(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    path: &Path,
+) -> Result<Vec<String>> {
+    // A checkout already gone behind our back has nothing left to lose.
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    // A git worktree made with plain git has no sl state until the first `sl`
+    // command there; set it up the way that command would.
+    gitcompat::init::maybe_init_inside_dotgit(path, repo.ident())?;
+    let wc = Repo::load(path, &[])?.working_copy()?;
+    let status = wc
+        .read()
+        .status(&ctx.core, Arc::new(AlwaysMatcher::new()), false)?;
+    // In `sl status` order.
+    let mut lines = Vec::new();
+    for (letter, mut files) in [
+        ("M", status.modified().collect::<Vec<_>>()),
+        ("A", status.added().collect()),
+        ("R", status.removed().collect()),
+        ("!", status.deleted().collect()),
+        ("?", status.unknown().collect()),
+    ] {
+        files.sort();
+        lines.extend(files.into_iter().map(|file| format!("{letter} {file}")));
+    }
+    Ok(lines)
+}
+
+fn reason_suffix(reasons: &BTreeMap<PathBuf, &str>, path: &Path) -> String {
+    reasons
+        .get(path)
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default()
+}
+
 fn confirm_remove(
     ctx: &ReqCtx<WorktreeOpts>,
     paths: &[&Path],
     changes: &BTreeMap<PathBuf, Vec<String>>,
+    reasons: &BTreeMap<PathBuf, &str>,
 ) -> Result<()> {
     if ctx.global_opts().noninteractive {
         return Ok(());
@@ -370,14 +401,18 @@ fn confirm_remove(
         Ok(())
     };
     if paths.len() == 1 {
-        ctx.io()
-            .write(format!("will remove {}\n", paths[0].display()))?;
+        ctx.io().write(format!(
+            "will remove {}{}\n",
+            paths[0].display(),
+            reason_suffix(reasons, paths[0])
+        ))?;
         write_changes(paths[0], "")?;
     } else {
         ctx.io()
             .write(format!("will remove {} worktrees:\n", paths.len()))?;
         for p in paths {
-            ctx.io().write(format!("  {}\n", p.display()))?;
+            ctx.io()
+                .write(format!("  {}{}\n", p.display(), reason_suffix(reasons, p)))?;
             write_changes(p, "    ")?;
         }
     }

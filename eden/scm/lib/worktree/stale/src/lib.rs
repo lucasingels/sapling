@@ -13,7 +13,8 @@
 //! stacked on it, is then stale, the way jj marks a workspace stale when
 //! another workspace rewrites its working-copy commit.
 //!
-//! This crate only detects that state. Moving a stale checkout onto the latest
+//! This crate only detects that state, and which checkouts are done with
+//! (their commit landed or was abandoned) for `sl worktree prune`. Moving a stale checkout onto the latest
 //! versions (`sl update-stale`) lives in Python, in `worktreestale.py`, which
 //! calls into this crate through the `repo` bindings.
 
@@ -144,11 +145,8 @@ fn checkout_state_at(
     if parents.next().is_some() {
         return Ok(None);
     }
-    if let Err(err) = repostate::command_state::try_operation(dot_path, Operation::Other) {
-        if err.downcast_ref::<Conflict>().is_some() {
-            return Ok(None);
-        }
-        return Err(err);
+    if has_unfinished_operation(dot_path)? {
+        return Ok(None);
     }
     let dag = repo.dag_commits()?;
     let dag = dag.read();
@@ -159,6 +157,16 @@ fn checkout_state_at(
         }
         graph.stale_state(p1).await
     })
+}
+
+/// Whether a merge, rebase, graft, ... is unfinished in the checkout whose
+/// dot dir is `dot_path`.
+fn has_unfinished_operation(dot_path: &Path) -> Result<bool> {
+    match repostate::command_state::try_operation(dot_path, Operation::Other) {
+        Ok(()) => Ok(false),
+        Err(err) if err.downcast_ref::<Conflict>().is_some() => Ok(true),
+        Err(err) => Err(err),
+    }
 }
 
 /// The note for read-only commands when the checkout at `repo` is stale.
@@ -184,6 +192,54 @@ pub fn stale_state(repo: &Repo, node: &HgId, wdir_parents: &[HgId]) -> Result<Op
         let graph = Graph::new(repo, &**dag, wdir_parents).await?;
         graph.stale_state(node).await
     })
+}
+
+/// Why a checkout's commit is done with, so the checkout can go.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Finished {
+    /// The commit, or a later version of it, is public.
+    Landed,
+    /// The commit is hidden and no later version of it is visible.
+    Abandoned,
+}
+
+impl Finished {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Finished::Landed => "landed",
+            Finished::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Whether a checkout at `node` is done with, judged by the visibility of the
+/// repo running the command, whose working copy parents are `wdir_parents`.
+/// None while the commit is visible and draft, and also when it is hidden but
+/// a later draft version is visible: that checkout is stale, its work goes on
+/// in the later version.
+pub fn finished_state(repo: &Repo, node: &HgId, wdir_parents: &[HgId]) -> Result<Option<Finished>> {
+    let dag = repo.dag_commits()?;
+    let dag = dag.read();
+    block_on(async {
+        let graph = Graph::new(repo, &**dag, wdir_parents).await?;
+        graph.finished_state(node).await
+    })
+}
+
+/// Like [`finished_state`], for the checkout at `root` of `repo`'s group,
+/// which has `node` checked out. None while an operation (merge, rebase, ...)
+/// is unfinished there: that checkout is in use.
+pub fn other_checkout_finished(
+    repo: &Repo,
+    root: &Path,
+    node: &HgId,
+    wdir_parents: &[HgId],
+) -> Result<Option<Finished>> {
+    let info = RepoMinimalInfo::from_repo_root(root.to_path_buf())?;
+    if has_unfinished_operation(&info.dot_hg_path)? {
+        return Ok(None);
+    }
+    finished_state(repo, node, wdir_parents)
 }
 
 /// The commit graph as the stale check sees it, matching Python's
@@ -254,9 +310,16 @@ impl<'a> Graph<'a> {
     }
 
     /// Whether a later version of `node` (a successor at any depth) is
-    /// visible. Like `mutation.allsuccessors`, this does not follow
-    /// successors of public commits.
+    /// visible.
     async fn has_newer_version(&self, node: &HgId) -> Result<bool> {
+        Ok(!self.visible_newer_versions(node, true).await?.is_empty())
+    }
+
+    /// The visible later versions of `node` (successors at any depth), or only
+    /// the first one found with `first_only`. Like `mutation.allsuccessors`,
+    /// this does not follow successors of public commits.
+    async fn visible_newer_versions(&self, node: &HgId, first_only: bool) -> Result<Vec<HgId>> {
+        let mut found = Vec::new();
         let mut seen = HashSet::new();
         let mut level = vec![*node];
         let mut depth = 0;
@@ -267,7 +330,10 @@ impl<'a> Graph<'a> {
                     continue;
                 }
                 if depth > 0 && self.is_visible(&current).await? {
-                    return Ok(true);
+                    found.push(current);
+                    if first_only {
+                        return Ok(found);
+                    }
                 }
                 if self.is_public(&current).await? {
                     continue;
@@ -279,7 +345,26 @@ impl<'a> Graph<'a> {
             depth += 1;
             level = next;
         }
-        Ok(false)
+        Ok(found)
+    }
+
+    async fn finished_state(&self, node: &HgId) -> Result<Option<Finished>> {
+        if !self.has_node(node).await? {
+            return Ok(None);
+        }
+        if self.is_public(node).await? {
+            return Ok(Some(Finished::Landed));
+        }
+        if self.is_visible(node).await? {
+            return Ok(None);
+        }
+        let newer = self.visible_newer_versions(node, false).await?;
+        for version in &newer {
+            if self.is_public(version).await? {
+                return Ok(Some(Finished::Landed));
+            }
+        }
+        Ok(newer.is_empty().then_some(Finished::Abandoned))
     }
 
     /// The commit graph is walked instead of asking for obsolete commits:
