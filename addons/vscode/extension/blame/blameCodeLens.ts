@@ -19,6 +19,7 @@ import type {InlineBlameProvider} from './blame';
 
 import {relativeDate} from 'isl/src/relativeDate';
 import {ComparisonType} from 'shared/Comparison';
+import {truncate} from 'shared/utils';
 import {CodeLens, commands, EventEmitter, languages, Range, SymbolKind, workspace} from 'vscode';
 import {getRealignedBlameInfo, mostRecentCommitInRange, shortenAuthorName} from './blameUtils';
 
@@ -36,9 +37,6 @@ const RELEVANT_SYMBOL_KINDS = new Set<SymbolKind>([
 
 /** Keep a single lens line readable; the full message is still available via hover blame. */
 const MAX_TITLE_LENGTH = 60;
-function truncateTitle(title: string): string {
-  return title.length > MAX_TITLE_LENGTH ? `${title.slice(0, MAX_TITLE_LENGTH - 1)}…` : title;
-}
 
 type LineRange = {startLine: number; endLine: number};
 
@@ -229,8 +227,9 @@ export class BlameCodeLensProvider implements Disposable {
 
   private lensTitle(commit: CommitInfo): string {
     const DOT = '•';
-    return `${shortenAuthorName(commit.author)}, ${relativeDate(commit.date, {})} ${DOT} ${truncateTitle(
+    return `${shortenAuthorName(commit.author)}, ${relativeDate(commit.date, {})} ${DOT} ${truncate(
       commit.title.trim(),
+      MAX_TITLE_LENGTH,
     )}`;
   }
 

@@ -26,11 +26,6 @@
   background-color: #4285f4;
 }
 
-/* submittable (CR+2) — Gerrit green */
-.gerrit-diff-status-approved {
-  background-color: #1e8e3e;
-}
-
 
 /* Merged — Gerrit purple */
 .gerrit-diff-status-MERGED {
@@ -96,7 +91,7 @@
 }
 
 .gerrit-credential-error {
-  color: var(--errorForeground);
+  color: var(--error-fg-color);
   margin: 0;
 }
 

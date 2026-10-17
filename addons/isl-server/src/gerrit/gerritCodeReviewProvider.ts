@@ -19,11 +19,13 @@ import type {
 import type {CodeReviewProvider, DiffSummaries} from '../CodeReviewProvider';
 import type {Logger} from '../logger';
 
-import {execFile} from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {debounce} from 'shared/debounce';
+import {ejeca} from 'shared/ejeca';
+import rejectAfterTimeout from 'shared/rejectAfterTimeout';
+import {tryJsonParse} from 'shared/utils';
 
 /** Escape plain text for safe HTML embedding, preserving line breaks. */
 function escapeHtml(text: string): string {
@@ -82,54 +84,32 @@ type GerritCodeReviewSystem = CodeReviewSystem & {
 type Credentials = {username: string; password: string};
 
 /**
- * Look up credentials for a URL via the Git credential helper.
+ * Run `git credential <action>` for the host of `url`, with any extra `key=value` lines.
  * This delegates to whatever the user has configured (macOS Keychain,
  * Git Credential Manager, etc.) — no passwords in plain config.
- * Returns null if no credentials are found or the helper fails.
+ * Returns the helper's output, or null if the helper fails.
  */
-function getCredentials(url: string): Promise<Credentials | null> {
-  return new Promise(resolve => {
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      resolve(null);
-      return;
-    }
-    const input = `protocol=${parsed.protocol.replace(':', '')}\nhost=${parsed.host}\n\n`;
-    const proc = execFile('git', ['credential', 'fill'], (err, stdout) => {
-      if (err || !stdout) {
-        resolve(null);
-        return;
-      }
-      const get = (key: string) => stdout.match(new RegExp(`^${key}=(.+)$`, 'm'))?.[1] ?? '';
-      const username = get('username');
-      const password = get('password');
-      resolve(username && password ? {username, password} : null);
-    });
-    proc.stdin?.end(input);
-  });
+async function gitCredential(
+  action: 'fill' | 'approve' | 'reject',
+  url: string,
+  extraLines = '',
+): Promise<string | null> {
+  try {
+    const {protocol, host} = new URL(url);
+    const input = `protocol=${protocol.replace(':', '')}\nhost=${host}\n${extraLines}\n`;
+    return (await ejeca('git', ['credential', action], {input})).stdout;
+  } catch {
+    return null;
+  }
 }
 
-/** Run `git credential approve` or `reject` for a given URL and credentials. */
-function runGitCredential(
-  action: 'approve' | 'reject',
-  url: string,
-  username: string,
-  password: string,
-): Promise<void> {
-  return new Promise(resolve => {
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      resolve();
-      return;
-    }
-    const input = `protocol=${parsed.protocol.replace(':', '')}\nhost=${parsed.host}\nusername=${username}\npassword=${password}\n`;
-    const proc = execFile('git', ['credential', action], () => resolve());
-    proc.stdin?.end(input);
-  });
+/** Look up credentials for a URL via the Git credential helper, or null if none are stored. */
+async function getCredentials(url: string): Promise<Credentials | null> {
+  const stdout = await gitCredential('fill', url);
+  const get = (key: string) => stdout?.match(new RegExp(`^${key}=(.+)$`, 'm'))?.[1] ?? '';
+  const username = get('username');
+  const password = get('password');
+  return username && password ? {username, password} : null;
 }
 
 /** Fetch a URL with optional Basic auth and return the response body. */
@@ -138,11 +118,6 @@ function fetchUrl(
   credentials?: Credentials | null,
   timeoutMs = 8_000,
 ): Promise<string> {
-  // Use Promise.race to guarantee the timeout fires even if the TCP connection
-  // never establishes (req.setTimeout only fires after the socket is connected).
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error('Gerrit REST request timed out')), timeoutMs),
-  );
   const requestPromise = new Promise<string>((resolve, reject) => {
     const parsed = new URL(url);
     const options: https.RequestOptions = {
@@ -183,41 +158,14 @@ function fetchUrl(
     });
     req.on('error', reject);
   });
-  return Promise.race([requestPromise, timeoutPromise]);
+  // Race a timeout, which fires even if the TCP connection never establishes
+  // (req.setTimeout only fires after the socket is connected).
+  return rejectAfterTimeout(requestPromise, timeoutMs, 'Gerrit REST request timed out');
 }
 
-/**
- * Parse a Gerrit REST API JSON response, stripping the ")]}'" XSSI prefix.
- * Returns null if the response cannot be parsed as an array.
- */
-function parseGerritJsonArray(raw: string): Array<Record<string, unknown>> | null {
-  try {
-    const stripped = raw.replace(/^\)\]}'\n/, '');
-    const parsed = JSON.parse(stripped);
-    if (Array.isArray(parsed)) {
-      return parsed as Array<Record<string, unknown>>;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
-}
-
-/**
- * Parse a Gerrit REST API JSON object response, stripping the ")]}'" XSSI prefix.
- * Returns null if the response cannot be parsed as an object.
- */
-function parseGerritJsonObject(raw: string): Record<string, unknown> | null {
-  try {
-    const stripped = raw.replace(/^\)\]}'\n/, '');
-    const parsed = JSON.parse(stripped);
-    if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
+/** Parse a Gerrit REST API JSON response, stripping the ")]}'" XSSI prefix. */
+function parseGerritJson(raw: string): unknown {
+  return tryJsonParse(raw.replace(/^\)\]}'\n/, ''));
 }
 
 type LabelInfo = {
@@ -316,7 +264,6 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
   constructor(
     private codeReviewSystem: GerritCodeReviewSystem,
     private logger: Logger,
-    _repoRoot: string, // kept for constructor-signature compatibility
   ) {}
 
   onChangeDiffSummaries(callback: (result: Result<DiffSummaries>) => unknown): Disposable {
@@ -360,9 +307,9 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
         const url = `${changesBase}?q=${query}&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS`;
         this.logger.info(`Gerrit: fetching changes for project ${project} from REST API`);
         const raw = await fetchUrl(url, credentials);
-        const results = parseGerritJsonArray(raw);
+        const results = parseGerritJson(raw);
 
-        if (results == null) {
+        if (!Array.isArray(results)) {
           this.diffSummaries.emit(
             'error',
             new Error(
@@ -470,8 +417,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
       return [];
     }
 
-    const parsed = parseGerritJsonObject(raw);
-    if (parsed == null) {
+    const parsed = parseGerritJson(raw);
+    if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return [];
     }
 
@@ -529,12 +476,12 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
       const credentials = {username, password};
       fetchUrl(`${webUrl}/a/accounts/self`, credentials)
         .then(async () => {
-          await runGitCredential('approve', webUrl, username, password);
+          await gitCredential('approve', webUrl, `username=${username}\npassword=${password}\n`);
           postMessage({type: 'gerritCredentialsResult', success: true});
           // The client will re-send fetchDiffSummaries on success
         })
         .catch(async err => {
-          await runGitCredential('reject', webUrl, username, password);
+          await gitCredential('reject', webUrl, `username=${username}\npassword=${password}\n`);
           postMessage({
             type: 'gerritCredentialsResult',
             success: false,

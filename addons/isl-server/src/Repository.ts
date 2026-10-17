@@ -221,11 +221,7 @@ export class Repository {
     }
 
     if (remote.type === 'gerrit') {
-      this.codeReviewProvider = new GerritCodeReviewProvider(
-        remote,
-        ctx.logger,
-        this.info.repoRoot,
-      );
+      this.codeReviewProvider = new GerritCodeReviewProvider(remote, ctx.logger);
     }
 
     const shouldWait = (): boolean => {

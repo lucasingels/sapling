@@ -17,7 +17,7 @@ import {Operation} from './Operation';
  * checked out on be published -- without it `sl push` starts from `.`, which
  * would quietly publish the wrong stack.
  *
- * Passing `draft: true` pushes changes as WIP (work-in-progress) by appending %wip.
+ * Passing `draft: true` pushes changes as WIP (work-in-progress) with `--wip`.
  */
 export class GerritPublishOperation extends Operation {
   static opName = 'gerrit publish';

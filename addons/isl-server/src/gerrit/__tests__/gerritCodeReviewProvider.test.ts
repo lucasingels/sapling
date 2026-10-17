@@ -16,16 +16,13 @@ jest.mock('node:https', () => ({
 jest.mock('node:http', () => ({
   get: jest.fn(),
 }));
-jest.mock('node:child_process', () => ({
-  execFile: jest.fn((_cmd, _args, cb) => {
-    // Default: no credentials stored
-    cb(new Error('no credentials'), '', '');
-    return {stdin: {end: jest.fn()}};
-  }),
+jest.mock('shared/ejeca', () => ({
+  // Default: no credentials stored
+  ejeca: jest.fn(() => Promise.reject(new Error('no credentials'))),
 }));
 
-import {execFile} from 'node:child_process';
 import https from 'node:https';
+import {ejeca} from 'shared/ejeca';
 
 const GERRIT_SYSTEM: CodeReviewSystem & {type: 'gerrit'} = {
   type: 'gerrit',
@@ -79,7 +76,7 @@ describe('GerritCodeReviewProvider', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    provider = new GerritCodeReviewProvider(GERRIT_SYSTEM, mockLogger, '/repo');
+    provider = new GerritCodeReviewProvider(GERRIT_SYSTEM, mockLogger);
   });
 
   afterEach(() => {
@@ -154,14 +151,12 @@ describe('GerritCodeReviewProvider', () => {
     const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';
     mockHttpsResponse(GERRIT_CHANGE_RESPONSE(changeId, 142));
 
-    jest.mocked(execFile).mockImplementation((_cmd, _args, cb) => {
-      (cb as (err: null, stdout: string, stderr: string) => void)(
-        null,
-        'protocol=https\nhost=code.example.com\nusername=alice\npassword=secret\n',
-        '',
-      );
-      return {stdin: {end: jest.fn()}} as unknown as ReturnType<typeof execFile>;
-    });
+    jest.mocked(ejeca).mockImplementation(
+      () =>
+        Promise.resolve({
+          stdout: 'protocol=https\nhost=code.example.com\nusername=alice\npassword=secret',
+        }) as unknown as ReturnType<typeof ejeca>,
+    );
 
     provider.triggerDiffSummariesFetch([changeId]);
     await new Promise(r => setTimeout(r, 50));
@@ -337,7 +332,6 @@ describe('GerritCodeReviewProvider', () => {
       const providerWithWebUrl = new GerritCodeReviewProvider(
         {type: 'gerrit', remoteUrl: 'ssh://user@ssh.code.example.com:29418/my-repo', webUrl: 'https://code.example.com'},
         mockLogger,
-        '/repo',
       );
       mockHttpsResponse(COMMENTS_RESPONSE);
       await providerWithWebUrl.fetchComments(changeId);

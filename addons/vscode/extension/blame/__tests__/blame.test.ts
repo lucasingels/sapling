@@ -137,7 +137,6 @@ added some stuff in #1234`,
             remoteUrl: 'https://code.example.com/my-repo',
           },
           mockLogger,
-          '/repo',
         ),
       } as unknown as Repository;
       const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';

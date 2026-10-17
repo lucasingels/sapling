@@ -324,17 +324,7 @@ export function GerritSetupButton() {
 
   return (
     <Tooltip title={t('Gerrit authentication required. Click to configure credentials.')} placement="bottom">
-      <Button
-        className="gerrit-setup-button"
-        onClick={() =>
-          showModal({
-            type: 'custom',
-            title: t('Configure Gerrit Credentials'),
-            component: ({returnResultAndDismiss}) => (
-              <GerritCredentialForm webUrl={webUrl} onDismiss={returnResultAndDismiss} />
-            ),
-          })
-        }>
+      <Button className="gerrit-setup-button" onClick={() => showCredentialsModal(webUrl)}>
         <Icon icon="warning" slot="start" />
         <T>Gerrit</T>
       </Button>
@@ -344,19 +334,20 @@ export function GerritSetupButton() {
 
 export function GerritConfigureCredentialsButton({webUrl}: {webUrl: string}) {
   return (
-    <Button
-      onClick={() =>
-        showModal({
-          type: 'custom',
-          title: t('Configure Gerrit Credentials'),
-          component: ({returnResultAndDismiss}) => (
-            <GerritCredentialForm webUrl={webUrl} onDismiss={returnResultAndDismiss} />
-          ),
-        })
-      }>
+    <Button onClick={() => showCredentialsModal(webUrl)}>
       <T>Configure credentials</T>
     </Button>
   );
+}
+
+function showCredentialsModal(webUrl: string) {
+  return showModal({
+    type: 'custom',
+    title: t('Configure Gerrit Credentials'),
+    component: ({returnResultAndDismiss}) => (
+      <GerritCredentialForm webUrl={webUrl} onDismiss={returnResultAndDismiss} />
+    ),
+  });
 }
 
 function GerritCredentialForm({
