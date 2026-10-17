@@ -12,6 +12,7 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 
 // Error design goals:
 // - Callsites can test whether an error is caused by data corruption or other
@@ -38,6 +39,8 @@ struct Inner {
     messages: Vec<String>,
     is_corruption: bool,
     io_error_kind: Option<io::ErrorKind>,
+    // The path of the filesystem operation whose `io::Error` is in `sources`.
+    io_error_path: Option<PathBuf>,
 }
 
 impl Error {
@@ -81,6 +84,32 @@ impl Error {
 
     pub fn io_error_kind(&self) -> io::ErrorKind {
         self.inner.io_error_kind.unwrap_or(io::ErrorKind::Other)
+    }
+
+    /// Find a filesystem operation that failed because the process may not
+    /// access or write the path (EACCES, EPERM or EROFS), in this error or in
+    /// the errors it was caused by. Returns the path and the original
+    /// `io::Error`.
+    ///
+    /// Such errors are never data corruption. A common cause is a sandbox
+    /// that blocks writes to the directory holding the data.
+    pub fn permission_error(&self) -> Option<(&Path, &io::Error)> {
+        if let Some(path) = &self.inner.io_error_path {
+            let io_err = self
+                .inner
+                .sources
+                .iter()
+                .filter_map(|s| s.downcast_ref::<io::Error>())
+                .find(|e| is_permission_error(e));
+            if let Some(io_err) = io_err {
+                return Some((path, io_err));
+            }
+        }
+        self.inner
+            .sources
+            .iter()
+            .filter_map(|s| s.downcast_ref::<Error>())
+            .find_map(|e| e.permission_error())
     }
 
     // Following methods are used by this crate only.
@@ -292,6 +321,7 @@ impl<T> IoResultExt<T> for std::io::Result<T> {
                 err = err.mark_corruption();
             }
             err.inner.io_error_kind = Some(kind);
+            err.inner.io_error_path = Some(path.to_path_buf());
 
             // Provide more context for PermissionDenied
             if is_eperm {
@@ -331,6 +361,15 @@ impl<T> IoResultExt<T> for std::io::Result<T> {
     fn infallible(self) -> Result<T> {
         self.map_err(|err| Error::blank().source(err).message("Unexpected failure"))
     }
+}
+
+/// Whether `err` means the process may not access or write a path, as opposed
+/// to the data in it being bad.
+fn is_permission_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
 }
 
 pub(crate) trait LazyToString {
@@ -443,6 +482,37 @@ Caused by 1 errors:
 Caused by 1 errors:
 - io::Error: something wrong happened"#
         );
+    }
+
+    #[test]
+    fn test_permission_error() {
+        let denied =
+            || -> std::io::Result<()> { Err(io::Error::from(io::ErrorKind::PermissionDenied)) };
+        let path = Path::new("store/metalog/roots/rlock");
+        let err = denied()
+            .context(path, "cannot open for locking")
+            .unwrap_err();
+        assert!(!err.is_corruption());
+        let (found_path, io_err) = err.permission_error().unwrap();
+        assert_eq!(found_path, path);
+        assert_eq!(io_err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Found through layers of errors, as `OpenOptions::open` wraps it.
+        let wrapped = Error::blank()
+            .message("in log::OpenOptions::open")
+            .source(Error::blank().message("outer").source(err));
+        assert_eq!(wrapped.permission_error().unwrap().0, path);
+
+        let read_only =
+            || -> std::io::Result<()> { Err(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)) };
+        let err = read_only().context(path, "cannot create").unwrap_err();
+        assert!(err.permission_error().is_some());
+
+        // Other I/O errors and corruption are not permission errors.
+        let err = io_result().context(path, "cannot read").unwrap_err();
+        assert!(err.permission_error().is_none());
+        let err = Error::corruption(path, "checksum mismatch");
+        assert!(err.permission_error().is_none());
     }
 
     fn io_result() -> std::io::Result<()> {

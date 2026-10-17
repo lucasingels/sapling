@@ -17,6 +17,20 @@ pub fn translate_io_error(py: Python, e: &std::io::Error) -> cpython::PyErr {
         ),
         None => (e, None),
     };
+    new_os_error(py, e, filename)
+}
+
+/// Like [`translate_io_error`], for an `io::Error` whose path is known to the
+/// caller but not carried by the error itself.
+pub fn translate_io_error_with_path(
+    py: Python,
+    e: &std::io::Error,
+    path: &std::path::Path,
+) -> cpython::PyErr {
+    new_os_error(py, e, Some(path.display().to_string()))
+}
+
+fn new_os_error(py: Python, e: &std::io::Error, filename: Option<String>) -> cpython::PyErr {
     let errno = io_error_errno(e);
     let strerror = io_error_strerror(e, errno);
     let error_type = py.get_type::<exc::OSError>();

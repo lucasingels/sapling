@@ -353,7 +353,7 @@ impl Zstore {
     }
 
     fn error(&self, message: impl fmt::Display) -> crate::Error {
-        crate::Error(format!("{:?}: {}", self.dir, message))
+        crate::Error::new(format!("{:?}: {}", self.dir, message))
     }
 }
 
@@ -411,7 +411,7 @@ impl Zstore {
                     id = delta.base_id;
                     chain.push(delta);
                 } else {
-                    return Err(crate::Error(format!(
+                    return Err(crate::Error::new(format!(
                         "unexpected broken chain around {}",
                         id.to_hex()
                     )));

@@ -594,7 +594,19 @@ class vfs(abstractvfs):
 
         createmode = self._rustcreatemode()
         rustvfs = self._rustvfs if mode in ("r", "rb") else self._rustvfs_mkdir
-        return rustvfs.open(path, mode=mode, perm=createmode, atomicreplace=atomictemp)
+        try:
+            return rustvfs.open(
+                path, mode=mode, perm=createmode, atomicreplace=atomictemp
+            )
+        except OSError as err:
+            # The Rust vfs names the path relative to this vfs. Name the full
+            # path when access is denied, so the user can tell which directory
+            # needs fixing (for example, the shared store of a worktree).
+            if err.errno in (errno.EACCES, errno.EPERM, errno.EROFS) and (
+                err.filename == path
+            ):
+                err.filename = self.join(path)
+            raise
 
     def symlink(self, src: "Union[bytes, str]", dst: str) -> None:
         dst = self._rustpath(dst)

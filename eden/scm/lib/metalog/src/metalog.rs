@@ -306,7 +306,7 @@ impl MetaLog {
         tracing::debug!(root=?self.orig_root_id, "commit (locked, detached = {})", options.detached);
         let (_, actual_compaction_epoch) = resolve_compaction_epoch(&self.path)?;
         if self.compaction_epoch != actual_compaction_epoch {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "Commit failed. Compaction epoch changed since open; expected: {}, actual: {}",
                 self.compaction_epoch.unwrap_or(0),
                 actual_compaction_epoch.unwrap_or(0)
@@ -402,7 +402,7 @@ impl MetaLog {
 
     /// Generate an error.
     pub fn error(&self, message: impl fmt::Display) -> Error {
-        Error(format!("{:?}: {}", self.path, message))
+        Error::new(format!("{:?}: {}", self.path, message))
     }
 
     /// Block until the on-disk metalog gets changed.
@@ -564,7 +564,7 @@ pub(crate) fn load_root(blobs: &Zstore, id: Id20) -> Result<Root> {
     let root = match blobs.get(id)? {
         Some(bytes) => mincode::deserialize(&bytes)?,
         None => {
-            return Err(crate::Error(format!(
+            return Err(crate::Error::new(format!(
                 "Root ID {} is not found",
                 id.to_hex()
             )));

@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+use std::path::Path;
+
 use cpython::*;
 use cpython_ext::error;
 
@@ -111,11 +113,48 @@ fn log_permission_denied_binding(py: Python, e: &types::errors::PermissionDenied
     }
 }
 
+/// Find a filesystem operation that failed because the process may not access
+/// or write a path (for example, a sandbox blocking writes to the shared
+/// store). indexedlog and metalog report those inside their own error types,
+/// which would otherwise become `IndexedLogError` or `MetaLogError` and read
+/// as "internal storage is corrupted".
+fn find_permission_error(e: &error::Error) -> Option<(&Path, &std::io::Error)> {
+    e.chain().find_map(permission_error_in)
+}
+
+fn permission_error_in<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<(&'a Path, &'a std::io::Error)> {
+    if let Some(e) = e.downcast_ref::<indexedlog::Error>() {
+        return e.permission_error();
+    }
+    if let Some(e) = e.downcast_ref::<metalog::Error>() {
+        return e.permission_error();
+    }
+    // `dag::Error` forwards `source()` past the backend error, so look inside.
+    if let Some(dag::Error::Backend(backend_error)) = e.downcast_ref::<dag::Error>() {
+        match backend_error.as_ref() {
+            dag::errors::BackendError::IndexedLog(e) => return e.permission_error(),
+            dag::errors::BackendError::Other(e) => return find_permission_error(e),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn register_error_handlers() {
     fn specific_error_handler(py: Python, mut e: &error::Error) -> Option<PyErr> {
         // We care about concrete errors, so peel away anyhow contextual layers.
         while let Some(inner) = e.downcast_ref::<error::Error>() {
             e = inner;
+        }
+
+        // A permission error is not data corruption. Report it as an OSError
+        // with the path, so the user learns which file could not be written.
+        if let Some((path, io_err)) = find_permission_error(e) {
+            return Some(cpython_ext::error::translate_io_error_with_path(
+                py, io_err, path,
+            ));
         }
 
         // Extract inner io::Error out.

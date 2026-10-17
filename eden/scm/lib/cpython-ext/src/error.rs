@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 
 use crate::PythonKeepAlive;
 pub use crate::io_error::translate_io_error;
+pub use crate::io_error::translate_io_error_with_path;
 
 /// Extends the `Result` type to allow conversion to `PyResult` from a native
 /// Rust result.

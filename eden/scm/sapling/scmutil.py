@@ -214,6 +214,7 @@ def callcatch(ui, req, func):
             _("could not lock %s: %s\n") % (inst.desc or inst.filename, inst.strerror),
             error=_("abort"),
         )
+        _accesshint(ui, inst.errno, inst.filename)
     except error.OutOfBandError as inst:
         if inst.args:
             msg = _("remote error:\n")
@@ -359,6 +360,7 @@ def callcatch(ui, req, func):
                     ui.warn(_("(current process runs with uid %s)\n") % uid)
                     _printstat(ui, filename)
                     _printstat(ui, os.path.dirname(filename))
+            _accesshint(ui, getattr(inst, "errno", None), filename)
         else:
             ui.warn(_("%s\n") % inst, error=_("abort"))
     except OSError as inst:
@@ -408,6 +410,35 @@ def _uploadtraceback(ui, message, trace):
     ui.log("errortracekey", "Trace key:%s\n", key, errortracekey=key)
     error_prefix = payload[:500]
     ui.log("error_prefix", "%s", error_prefix, error_prefix=error_prefix)
+
+
+def _metadatadir(path):
+    """Return the metadata directory (.sl, .hg or .git/sl) containing path"""
+    parts = os.path.abspath(path).split(os.sep)
+    for i, part in enumerate(parts):
+        if part in (".sl", ".hg"):
+            return os.sep.join(parts[: i + 1])
+        if part == ".git" and parts[i + 1 : i + 2] == ["sl"]:
+            return os.sep.join(parts[: i + 2])
+    return None
+
+
+def _accesshint(ui, num, path):
+    """Explain a permission or read-only failure on one of our own files
+
+    Linked worktrees share the main checkout's store and locks, so a sandbox
+    that only allows writes to the worktree blocks them. Never suggest repair:
+    the data is fine, the process just cannot write it.
+    """
+    if num not in (errno.EACCES, errno.EPERM, errno.EROFS) or not path:
+        return
+    metadatadir = _metadatadir(path)
+    if metadatadir:
+        ui.warn(
+            _("(is @prog@ running in a sandbox that blocks writes to %s?)\n")
+            % metadatadir,
+            label="ui.hint",
+        )
 
 
 def _printstat(ui, path):

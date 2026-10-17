@@ -142,6 +142,15 @@ class lockinfo:
         return _("process %r on host %r") % (self.pid, self.host)
 
 
+def _ioerrormessage(err) -> str:
+    """Describe an IOError like str(err) does, minus the "[Errno N]" prefix"""
+    if err.strerror is None:
+        return str(err)
+    if err.filename is not None:
+        return "%s: %s" % (err.strerror, err.filename)
+    return err.strerror
+
+
 def trylock(
     ui, vfs, lockname, timeout, warntimeout: Optional[int] = None, *args, **kwargs
 ) -> "lock":
@@ -348,7 +357,9 @@ class lock:
         except IOError as err:
             raise error.LockUnavailable(
                 err.errno,
-                str(err),
+                # Not str(err): its "[Errno N]" prefix adds nothing, and N is
+                # a guess when the native error does not carry the errno.
+                _ioerrormessage(err),
                 path,
                 self.desc,
             )
