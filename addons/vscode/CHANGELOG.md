@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+### 17 October 2026
+
+- You can now write a commit message directly in the Source Control panel and commit or amend with it: Cmd/Ctrl+Enter commits, toolbar buttons cover commit and amend, and the changed-files context menu can commit or amend only the files you select. Both refuse to run while merge conflicts are unresolved
+- Code review comments now appear as native comment threads in the editor, anchored to the line they were left on, alongside the existing ISL comments view. They are read-only for now, so replying and resolving still happen in Gerrit or GitHub
+- The status bar now shows the current commit or bookmark, its review status, unresolved merge conflicts and any running Sapling operation, along with a Pull action
+- New `sapling.showBlameCodeLens` setting, off by default, adds a blame annotation above each class, function and method and one for the whole file, showing who last changed it; clicking opens that commit's diff. It is independent of the existing inline blame setting
+- The worktree panel marks a worktree as stale when another worktree rewrote the commits it has checked out, with the reason and an `sl update-stale` hint in the tooltip, and reads each worktree's commit from one `sl worktree list` call instead of running `sl whereami` per worktree (needs Sapling 0.3.9)
+- Removing a worktree now warns that its uncommitted changes will be discarded before going ahead (needs Sapling 0.3.9)
+- Worktree commands are no longer refused for GitHub-backed EdenFS repositories, matching upstream ISL
+- With Gerrit, "Resubmit stack" is hidden when every commit matches the patchset already uploaded; a commit that differs from its uploaded patchset gets its own resubmit button
+- Pick up upstream ISL changes from the October merge, including faster smartlog rendering and Git worktrees in the worktree list and badges
+- The extension now requires VS Code 1.105 or newer, matching current Cursor
+
 ## 0.2.6
 
 ### 9 September 2026
@@ -41,7 +56,9 @@
 
 - Add gerrit as a code review provider
 
-## Unreleased
+## 0.1.70
+
+### 16 March 2026
 
 - Reduced fetching frequency for better performance
 - Go to time in download commit menu
