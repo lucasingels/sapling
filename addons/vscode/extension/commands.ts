@@ -527,9 +527,13 @@ export const vscodeCommands = {
     if (picked == null) {
       return;
     }
+    // Modal warnings come with their own Cancel button.
     const choice = await vscode.window.showWarningMessage(
-      t('Are you sure you want to remove this worktree?'),
-      t('Cancel'),
+      t('Are you sure you want to remove worktree $name?').replace('$name', picked.label),
+      {
+        modal: true,
+        detail: t('Uncommitted changes in this worktree, including untracked files, will be lost.'),
+      },
       t('Remove'),
     );
     if (choice !== t('Remove')) {

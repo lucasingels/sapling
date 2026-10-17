@@ -753,6 +753,14 @@ describe('worktree commands', () => {
       expect(mockShowQuickPick.mock.calls[0][0]).not.toEqual(
         expect.arrayContaining([expect.objectContaining({worktree: mainWorktree})]),
       );
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Are you sure you want to remove worktree sibling?',
+        {
+          modal: true,
+          detail: 'Uncommitted changes in this worktree, including untracked files, will be lost.',
+        },
+        'Remove',
+      );
       expect(mockRepo.runOrQueueOperation).toHaveBeenCalledWith(
         ctx,
         expect.objectContaining({
@@ -817,7 +825,8 @@ describe('worktree commands', () => {
         description: siblingWorktree.path,
         worktree: siblingWorktree,
       } as never);
-      mockShowWarningMessage.mockResolvedValueOnce('Cancel' as never);
+      // Dismissing a modal (its built-in Cancel button or Escape) resolves to undefined.
+      mockShowWarningMessage.mockResolvedValueOnce(undefined as never);
 
       await removeCommand.apply(ctx);
 
