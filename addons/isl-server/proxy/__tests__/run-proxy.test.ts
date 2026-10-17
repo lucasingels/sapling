@@ -74,6 +74,10 @@ describe('run-proxy', () => {
   const killMock = jest.spyOn(process, 'kill').mockImplementation(() => true);
   // process.kill is mocked to always succeed, so the exit poll would never see the process go away
   jest.spyOn(lifecycle, 'waitForProcessToExit').mockResolvedValue(true);
+  // `new URL()` lowercases the host, so a mixed-case machine hostname would never match
+  // the expected URL; use a fixed lowercase one instead.
+  const TEST_HOSTNAME = 'isl-test-host.example.com';
+  jest.spyOn(os, 'hostname').mockReturnValue(TEST_HOSTNAME);
   const exitMock = jest.spyOn(process, 'exit').mockImplementation((): never => {
     throw new Error('exited');
   });
@@ -251,7 +255,7 @@ describe('run-proxy', () => {
 
     expect(JSON.parse(allConsoleStdout())).toEqual(
       expect.objectContaining({
-        url: expect.stringContaining(`https://${os.hostname()}:3011/`),
+        url: expect.stringContaining(`https://${TEST_HOSTNAME}:3011/`),
         wasServerReused: true,
       }),
     );
@@ -284,7 +288,7 @@ describe('run-proxy', () => {
     expect(killMock).toHaveBeenCalled();
     expect(JSON.parse(allConsoleStdout())).toEqual(
       expect.objectContaining({
-        url: expect.stringContaining(`https://${os.hostname()}:3011/`),
+        url: expect.stringContaining(`https://${TEST_HOSTNAME}:3011/`),
         wasServerReused: false,
       }),
     );
