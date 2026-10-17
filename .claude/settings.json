@@ -1,0 +1,13 @@
+{
+  "worktree": {
+    "symlinkDirectories": [
+      "addons/node_modules",
+      "addons/components/node_modules",
+      "addons/isl/node_modules",
+      "addons/isl-server/node_modules",
+      "addons/shared/node_modules",
+      "addons/textmate/node_modules",
+      "addons/vscode/node_modules"
+    ]
+  }
+}
