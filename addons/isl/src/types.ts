@@ -330,6 +330,10 @@ export type WorktreeEntry = {
   role: 'main' | 'linked';
   /** Hash checked out (`.`) in this worktree, best-effort. Absent if it couldn't be read. */
   node?: Hash;
+  /** Whether another worktree rewrote this worktree's checked-out commit or one below it. */
+  stale?: boolean;
+  /** Why the worktree is stale, when it is. */
+  staleReason?: string;
 };
 
 export type ApplicationInfo = {

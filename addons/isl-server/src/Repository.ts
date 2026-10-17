@@ -1018,11 +1018,12 @@ export class Repository {
       const repoRoot = this.info.repoRoot;
       const worktreeEntries =
         worktrees.length > 0 ? worktrees : [{path: repoRoot, role: 'main' as const}];
-      // Fetch the checked-out hash for sibling worktrees only; our own is already
-      // tracked via `.` in the smartlog revset.
+      // `sl worktree list` gives each worktree's checked-out hash. Older versions
+      // don't, so fall back to `sl whereami` for sibling worktrees only; our own is
+      // already tracked via `.` in the smartlog revset.
       const worktreeEntriesWithNodes = await Promise.all(
         worktreeEntries.map(async entry => {
-          if (pathsAreIdentical(entry.path, repoRoot)) {
+          if (entry.node != null || pathsAreIdentical(entry.path, repoRoot)) {
             return entry;
           }
           const node = await whereami(ctx, entry.path);

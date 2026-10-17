@@ -210,3 +210,8 @@
   background-color: var(--button-primary-background);
   color: var(--button-primary-foreground);
 }
+
+.staleBadge {
+  background-color: var(--signal-medium-bg);
+  color: var(--signal-fg);
+}

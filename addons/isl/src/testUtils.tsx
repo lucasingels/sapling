@@ -75,6 +75,8 @@ export function simulateWorktreeInfo(
     role: 'main' | 'linked';
     label?: string;
     node?: string;
+    stale?: boolean;
+    staleReason?: string;
   }>,
   supportsMutation = true,
 ) {

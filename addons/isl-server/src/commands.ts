@@ -225,7 +225,11 @@ export async function listWorktrees(ctx: RepositoryContext): Promise<WorktreeEnt
       'list',
       '-Tjson',
     ]);
-    return JSON.parse(result.stdout);
+    // `node`, `stale` and `stale_reason` are missing from older `sl` versions.
+    const entries: Array<Omit<WorktreeEntry, 'staleReason'> & {stale_reason?: string}> = JSON.parse(
+      result.stdout,
+    );
+    return entries.map(({stale_reason, ...entry}) => ({...entry, staleReason: stale_reason}));
   } catch (error) {
     ctx.logger.error(`Failed to list worktrees for ${ctx.cwd}`, error);
     return [];

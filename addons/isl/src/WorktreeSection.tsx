@@ -174,6 +174,7 @@ function WorktreeRowWithHover({
       <code className={css.worktreePath} title={wt.path}>
         {hasLabel ? wt.label : wtBasename}
       </code>
+      {wt.stale === true && <StaleWorktreeBadge wt={wt} />}
       {isCurrent ? (
         <Badge className={css.activeBadge}>Active</Badge>
       ) : (
@@ -276,6 +277,25 @@ function WorktreeRowWithHover({
         </div>
       )}
     </div>
+  );
+}
+
+/** Marks a worktree whose checked-out commit was rewritten in another worktree. */
+function StaleWorktreeBadge({wt}: {wt: WorktreeEntry}) {
+  return (
+    <Tooltip
+      title={
+        <div>
+          {wt.staleReason != null && <div>{wt.staleReason}</div>}
+          <T replace={{$cmd: <code>sl update-stale</code>}}>
+            Run $cmd in this worktree to move it onto the latest versions.
+          </T>
+        </div>
+      }>
+      <Badge className={css.staleBadge} data-testid="worktree-stale-badge">
+        <T>stale</T>
+      </Badge>
+    </Tooltip>
   );
 }
 

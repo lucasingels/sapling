@@ -1453,6 +1453,51 @@ describe('fetchSubmoduleMap', () => {
       });
     });
 
+    it('takes nodes and stale state from `sl worktree list` without calling `sl whereami`', async () => {
+      const ejeca = mockEjeca([
+        [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
+        [/^sl root --shared/, {stdout: '/repo/main'}],
+        [/^sl root/, {stdout: '/repo/main'}],
+        [/^sl debugroots/, {stdout: '/repo/main'}],
+        [
+          /^sl --config worktree\.enabled=true worktree list/,
+          {
+            stdout: JSON.stringify([
+              {path: '/repo/main', role: 'main', current: true, node: 'aaa', stale: false},
+              {
+                path: '/repo/feature',
+                label: 'feature-x',
+                role: 'linked',
+                current: false,
+                node: 'bbb',
+                stale: true,
+                stale_reason: "this worktree's commit bbb was rewritten in another worktree",
+              },
+            ]),
+          },
+        ],
+        [/^sl whereami/, {stdout: 'should-not-be-used'}],
+      ]);
+
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      const repo = new Repository(info, ctx);
+      ejeca.mockClear();
+      await repo.refreshWorktreeInfo();
+      expect(repo.getWorktreeInfo()?.worktrees).toEqual([
+        {path: '/repo/main', role: 'main', current: true, node: 'aaa', stale: false},
+        {
+          path: '/repo/feature',
+          label: 'feature-x',
+          role: 'linked',
+          current: false,
+          node: 'bbb',
+          stale: true,
+          staleReason: "this worktree's commit bbb was rewritten in another worktree",
+        },
+      ]);
+      expect(ejeca.mock.calls.filter(([, args]) => args?.includes('whereami'))).toEqual([]);
+    });
+
     it('populates worktreeInfo for solo repos with sharedRoot', async () => {
       mockEjeca([
         [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
