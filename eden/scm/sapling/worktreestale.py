@@ -28,7 +28,7 @@ import os
 import subprocess
 import time
 
-from . import error, git, hg, mutation, util
+from . import error, git, hg, merge as mergemod, mutation, util
 from .i18n import _
 from .node import bin, nullid, short
 
@@ -150,9 +150,11 @@ def updatestale(ui, repo):
 
 
 def update(ui, repo, state):
-    """move a stale checkout onto the latest versions of its commits"""
-    old = repo["."].node()
+    """move a stale checkout onto the latest versions of its commits, setting
+    uncommitted changes aside meanwhile and bringing them back afterwards"""
+    target = None
     if state[0] == REWRITTEN:
+        old = repo["."].node()
         target = _latest(repo, old)
         if target is None:
             raise error.Abort(
@@ -162,21 +164,48 @@ def update(ui, repo, state):
                 )
                 % short(old),
             )
-        with repo.wlock():
+    shelved = _shelve(repo)
+    try:
+        _move(ui, repo, state, target)
+    except BaseException:
+        if shelved:
+            # Back onto the commit they came from, or onto wherever the move
+            # got to before it failed.
             try:
-                hg.update(repo, target, quietempty=True, updatecheck="noconflict")
+                conflicts = _unshelve(ui, repo, shelved)
             except error.Abort as ex:
-                raise error.Abort(
-                    _("cannot move pending changes onto %s: %s") % (short(target), ex),
-                    hint=_("run '@prog@ goto --merge %s' and resolve") % short(target),
-                )
+                ui.warn(_("%s\n") % ex)
+            else:
+                if conflicts:
+                    ui.warn(_conflictsmessage(repo, shelved, conflicts) + "\n")
+        raise
+    if shelved:
+        conflicts = _unshelve(ui, repo, shelved)
+        if conflicts:
+            raise error.Abort(
+                _conflictsmessage(repo, shelved, conflicts),
+                hint=_(
+                    "the conflicts are marked in the files; resolve them, "
+                    "run '@prog@ resolve --mark', then '@prog@ unshelve --continue'"
+                ),
+            )
+    return 0
+
+
+def _move(ui, repo, state, target):
+    """move the clean working copy onto target, the latest version of its
+    rewritten parent, then restack whatever is still stale below it"""
+    old = repo["."].node()
+    if state[0] == REWRITTEN:
+        with repo.wlock():
+            hg.update(repo, target, quietempty=True)
         ui.warn(
             _("note: moved this worktree to the latest version %s; files changed to match\n")
             % _describe(repo, target)
         )
         state = _stalestate(repo, target)
         if state is None:
-            return 0
+            return
         old = target
 
     _restack(ui, repo)
@@ -194,7 +223,6 @@ def update(ui, repo, state):
         )
         % _describe(repo, new)
     )
-    return 0
 
 
 def _sl(path, args):
@@ -211,21 +239,58 @@ def _sl(path, args):
     return subprocess.run(cmd, capture_output=True, env=env)
 
 
-def _restack(ui, repo):
-    """restack the stack under the working copy, setting uncommitted changes
-    aside meanwhile: a rebase cannot move a working copy that has them"""
-    shelved = None
-    if any(repo.status()[:4]):
-        shelved = "update-stale-%d" % int(time.time())
-        proc = _sl(
-            repo.root,
-            ["--config", "extensions.shelve=", "shelve", "--name", shelved],
+def _shelve(repo):
+    """set uncommitted changes aside, since neither a rebase nor a git checkout
+    moves a working copy whose changes overlap the move; the shelve's name, or
+    None when there was nothing to set aside"""
+    if not any(repo.status()[:4]):
+        return None
+    shelved = "update-stale-%d" % int(time.time())
+    proc = _sl(
+        repo.root,
+        ["--config", "extensions.shelve=", "shelve", "--name", shelved],
+    )
+    repo.invalidateall()
+    if proc.returncode != 0:
+        raise error.Abort(
+            _("cannot set uncommitted changes aside: %s")
+            % proc.stderr.decode("utf-8", "replace").strip()
         )
-        if proc.returncode != 0:
-            raise error.Abort(
-                _("cannot set uncommitted changes aside: %s")
-                % proc.stderr.decode("utf-8", "replace").strip()
-            )
+    return shelved
+
+
+def _unshelve(ui, repo, shelved):
+    """bring the changes set aside back onto the working copy; the files that
+    conflict, left with conflict markers and the unshelve unfinished"""
+    proc = _sl(
+        repo.root,
+        ["--config", "extensions.shelve=", "unshelve", "--name", shelved],
+    )
+    repo.invalidateall()
+    if proc.returncode == 0:
+        return []
+    conflicts = []
+    if repo.localvfs.exists("shelvedstate"):
+        conflicts = sorted(mergemod.mergestate.read(repo).unresolved())
+    if not conflicts:
+        ui.warn(proc.stdout.decode("utf-8", "replace"))
+        ui.warn(proc.stderr.decode("utf-8", "replace"))
+        raise error.Abort(
+            _("cannot bring back the uncommitted changes set aside as shelve '%s'")
+            % shelved,
+            hint=_("they are kept there; see '@prog@ shelve --list'"),
+        )
+    return conflicts
+
+
+def _conflictsmessage(repo, shelved, conflicts):
+    return _(
+        "uncommitted changes conflict with %s in %s (they are also kept as shelve '%s')"
+    ) % (_describe(repo, repo["."].node()), ", ".join(conflicts), shelved)
+
+
+def _restack(ui, repo):
+    """restack the stack under the clean working copy"""
     try:
         _sl(
             repo.root,
@@ -240,14 +305,6 @@ def _restack(ui, repo):
             ],
         )
     finally:
-        if shelved:
-            proc = _sl(
-                repo.root,
-                ["--config", "extensions.shelve=", "unshelve", "--name", shelved],
-            )
-            if proc.returncode != 0:
-                ui.warn(proc.stdout.decode("utf-8", "replace"))
-                ui.warn(proc.stderr.decode("utf-8", "replace"))
         repo.invalidateall()
         mutation.clearobsoletecache(repo)
 

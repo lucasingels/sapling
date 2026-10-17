@@ -179,6 +179,114 @@ Set in a config file, it also restacks with uncommitted changes set aside:
   a4
   $ setconfig worktree.auto-update-stale=false
 
+Uncommitted changes to the files the rewrite changed come along too. Ones that
+merge cleanly land on the latest version:
+
+  $ setconfig extensions.shelve=
+  $ git init -q -b main $TESTTMP/overlap
+  $ cd $TESTTMP/overlap
+  $ echo 1 > f
+  $ echo 2 >> f
+  $ echo 3 >> f
+  $ git add f
+  $ git commit -q -m base
+  $ git checkout -q --detach
+  $ echo c > c
+  $ sl commit -qAm C
+  $ sl worktree add -q $TESTTMP/clean
+  $ sl worktree add -q $TESTTMP/conflict
+  $ sl worktree add -q $TESTTMP/stacked
+  $ echo 1 > $TESTTMP/clean/f
+  $ echo 2 >> $TESTTMP/clean/f
+  $ echo three >> $TESTTMP/clean/f
+  $ echo uno > $TESTTMP/conflict/f
+  $ echo 2 >> $TESTTMP/conflict/f
+  $ echo 3 >> $TESTTMP/conflict/f
+  $ cd $TESTTMP/stacked
+  $ echo d > d
+  $ sl commit -qAm D
+  $ echo uno > f
+  $ echo 2 >> f
+  $ echo 3 >> f
+  $ cd $TESTTMP/overlap
+  $ echo one > f
+  $ echo 2 >> f
+  $ echo 3 >> f
+  $ sl amend -qm C2
+  hint[amend-restack]: descendants of 6268e51f817f are left behind - use 'sl restack' to rebase them
+  hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
+  note: worktree $TESTTMP/clean is now stale (it is on 6268e51f817f "C"); 'sl update-stale' there moves it onto the latest versions
+  note: worktree $TESTTMP/conflict is now stale (it is on 6268e51f817f "C"); 'sl update-stale' there moves it onto the latest versions
+  note: worktree $TESTTMP/stacked is now stale (it is on 12115d535d4a "D"); 'sl update-stale' there moves it onto the latest versions
+
+  $ cd $TESTTMP/clean
+  $ sl update-stale
+  note: this worktree's commit 6268e51f817f "C" was rewritten in another worktree
+  note: moved this worktree to the latest version 0937152ba8f5 "C2"; files changed to match
+  $ cat f
+  one
+  2
+  three
+  $ sl status
+  M f
+
+Ones that conflict stop update-stale with the conflicts marked, the way
+unshelve leaves them, rather than reporting success:
+
+  $ cd $TESTTMP/conflict
+  $ sl update-stale
+  note: this worktree's commit 6268e51f817f "C" was rewritten in another worktree
+  note: moved this worktree to the latest version 0937152ba8f5 "C2"; files changed to match
+  abort: uncommitted changes conflict with 0937152ba8f5 "C2" in f (they are also kept as shelve 'update-stale-*') (glob)
+  (the conflicts are marked in the files; resolve them, run 'sl resolve --mark', then 'sl unshelve --continue')
+  [255]
+  $ sl status
+  M f
+  ? f.orig
+  $ echo uno > f
+  $ echo 2 >> f
+  $ echo 3 >> f
+  $ sl resolve --mark f
+  (no more unresolved files)
+  continue: sl unshelve --continue
+  $ sl unshelve --continue
+  rebasing * "shelve changes to: C" (glob)
+  unshelve of 'update-stale-*' complete (glob)
+  $ cat f
+  uno
+  2
+  3
+  $ sl status
+  M f
+  ? f.orig
+  $ sl shelve --list
+  $ sl update-stale
+  this worktree is not stale
+
+The same goes for a restack, and with worktree.auto-update-stale the command
+that triggered the update does not run:
+
+  $ cd $TESTTMP/stacked
+  $ sl commit -qm E --config worktree.auto-update-stale=true
+  note: 6268e51f817f "C", below this worktree's commit, was rewritten in another worktree
+  note: restacked this worktree's commits onto the latest versions, now on 1430ebce3c52 "D"; files changed to match
+  abort: uncommitted changes conflict with 1430ebce3c52 "D" in f (they are also kept as shelve 'update-stale-*') (glob)
+  (the conflicts are marked in the files; resolve them, run 'sl resolve --mark', then 'sl unshelve --continue')
+  [255]
+  $ sl log -r '.^::.' -T '{desc}\n'
+  C2
+  D
+
+Aborting the unshelve instead keeps the changes in the shelve:
+
+  $ sl unshelve --abort
+  rebase aborted
+  unshelve of 'update-stale-*' aborted (glob)
+  $ sl status
+  ? f.orig
+  $ sl shelve --list
+  update-stale-* shelve changes to: D (glob)
+
 Outside a worktree group, an obsolete working copy parent is not stale:
 
   $ git init -q -b main $TESTTMP/single
