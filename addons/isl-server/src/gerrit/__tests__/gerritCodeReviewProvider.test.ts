@@ -64,6 +64,7 @@ const GERRIT_CHANGE_RESPONSE = (changeId: string, number: number) =>
       subject: 'My feature',
       status: 'NEW',
       submittable: true,
+      current_revision: 'f00df00df00df00df00df00df00df00df00df00d',
       labels: {
         'Code-Review': {approved: {name: 'Bob'}, all: [{value: 2}, {value: 1}]},
         Verified: {approved: {name: 'CI'}, all: [{value: 1}]},
@@ -124,7 +125,7 @@ describe('GerritCodeReviewProvider', () => {
     const [[url]] = (https.get as jest.Mock).mock.calls;
     expect(url).toMatchObject({
       hostname: 'code.example.com',
-      path: '/changes/?q=project:my-repo&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS',
+      path: '/changes/?q=project:my-repo&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION',
     });
 
     expect(results).toHaveLength(1);
@@ -144,6 +145,7 @@ describe('GerritCodeReviewProvider', () => {
       submittable: true,
       isWorkInProgress: false,
       isPrivate: false,
+      currentRevision: 'f00df00df00df00df00df00df00df00df00df00d',
     });
   });
 

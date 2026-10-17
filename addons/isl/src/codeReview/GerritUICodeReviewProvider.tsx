@@ -12,7 +12,6 @@ import type {Operation} from '../operations/Operation';
 import type {Dag} from '../previews';
 import type {CodeReviewSystem, CommitInfo, DiffId, DiffSummary, Hash} from '../types';
 import type {UICodeReviewProvider} from './UICodeReviewProvider';
-import type {SyncStatus} from './syncStatus';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
@@ -27,6 +26,7 @@ import {t, T} from '../i18n';
 import {succeedableRevset} from '../types';
 import {showModal} from '../useModal';
 import {allDiffSummaries, codeReviewProvider} from './CodeReviewInfo';
+import {SyncStatus} from './syncStatus';
 import './GerritBadge.css';
 
 /**
@@ -82,6 +82,18 @@ function tooltipForSummary(summary: GerritDiffSummary): string {
   }
 }
 
+/** The commit of the latest patchset of `commit`'s open change, when Gerrit reported one. */
+function uploadedRevision(
+  commit: CommitInfo,
+  diffSummaries: Map<string, DiffSummary>,
+): string | undefined {
+  if (commit.diffId == null) {
+    return undefined;
+  }
+  const summary = diffSummaries.get(commit.diffId) as GerritDiffSummary | undefined;
+  return summary?.state === 'NEW' ? summary.currentRevision : undefined;
+}
+
 export class GerritUICodeReviewProvider implements UICodeReviewProvider {
   name = 'gerrit';
   label = t('Gerrit');
@@ -127,10 +139,22 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
   }
 
   getSyncStatuses(
-    _commits: CommitInfo[],
-    _allDiffSummaries: Map<string, DiffSummary>,
+    commits: CommitInfo[],
+    allDiffSummaries: Map<string, DiffSummary>,
   ): Map<string, SyncStatus> {
-    return new Map();
+    // Gerrit only gives the latest patchset's commit, so a commit that differs from it
+    // counts as changed locally; a newer patchset uploaded elsewhere looks the same.
+    const statuses = new Map<string, SyncStatus>();
+    for (const commit of commits) {
+      const uploaded = uploadedRevision(commit, allDiffSummaries);
+      if (uploaded != null) {
+        statuses.set(
+          commit.hash,
+          uploaded === commit.hash ? SyncStatus.InSync : SyncStatus.LocalIsNewer,
+        );
+      }
+    }
+    return statuses;
   }
 
   RepoInfo = () => {
@@ -218,6 +242,11 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
       const summary = diffSummaries.get(commit.diffId) as GerritDiffSummary | undefined;
       return summary != null && summary.state !== 'MERGED' && summary.state !== 'ABANDONED';
     });
+
+    // Nothing to publish when every commit is already the latest patchset of its change.
+    if (stack.every(commit => uploadedRevision(commit, diffSummaries) === commit.hash)) {
+      return {};
+    }
 
     return {resubmittableStack, submittableStack: this.getSubmittableDiffs(stack, diffSummaries)};
   }

@@ -73,6 +73,8 @@ export type GerritDiffSummary = {
   isWorkInProgress: boolean;
   /** Whether the change is marked private on Gerrit. */
   isPrivate: boolean;
+  /** Commit hash of the change's latest patchset, to tell whether the local commit was uploaded as is. */
+  currentRevision?: string;
 };
 
 type GerritCodeReviewSystem = CodeReviewSystem & {
@@ -304,7 +306,7 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
         // only on the /a/ path; requests to /changes/ are treated as anonymous even with
         // an Authorization header.
         const changesBase = credentials ? `${webUrl}/a/changes/` : `${webUrl}/changes/`;
-        const url = `${changesBase}?q=${query}&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS`;
+        const url = `${changesBase}?q=${query}&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION`;
         this.logger.info(`Gerrit: fetching changes for project ${project} from REST API`);
         const raw = await fetchUrl(url, credentials);
         const results = parseGerritJson(raw);
@@ -382,6 +384,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
             branchName,
             isWorkInProgress,
             isPrivate,
+            currentRevision:
+              typeof change.current_revision === 'string' ? change.current_revision : undefined,
             codeReview,
             codeReviewAttribution,
             signalSummary,

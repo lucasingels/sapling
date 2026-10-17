@@ -43,7 +43,7 @@ function hashes(commits?: Array<CommitInfo>): Array<Hash> {
   return (commits ?? []).map(c => c.hash);
 }
 
-function gerritSummary(state: 'NEW' | 'MERGED' | 'ABANDONED'): DiffSummary {
+function gerritSummary(state: 'NEW' | 'MERGED' | 'ABANDONED', currentRevision?: Hash): DiffSummary {
   return {
     type: 'gerrit',
     title: '',
@@ -57,6 +57,7 @@ function gerritSummary(state: 'NEW' | 'MERGED' | 'ABANDONED'): DiffSummary {
     submittable: false,
     isWorkInProgress: false,
     isPrivate: false,
+    currentRevision,
   } as DiffSummary;
 }
 
@@ -176,6 +177,61 @@ describe('GerritUICodeReviewProvider', () => {
       const dag = stackDag([{hash: 'a'}, {hash: 'b'}, {hash: 'c'}]);
       const actions = provider.getSupportedStackActions('b', dag, new Map());
       expect(hashes(actions.submittableStack)).toEqual(['b', 'c']);
+    });
+
+    describe('compared with the uploaded patchsets', () => {
+      const dag = stackDag([
+        {hash: 'a', diffId: 'Ia' as DiffId},
+        {hash: 'b', diffId: 'Ib' as DiffId},
+      ]);
+      const uploaded = (revisions: [Hash, Hash]) =>
+        new Map<DiffId, DiffSummary>([
+          ['Ia' as DiffId, gerritSummary('NEW', revisions[0])],
+          ['Ib' as DiffId, gerritSummary('NEW', revisions[1])],
+        ]);
+
+      it("offers nothing when every commit is its change's latest patchset", () => {
+        expect(provider.getSupportedStackActions('a', dag, uploaded(['a', 'b']))).toEqual({});
+      });
+
+      it('offers a new patchset once any commit differs from what was uploaded', () => {
+        const actions = provider.getSupportedStackActions('a', dag, uploaded(['a', 'old-b']));
+        expect(hashes(actions.resubmittableStack)).toEqual(['a', 'b']);
+      });
+
+      it('still offers to publish a new commit on top of an uploaded stack', () => {
+        const withNewTop = stackDag([
+          {hash: 'a', diffId: 'Ia' as DiffId},
+          {hash: 'b', diffId: 'Ib' as DiffId},
+          {hash: 'c', diffId: 'Ic' as DiffId},
+        ]);
+        const actions = provider.getSupportedStackActions('a', withNewTop, uploaded(['a', 'b']));
+        expect(hashes(actions.submittableStack)).toEqual(['a', 'b', 'c']);
+      });
+    });
+  });
+
+  describe('getSyncStatuses', () => {
+    it('marks commits by whether they are the latest uploaded patchset', () => {
+      const commits = [
+        {hash: 'a', diffId: 'Ia'},
+        {hash: 'b', diffId: 'Ib'},
+        {hash: 'c', diffId: 'Ic'},
+        {hash: 'd'},
+      ] as Array<CommitInfo>;
+      const statuses = provider.getSyncStatuses(
+        commits,
+        new Map<DiffId, DiffSummary>([
+          ['Ia' as DiffId, gerritSummary('NEW', 'a')],
+          ['Ib' as DiffId, gerritSummary('NEW', 'old-b')],
+          // Gerrit did not report a revision, or the change is closed: unknown.
+          ['Ic' as DiffId, gerritSummary('MERGED', 'c')],
+        ]),
+      );
+      expect([...statuses.entries()]).toEqual([
+        ['a', 'inSync'],
+        ['b', 'localIsNewer'],
+      ]);
     });
   });
 
