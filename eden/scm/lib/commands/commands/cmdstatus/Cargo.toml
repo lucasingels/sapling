@@ -22,5 +22,6 @@ sapling-status = { version = "0.1.0", path = "../../../status" }
 sapling-types = { version = "0.1.0", path = "../../../types" }
 sapling-util = { version = "0.1.0", path = "../../../util" }
 sapling-workingcopy = { version = "0.1.0", path = "../../../workingcopy" }
+sapling-worktree-stale = { version = "0.1.0", path = "../../../worktree/stale" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

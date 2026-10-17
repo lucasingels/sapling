@@ -272,6 +272,10 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8>
 
     print::print_status(formatter, relativizer, &print_config, &status, &copymap)?;
 
+    if let Some(note) = worktree_stale::checkout_note(repo, &wc.parents().unwrap_or_default()) {
+        ctx.io().write_err(note)?;
+    }
+
     Ok(0)
 }
 

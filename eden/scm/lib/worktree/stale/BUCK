@@ -1,0 +1,44 @@
+load("//eden/scm:targets.bzl", "sl_rust_library")
+
+oncall("sapling")
+
+sl_rust_library(
+    name = "worktree-stale",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "sapling-configmodel": {
+                        "features": [
+                            "convert-matcher",
+                        ],
+                    },
+                },
+            },
+            "lib": {"name": "worktree_stale"},
+            "package": {
+                "authors": ["Meta Source Control Team <sourcecontrol-dev@meta.com>"],
+                "homepage": "https://sapling-scm.com/",
+                "license": "GPL-2.0-only",
+                "name": "sapling-worktree-stale",
+                "repository": "https://github.com/facebook/sapling",
+            },
+        },
+    },
+    crate_root = "src/lib.rs",
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:tracing",
+        "//eden/scm/lib/async-runtime:async-runtime",
+        "//eden/scm/lib/commits/trait:commits-trait",
+        "//eden/scm/lib/config/model:configmodel",
+        "//eden/scm/lib/dag:dag",
+        "//eden/scm/lib/mutationstore:mutationstore",
+        "//eden/scm/lib/pathmatcher:pathmatcher",
+        "//eden/scm/lib/repo:repo",
+        "//eden/scm/lib/types:types",
+        "//eden/scm/lib/workingcopy/repostate:repostate",
+    ],
+)

@@ -31,13 +31,23 @@ Rewriting A in the main checkout leaves the other checkouts alone:
   $ cat $TESTTMP/wt/a
   a
   $ sl -R $TESTTMP/wt log -r . -T '{desc}\n'
+  note: this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
   A
 
-Read-only commands work in the stale checkout; commands that would build on or
-rewrite the stale commit refuse:
+Read-only commands work in the stale checkout and note that it is stale, the
+Rust ones (status, whereami) included; whereami keeps the bare hash on stdout:
 
   $ cd $TESTTMP/wt
   $ sl status
+  note: this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
+  $ sl whereami
+  6592f5ce41bd* (glob)
+  note: this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
+  $ sl whereami 2>/dev/null
+  6592f5ce41bd* (glob)
+
+Commands that would build on or rewrite the stale commit refuse:
+
   $ echo b > b
   $ sl commit -qAm B
   abort: stale worktree: this worktree's commit 6592f5ce41bd "A" was rewritten in another worktree
@@ -102,16 +112,21 @@ too, and update-stale restacks them, uncommitted changes and all:
   $ sl status
   M b
 
-With worktree.auto-update-stale, any command first updates a stale checkout:
+With worktree.auto-update-stale, a command that would build on the stale
+commits first updates the checkout; read-only commands still only note it:
 
   $ cd $TESTTMP/repo
   $ sl metaedit -q -r $(sl -R $TESTTMP/wt log -r . -T '{node}') -m B2
   note: worktree $TESTTMP/wt is now stale (it is on 583eed58c3e0 "B"); 'sl update-stale' there moves it onto the latest versions
   $ cd $TESTTMP/wt
   $ sl log -r . -T '{desc}\n' --config worktree.auto-update-stale=true
+  note: this worktree's commit 583eed58c3e0 "B" was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
+  B
+  $ sl metaedit -m B3 --config worktree.auto-update-stale=true
   note: this worktree's commit 583eed58c3e0 "B" was rewritten in another worktree
   note: moved this worktree to the latest version 47c3fc8a52d7 "B2"; files changed to match
-  B2
+  $ sl log -r . -T '{desc}\n'
+  B3
   $ sl status
   M b
 
@@ -124,12 +139,17 @@ Set in a config file, it also restacks with uncommitted changes set aside:
   $ sl amend -q --no-rebase
   hint[amend-restack]: descendants of * are left behind - use 'sl restack' to rebase them (glob)
   hint[hint-ack]: use 'sl hint --ack amend-restack' to silence these hints
-  note: worktree $TESTTMP/wt is now stale (it is on 47c3fc8a52d7 "B2"); it moves onto the latest versions at its next sl command
+  note: worktree $TESTTMP/wt is now stale (it is on f961745d4e8e "B3"); it moves onto the latest versions before the next command there that would build on them
   $ cd $TESTTMP/wt
   $ sl log -r . -T '{desc}\n'
+  note: 94cd8d1654d1 "A2", below this worktree's commit, was rewritten in another worktree; 'sl update-stale' moves it onto the latest versions
+  B3
+  $ sl metaedit -m B4
   note: 94cd8d1654d1 "A2", below this worktree's commit, was rewritten in another worktree
-  note: restacked this worktree's commits onto the latest versions, now on c8229bba727d "B2"; files changed to match
-  B2
+  note: restacked this worktree's commits onto the latest versions, now on 3f0065896a64 "B3"; files changed to match
+  $ sl log -r '.^::.' -T '{desc}\n'
+  A2
+  B4
   $ sl status
   M b
   $ cat a
@@ -150,3 +170,5 @@ Outside a worktree group, an obsolete working copy parent is not stale:
   $ sl commit -qAm Y
   warning: creating a child of an old version of a commit will diverge your stack:
   - * -> * (amend) (glob)
+
+  $ sl whereami > /dev/null

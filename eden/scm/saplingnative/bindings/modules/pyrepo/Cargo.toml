@@ -27,3 +27,4 @@ sapling-repolock = { version = "0.1.0", path = "../../../../lib/repolock" }
 sapling-types = { version = "0.1.0", path = "../../../../lib/types" }
 sapling-util = { version = "0.1.0", path = "../../../../lib/util" }
 sapling-workingcopy = { version = "0.1.0", path = "../../../../lib/workingcopy" }
+sapling-worktree-stale = { version = "0.1.0", path = "../../../../lib/worktree/stale" }

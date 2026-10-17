@@ -16,15 +16,19 @@ command runs in it. The rewriting command lists the checkouts it made stale.
 In a stale checkout, commands that would build on, rewrite or publish the
 stale commits (``worktree.stale-blocked-commands``) refuse to run until
 ``@prog@ update-stale`` moves it onto the latest versions, carrying uncommitted
-changes along. With ``worktree.auto-update-stale=true``, every command in a
-stale checkout runs that update first.
+changes along. With ``worktree.auto-update-stale=true``, those commands run
+that update first instead. Every other command, ``status`` and ``whereami``
+included, only notes that the checkout is stale.
+
+Detecting the state is shared with the Rust commands: see the
+``worktree_stale`` crate, reached through ``repo._rsrepo``.
 """
 
 import os
 import subprocess
 import time
 
-from . import cmdutil, error, git, hg, mutation, util
+from . import error, git, hg, mutation, util
 from .i18n import _
 from .node import bin, nullid, short
 
@@ -47,6 +51,9 @@ REWRITTEN = "rewritten"
 # A commit below the working copy parent was rewritten.
 ORPHANED = "orphaned"
 
+# A stale state is (REWRITTEN or ORPHANED, the rewritten commit, why the
+# checkout is stale), as the worktree_stale crate reports it.
+
 # The commits the current command rewrote, by the root of the repo it ran in.
 # The checkouts stacked on them are listed once the command is done.
 _rewritten = {}
@@ -66,36 +73,10 @@ def _ingroup(repo):
         return False
 
 
-def _hasnewerversion(repo, node, isvisible):
-    return any(isvisible(s) for s in mutation.allsuccessors(repo, [node], startdepth=1))
-
-
 def _stalestate(repo, node):
-    """(REWRITTEN or ORPHANED, the rewritten commit) for a checkout at node,
-    or None if it is not stale
-
-    This walks the graph instead of using ``obsolete()``: another checkout's
-    commits are hidden here once rewritten here, and revsets only see visible
-    commits.
-    """
-    cl = repo.changelog
-    if not cl.hasnode(node):
-        return None
-    ispublic = mutation.getispublicfunc(repo)
-    isvisible = mutation.getisvisiblefunc(repo)
-    if _hasnewerversion(repo, node, isvisible):
-        return REWRITTEN, node
-    seen = {node}
-    pending = list(cl.parents(node))
-    while pending:
-        n = pending.pop()
-        if n == nullid or n in seen or ispublic(n):
-            continue
-        seen.add(n)
-        if _hasnewerversion(repo, n, isvisible):
-            return ORPHANED, n
-        pending.extend(cl.parents(n))
-    return None
+    """the stale state of a checkout at node, judged by this repo's
+    visibility, or None if it is not stale"""
+    return repo._rsrepo.worktreestalestate(node, list(repo.dirstate.parents()))
 
 
 def _latest(repo, node):
@@ -120,49 +101,37 @@ def _describe(repo, node):
     return '%s "%s"' % (short(node), title)
 
 
-def _staleness(repo, state):
-    kind, node = state
-    if kind == REWRITTEN:
-        return _("this worktree's commit %s was rewritten in another worktree") % (
-            _describe(repo, node)
-        )
-    return _("%s, below this worktree's commit, was rewritten in another worktree") % (
-        _describe(repo, node)
-    )
-
-
 def _state(repo):
-    """the stale state of this checkout, or None when there is nothing to check"""
+    """the stale state of this checkout, or None when there is nothing to check
+    (outside a worktree group, during a merge or an unfinished operation, on a
+    public commit)"""
     if not _ingroup(repo):
         return None
-    ctx = repo["."]
-    if ctx.node() == nullid or not ctx.mutable() or repo.dirstate.p2() != nullid:
-        return None
-    try:
-        cmdutil.checkunfinished(repo)
-    except error.Abort:
-        # A rebase, graft, ... in progress owns the working copy.
-        return None
-    return _stalestate(repo, ctx.node())
+    return repo._rsrepo.worktreecheckoutstale(list(repo.dirstate.parents()))
 
 
 def checkstale(ui, repo, cmd):
-    """before running cmd in this checkout, update it or refuse if it is stale"""
+    """before running cmd in this checkout, note that it is stale, or, for a
+    command that would build on the stale commits, update it or refuse"""
     if cmd == "update-stale":
         return
     state = _state(repo)
     if state is None:
         return
-    if ui.configbool("worktree", "auto-update-stale"):
-        ui.warn(_("note: %s\n") % _staleness(repo, state))
-        update(ui, repo, state)
-        return
     if cmd not in ui.configlist(
         "worktree", "stale-blocked-commands", DEFAULT_BLOCKED_COMMANDS
     ):
+        ui.warn(
+            _("note: %s; '@prog@ update-stale' moves it onto the latest versions\n")
+            % state[2]
+        )
+        return
+    if ui.configbool("worktree", "auto-update-stale"):
+        ui.warn(_("note: %s\n") % state[2])
+        update(ui, repo, state)
         return
     raise error.Abort(
-        _("stale worktree: %s") % _staleness(repo, state),
+        _("stale worktree: %s") % state[2],
         hint=_(
             "nothing was changed; run '@prog@ update-stale' to move this worktree "
             "onto the latest versions (uncommitted changes come along), then retry"
@@ -176,7 +145,7 @@ def updatestale(ui, repo):
     if state is None:
         ui.status(_("this worktree is not stale\n"))
         return 0
-    ui.warn(_("note: %s\n") % _staleness(repo, state))
+    ui.warn(_("note: %s\n") % state[2])
     return update(ui, repo, state)
 
 
@@ -332,7 +301,10 @@ def _notestale(repo):
     ui = repo.ui
     root = os.path.realpath(repo.root)
     if ui.configbool("worktree", "auto-update-stale"):
-        then = _("it moves onto the latest versions at its next @prog@ command")
+        then = _(
+            "it moves onto the latest versions before the next command there "
+            "that would build on them"
+        )
     else:
         then = _("'@prog@ update-stale' there moves it onto the latest versions")
     for path, node in sorted(_checkouts(repo).items()):

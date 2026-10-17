@@ -247,6 +247,7 @@ members = [
   "lib/workingcopy",
   "lib/workingcopy/repostate",
   "lib/worktree",
+  "lib/worktree/stale",
   "lib/xdiff",
   "lib/xdiff-sys",
   "lib/xdiff/xdiff-cli",

@@ -126,6 +126,24 @@ py_class!(pub class repo |py| {
         Ok(Serde(parents))
     }
 
+    /// The stale state of this checkout of a git worktree group, whose
+    /// working copy parents are `parents`, as (kind, rewritten node, message),
+    /// or None. See the `worktree_stale` crate.
+    def worktreecheckoutstale(&self, parents: Serde<Vec<HgId>>) -> PyResult<Option<(String, Serde<HgId>, String)>> {
+        let repo = self.inner(py).read();
+        let state = worktree_stale::checkout_state(&repo, &parents).map_pyerr(py)?;
+        Ok(state.map(|state| (state.kind.as_str().to_string(), Serde(state.commit), state.message(&repo))))
+    }
+
+    /// The stale state of a checkout at `node`, judged by this repo's
+    /// visibility with working copy parents `wdirparents`, as
+    /// (kind, rewritten node, message), or None.
+    def worktreestalestate(&self, node: Serde<HgId>, wdirparents: Serde<Vec<HgId>>) -> PyResult<Option<(String, Serde<HgId>, String)>> {
+        let repo = self.inner(py).read();
+        let state = worktree_stale::stale_state(&repo, &node, &wdirparents).map_pyerr(py)?;
+        Ok(state.map(|state| (state.kind.as_str().to_string(), Serde(state.commit), state.message(&repo))))
+    }
+
     def invalidateworkingcopy(&self) -> PyResult<PyNone> {
         let wc_option = self.inner_wc(py).borrow_mut();
         if wc_option.is_some() {

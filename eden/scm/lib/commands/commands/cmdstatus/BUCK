@@ -33,5 +33,6 @@ sl_rust_library(
         "//eden/scm/lib/util:util",
         "//eden/scm/lib/util/hgplain:hgplain",
         "//eden/scm/lib/workingcopy:workingcopy",
+        "//eden/scm/lib/worktree/stale:worktree-stale",
     ],
 )

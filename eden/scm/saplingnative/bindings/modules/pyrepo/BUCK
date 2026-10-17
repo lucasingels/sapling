@@ -19,6 +19,7 @@ rust_python_library(
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/util:util",
         "//eden/scm/lib/workingcopy:workingcopy",
+        "//eden/scm/lib/worktree/stale:worktree-stale",
         "//eden/scm/saplingnative/bindings/modules/pyconfigloader:pyconfigloader",
         "//eden/scm/saplingnative/bindings/modules/pydag:pydag",
         "//eden/scm/saplingnative/bindings/modules/pyeagerepo:pyeagerepo",

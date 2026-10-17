@@ -25,6 +25,11 @@ pub fn run(ctx: ReqCtx<NoOpts>, repo: &Repo) -> Result<u8> {
         write!(stdout, "{}\n", p2.to_hex())?;
     }
 
+    // stdout stays the bare hashes that scripts and ISL parse.
+    if let Some(note) = worktree_stale::checkout_note(repo, &parents.to_vec()) {
+        ctx.io().write_err(note)?;
+    }
+
     Ok(0)
 }
 

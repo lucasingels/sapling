@@ -24,5 +24,6 @@ sl_rust_library(
         "//eden/scm/lib/repo:repo",
         "//eden/scm/lib/types:types",
         "//eden/scm/lib/workingcopy:workingcopy",
+        "//eden/scm/lib/worktree/stale:worktree-stale",
     ],
 )

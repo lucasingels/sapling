@@ -6423,14 +6423,16 @@ def updatestale(ui, repo):
     A checkout of a git worktree group is stale once another checkout rewrites
     the commit it has checked out, or a commit below it. Commands that would
     build on, rewrite or publish the stale commits refuse to run there until
-    it is updated (see ``worktree.stale-blocked-commands``).
+    it is updated (see ``worktree.stale-blocked-commands``). Other commands,
+    ``status`` and ``whereami`` included, run as usual and note on stderr that
+    the checkout is stale.
 
     This moves the working copy to the latest version of its commit and
     restacks its own commits onto the latest versions of the ones below,
     carrying uncommitted changes along.
 
-    Set ``worktree.auto-update-stale=true`` to update a stale checkout
-    automatically whenever a command runs in it.
+    Set ``worktree.auto-update-stale=true`` to have those commands update a
+    stale checkout automatically before they run, instead of refusing.
 
     Returns 0 on success.
     """
