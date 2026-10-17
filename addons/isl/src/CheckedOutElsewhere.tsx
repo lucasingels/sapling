@@ -10,7 +10,7 @@ import type {Hash, WorktreeEntry} from './types';
 import {atom} from 'jotai';
 import {basename, guessPathSep, isHexHash, pathsAreIdentical} from 'shared/utils';
 import {focusMode} from './atoms/FocusModeState';
-import {failsafeFeatureFlagLoadable} from './featureFlags';
+import {featureFlagLoadable} from './featureFlags';
 import {Internal} from './Internal';
 import {atomFamilyWeak, localStorageBackedAtom} from './jotaiUtils';
 import {repositoryInfo, worktreeInfoData} from './serverAPIState';
@@ -29,9 +29,14 @@ const loadedWorktreeInfo = atom(get => {
     return undefined;
   }
 
-  const flag = get(failsafeFeatureFlagLoadable(Internal.featureFlags?.Worktrees));
-  if (flag.state !== 'hasData' || flag.data !== true) {
-    return undefined;
+  // The flag is only an internal rollout failsafe. OSS builds have no feature-flag
+  // service (the flag name is undefined there), so the feature is simply on.
+  const flagName = Internal.featureFlags?.Worktrees;
+  if (flagName != null) {
+    const flag = get(featureFlagLoadable(flagName));
+    if (flag.state !== 'hasData' || flag.data !== true) {
+      return undefined;
+    }
   }
 
   return {info, worktreeInfo};

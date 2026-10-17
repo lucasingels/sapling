@@ -150,7 +150,6 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
-        worktreesSupported: false,
       });
     });
 
@@ -173,7 +172,6 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
-        worktreesSupported: false,
       });
     });
 
@@ -228,7 +226,6 @@ describe('Repository', () => {
         pullRequestDomain: 'github.com',
         preferredSubmitCommand: undefined,
         isEdenFs: false,
-        worktreesSupported: false,
       });
     });
   });
@@ -274,21 +271,7 @@ describe('Repository', () => {
       pullRequestDomain: undefined,
       preferredSubmitCommand: undefined,
       isEdenFs: false,
-      worktreesSupported: false,
     });
-  });
-
-  it('marks git-backed repos as supporting worktrees', async () => {
-    setConfigOverrideForTests([]);
-    setPathsDefault('');
-    mockEjeca([
-      [/^sl root --dotdir/, {stdout: '/path/to/myRepo/.git/sl'}],
-      [/^sl root/, {stdout: '/path/to/myRepo'}],
-      [/^sl debugroots/, {stdout: '/path/to/myRepo'}],
-    ]);
-    const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
-    expect(info.isEdenFs).toBe(false);
-    expect(info.worktreesSupported).toBe(true);
   });
 
   it('drops ancestor repos that are not really submodules', async () => {
@@ -1599,7 +1582,10 @@ describe('fetchSubmoduleMap', () => {
       await gitRepo.refreshWorktreeInfo();
       expect(gitRepo.getWorktreeInfo()?.supportsMutation).toBe(false);
 
-      const dotGitRepo = new Repository({...info, isEdenFs: false, worktreesSupported: true}, ctx);
+      const dotGitRepo = new Repository(
+        {...info, isEdenFs: false, dotdir: '/repo/main/.git/sl'},
+        ctx,
+      );
       await dotGitRepo.refreshWorktreeInfo();
       expect(dotGitRepo.getWorktreeInfo()?.supportsMutation).toBe(true);
     });

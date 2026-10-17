@@ -307,11 +307,6 @@ export type ValidatedRepoInfo = {
   pullRequestDomain: string | undefined;
   preferredSubmitCommand?: PreferredSubmitCommand;
   isEdenFs: boolean;
-  /**
-   * True when this repo can host linked worktrees: either an EdenFS checkout, or a
-   * git-backed repo where `sl worktree` is implemented with `git worktree`.
-   */
-  worktreesSupported?: boolean;
 };
 
 export type WorktreeInfo = {

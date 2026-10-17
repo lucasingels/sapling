@@ -894,18 +894,6 @@ async function resolveWorktreeRepo(): Promise<
   if (repo == null) {
     return undefined;
   }
-  if (repo.info.worktreesSupported !== true) {
-    vscode.window.showErrorMessage(
-      t(
-        'Worktrees are not supported for this repository (needs EdenFS or a git-backed repository)',
-      ),
-    );
-    return undefined;
-  }
-  if (repo.info.isEdenFs === true && repo.info.codeReviewSystem.type === 'github') {
-    vscode.window.showErrorMessage(t('Worktrees are not supported for GitHub repositories'));
-    return undefined;
-  }
   try {
     await repo.refreshWorktreeInfo();
   } catch (err) {
@@ -916,6 +904,11 @@ async function resolveWorktreeRepo(): Promise<
   const worktreeInfo = repo.getWorktreeInfo();
   if (worktreeInfo == null) {
     vscode.window.showErrorMessage(t('Worktrees are not available for this repository'));
+    return undefined;
+  }
+  // Same gate as the ISL worktree UI: the server decides which repos support worktrees.
+  if (!worktreeInfo.supportsMutation) {
+    vscode.window.showErrorMessage(t('Worktrees require EdenFS or a git-backed repository'));
     return undefined;
   }
   return {repo, worktreeInfo};

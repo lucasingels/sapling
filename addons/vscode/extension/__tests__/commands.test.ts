@@ -381,7 +381,6 @@ describe('worktree commands', () => {
     info: {
       repoRoot,
       isEdenFs: true,
-      worktreesSupported: true,
       codeReviewSystem: {type: 'phabricator'},
     },
     refreshWorktreeInfo: jest.fn().mockResolvedValue(undefined),
@@ -872,30 +871,20 @@ describe('worktree commands', () => {
   });
 
   it('shows an error for repos that cannot host worktrees', async () => {
-    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([
-      {
-        ...mockRepo,
-        info: {...mockRepo.info, isEdenFs: false, worktreesSupported: false},
-      } as unknown as Repository,
-    ]);
+    mockRepo.getWorktreeInfo.mockReturnValueOnce({...worktreeInfoFixture, supportsMutation: false});
 
     await vscodeCommands['sapling.worktree.switch'].apply(ctx);
 
     expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      'Worktrees are not supported for this repository (needs EdenFS or a git-backed repository)',
+      'Worktrees require EdenFS or a git-backed repository',
     );
     expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
   });
 
-  it('accepts git-backed repos that support worktrees', async () => {
+  it('accepts git-backed GitHub repos that support worktrees', async () => {
     const gitRepo = {
       ...mockRepo,
-      info: {
-        ...mockRepo.info,
-        isEdenFs: false,
-        worktreesSupported: true,
-        codeReviewSystem: {type: 'github'},
-      },
+      info: {...mockRepo.info, isEdenFs: false, codeReviewSystem: {type: 'github'}},
     } as unknown as jest.Mocked<Repository>;
     jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([gitRepo]);
     mockShowQuickPick
@@ -914,22 +903,6 @@ describe('worktree commands', () => {
       vscode.Uri.file(siblingWorktree.path),
       {forceNewWindow: true},
     );
-  });
-
-  it('still rejects GitHub-backed EdenFS repos', async () => {
-    jest.spyOn(repositoryCache, 'getAllRepositories').mockReturnValue([
-      {
-        ...mockRepo,
-        info: {...mockRepo.info, codeReviewSystem: {type: 'github'}},
-      } as unknown as Repository,
-    ]);
-
-    await vscodeCommands['sapling.worktree.switch'].apply(ctx);
-
-    expect(mockShowErrorMessage).toHaveBeenCalledWith(
-      'Worktrees are not supported for GitHub repositories',
-    );
-    expect(mockRepo.runOrQueueOperation).not.toHaveBeenCalled();
   });
 
   it('shows an error when worktree info is unavailable (GK off)', async () => {

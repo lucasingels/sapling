@@ -584,7 +584,6 @@ export class Repository {
         : allRepoRoots;
 
     const isEdenFs = await isEdenFsRepo(repoRoot as AbsolutePath);
-    const worktreesSupported = isEdenFs || isDotGitDotDir(dotdir);
 
     let codeReviewSystem: CodeReviewSystem;
     let pullRequestDomain;
@@ -646,7 +645,6 @@ export class Repository {
       pullRequestDomain,
       preferredSubmitCommand: preferredSubmitCommand as PreferredSubmitCommand | undefined,
       isEdenFs,
-      worktreesSupported,
     };
     logger.info('repo info: ', result);
     return result;
@@ -1040,7 +1038,8 @@ export class Repository {
           ? {
               sharedRoot,
               worktrees: worktreeEntriesWithNodes,
-              supportsMutation: this.info.isEdenFs || this.info.worktreesSupported === true,
+              // This fork's `sl worktree` can also add, label, and remove git worktrees.
+              supportsMutation: this.info.isEdenFs || isDotGitDotDir(this.info.dotdir),
             }
           : undefined;
       this.worktreeInfo = worktreeInfo;
