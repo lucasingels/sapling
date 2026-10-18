@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+### 18 October 2026
+
+- Opening conflicts in an external merge tool now uses `ui.merge:interactive` when it is set, so a setup that keeps `ui.merge = :merge` for non-interactive runs still opens its GUI merge tool instead of asking to configure one
+- With Gerrit, a stack that was only rebased, with the same message and changes as its uploaded patchsets, is no longer offered for republishing, and "Republish stack" appears only when a published commit changed. A stack whose only new commit is on top offers "Publish stack" instead, which pushes that commit
+- The Gerrit resubmit buttons now say "Republish", matching "Publish"
+
 ## 0.3.0
 
 ### 17 October 2026
