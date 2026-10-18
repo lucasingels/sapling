@@ -60,14 +60,26 @@ class Sapling < Formula
 
     python = Formula["python@3.12"].opt_prefix/"bin/python3.12"
 
-    cd "eden/scm" do
-      system "rustup-init -y"
-      system "source %CACHEDIR%/cargo_cache/env && rustup target add %TARGET%"
-      system "source %CACHEDIR%/cargo_cache/env && "\
-             "#{python} ./build.py --oss --with-python #{python} "\
-             "--with-version %VERSION% --rust-target %TARGET%"
-      bin.install "out/sl"
-      lib.install "out/isl-dist.tar.xz"
+    # sccache keys each compile on its working directory and on the CARGO_* variables, which
+    # hold absolute paths, and Homebrew unpacks the source into a new temp dir on every run.
+    # Building from a fixed path lets the fork's own crates hit the cache, not just the
+    # registry ones. HOMEBREW_TEMP is writable inside Homebrew's build sandbox.
+    build_root = Pathname(HOMEBREW_TEMP)/"sapling-build"
+    rm_r build_root if build_root.exist?
+    cp_r buildpath, build_root
+
+    begin
+      cd build_root/"eden/scm" do
+        system "rustup-init -y"
+        system "source %CACHEDIR%/cargo_cache/env && rustup target add %TARGET%"
+        system "source %CACHEDIR%/cargo_cache/env && "\
+               "#{python} ./build.py --oss --with-python #{python} "\
+               "--with-version %VERSION% --rust-target %TARGET%"
+        bin.install "out/sl"
+        lib.install "out/isl-dist.tar.xz"
+      end
+    ensure
+      rm_r build_root if build_root.exist?
     end
 
     libexec.install "#{prefix}/bin/sl"

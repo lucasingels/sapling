@@ -59,10 +59,10 @@ jobs:
     # Nearly all of this job's time is the cargo build inside `brew install`.
     # Three caches carry work between runs:
     #   * sccache (GitHub Actions cache backend) skips recompiling crates whose
-    #     inputs are unchanged. Crates from the cargo registry hit across runs
-    #     because Homebrew keeps CARGO_HOME at a fixed path under `brew --cache`;
-    #     the fork's own workspace crates rebuild every time because Homebrew
-    #     unpacks the source into a differently named temp dir on each run.
+    #     inputs are unchanged. Its key includes absolute paths, so both ends are
+    #     pinned: Homebrew keeps CARGO_HOME at a fixed path under `brew --cache`,
+    #     and the formula builds from a fixed copy of the source rather than the
+    #     differently named temp dir Homebrew unpacks it into on each run.
     #   * the cargo registry (crate index + downloaded .crate files), so a warm
     #     run does not re-download ~800 crates.
     #   * the yarn cache used by the ISL build.
