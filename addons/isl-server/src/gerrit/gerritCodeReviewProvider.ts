@@ -18,6 +18,7 @@ import type {
 } from 'isl/src/types';
 import type {CodeReviewProvider, DiffSummaries} from '../CodeReviewProvider';
 import type {Logger} from '../logger';
+import type {RebasedRevisionFinder} from './rebasedRevisions';
 
 import http from 'node:http';
 import https from 'node:https';
@@ -75,6 +76,8 @@ export type GerritDiffSummary = {
   isPrivate: boolean;
   /** Commit hash of the change's latest patchset, to tell whether the local commit was uploaded as is. */
   currentRevision?: string;
+  /** Local commits that are `currentRevision` rebased and nothing else, so they need no republish. */
+  rebasedRevisions?: Array<string>;
 };
 
 type GerritCodeReviewSystem = CodeReviewSystem & {
@@ -266,6 +269,7 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
   constructor(
     private codeReviewSystem: GerritCodeReviewSystem,
     private logger: Logger,
+    private rebasedRevisionFinder?: RebasedRevisionFinder,
   ) {}
 
   onChangeDiffSummaries(callback: (result: Result<DiffSummaries>) => unknown): Disposable {
@@ -396,6 +400,7 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
         }
 
         this.logger.info(`Gerrit: fetched ${summaries.size} change(s)`);
+        await this.addRebasedRevisions(summaries);
         this.diffSummaries.emit('data', summaries);
       } catch (err) {
         this.logger.warn(`Gerrit: failed to fetch changes: ${err}`);
@@ -406,6 +411,29 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
     undefined,
     /* leading */ true,
   );
+
+  private async addRebasedRevisions(summaries: Map<DiffId, GerritDiffSummary>): Promise<void> {
+    if (this.rebasedRevisionFinder == null) {
+      return;
+    }
+    const uploaded = new Map<DiffId, string>();
+    for (const [changeId, summary] of summaries) {
+      if (summary.state === 'NEW' && summary.currentRevision != null) {
+        uploaded.set(changeId, summary.currentRevision);
+      }
+    }
+    try {
+      for (const [changeId, hashes] of await this.rebasedRevisionFinder.find(uploaded)) {
+        const summary = summaries.get(changeId);
+        if (summary != null) {
+          summary.rebasedRevisions = hashes;
+        }
+      }
+    } catch (err) {
+      // Without it, rebased commits only show as needing a republish they do not need.
+      this.logger.warn(`Gerrit: failed to find rebased revisions: ${err}`);
+    }
+  }
 
   async fetchComments(diffId: DiffId): Promise<Array<DiffComment>> {
     const webUrl = this.getWebUrl();

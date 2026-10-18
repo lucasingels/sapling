@@ -21,9 +21,9 @@ import {OperationDisabledButton} from './OperationDisabledButton';
 import {RebaseOrphanedStackButton} from './RebaseOntoSuccessor';
 import {showSuggestedRebaseForStack, SuggestedRebaseButton} from './SuggestedRebase';
 import {allDiffSummaries, codeReviewProvider} from './codeReview/CodeReviewInfo';
+import {resubmitButtonVerb, submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
 import {T, t} from './i18n';
-import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import {IconStack} from './icons/IconStack';
 import {useRunOperation} from './operationsState';
 import {useUncommittedSelection} from './partialSelection';
@@ -100,8 +100,12 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
       const TooltipContent = () => {
         return (
           <div className="resubmit-stack-tooltip">
-            <T replace={{$cmd: reviewProvider?.submitCommandName()}}>
-              Submit new version of commits in this stack for review with $cmd.
+            <T
+              replace={{
+                $verb: resubmitButtonVerb(reviewProvider),
+                $cmd: reviewProvider?.submitCommandName(),
+              }}>
+              $verb the commits in this stack for review with $cmd.
             </T>
             {willShowConfirmationModal && (
               <div>
@@ -145,7 +149,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
                   publishWhenReady: confirmation.publishWhenReady,
                 });
               }}>
-              <T>Resubmit stack</T>
+              <T replace={{$verb: resubmitButtonVerb(reviewProvider)}}>$verb stack</T>
             </OperationDisabledButton>
           </HighlightCommitsWhileHovering>
         </Tooltip>,

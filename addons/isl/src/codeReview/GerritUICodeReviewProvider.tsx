@@ -82,16 +82,25 @@ function tooltipForSummary(summary: GerritDiffSummary): string {
   }
 }
 
-/** The commit of the latest patchset of `commit`'s open change, when Gerrit reported one. */
-function uploadedRevision(
+/**
+ * Whether `commit` is what its open change has up for review: the latest patchset itself, or
+ * that patchset rebased with nothing else changed. Undefined when Gerrit reported no patchset.
+ */
+function matchesUploaded(
   commit: CommitInfo,
   diffSummaries: Map<string, DiffSummary>,
-): string | undefined {
+): boolean | undefined {
   if (commit.diffId == null) {
     return undefined;
   }
   const summary = diffSummaries.get(commit.diffId) as GerritDiffSummary | undefined;
-  return summary?.state === 'NEW' ? summary.currentRevision : undefined;
+  if (summary?.state !== 'NEW' || summary.currentRevision == null) {
+    return undefined;
+  }
+  return (
+    summary.currentRevision === commit.hash ||
+    (summary.rebasedRevisions?.includes(commit.hash) ?? false)
+  );
 }
 
 export class GerritUICodeReviewProvider implements UICodeReviewProvider {
@@ -142,16 +151,13 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     commits: CommitInfo[],
     allDiffSummaries: Map<string, DiffSummary>,
   ): Map<string, SyncStatus> {
-    // Gerrit only gives the latest patchset's commit, so a commit that differs from it
-    // counts as changed locally; a newer patchset uploaded elsewhere looks the same.
+    // Gerrit only gives the latest patchset's commit, so a commit that differs from it, other
+    // than by a rebase, counts as changed locally; a newer patchset uploaded elsewhere looks the same.
     const statuses = new Map<string, SyncStatus>();
     for (const commit of commits) {
-      const uploaded = uploadedRevision(commit, allDiffSummaries);
-      if (uploaded != null) {
-        statuses.set(
-          commit.hash,
-          uploaded === commit.hash ? SyncStatus.InSync : SyncStatus.LocalIsNewer,
-        );
+      const matches = matchesUploaded(commit, allDiffSummaries);
+      if (matches != null) {
+        statuses.set(commit.hash, matches ? SyncStatus.InSync : SyncStatus.LocalIsNewer);
       }
     }
     return statuses;
@@ -204,6 +210,10 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return 'Publish';
   }
 
+  resubmitButtonLabel(): string {
+    return 'Republish';
+  }
+
   hasSubmittedDiff(
     diffId: DiffId | undefined,
     summary: DiffSummary | null | undefined,
@@ -243,12 +253,24 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
       return summary != null && summary.state !== 'MERGED' && summary.state !== 'ABANDONED';
     });
 
-    // Nothing to publish when every commit is already the latest patchset of its change.
-    if (stack.every(commit => uploadedRevision(commit, diffSummaries) === commit.hash)) {
+    // A commit that is already the latest patchset of its change, or that patchset only
+    // rebased, has nothing to send. Gerrit rejects a push with nothing new.
+    const hasNewVersion = (commit: CommitInfo) => matchesUploaded(commit, diffSummaries) !== true;
+
+    // Merged and abandoned changes are left out here, so one not yet pulled does not
+    // keep the button up for a stack that is otherwise up to date.
+    const submittableStack = this.getSubmittableDiffs(stack, diffSummaries);
+    if (!submittableStack.some(hasNewVersion)) {
       return {};
     }
 
-    return {resubmittableStack, submittableStack: this.getSubmittableDiffs(stack, diffSummaries)};
+    // Republishing pushes up to the top of `resubmittableStack`, which would send nothing
+    // when none of those commits changed, and skip any new commit above them. Offering
+    // only `submittableStack` then shows Publish stack, which pushes to the real top.
+    return {
+      resubmittableStack: resubmittableStack.some(hasNewVersion) ? resubmittableStack : [],
+      submittableStack,
+    };
   }
 
   getSubmittableDiffs(

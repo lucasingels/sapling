@@ -9,7 +9,7 @@ import type {ReactNode} from 'react';
 import type {CommitInfo, DiffId, DiffSummary} from '../types';
 import type {UICodeReviewProvider} from './UICodeReviewProvider';
 
-import {submitButtonVerb} from './UICodeReviewProvider';
+import {resubmitButtonVerb, submitButtonVerb} from './UICodeReviewProvider';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
@@ -285,7 +285,9 @@ function ResubmitSyncButton({
 
   return (
     <Tooltip
-      title={t('This commit has changed locally since it was last submitted. Click to resubmit.')}>
+      title={t('This commit has changed locally since it went up for review. Click to $verb.', {
+        replace: {$verb: resubmitButtonVerb(provider).toLowerCase()},
+      })}>
       <Button
         icon
         data-testid="commit-submit-button"

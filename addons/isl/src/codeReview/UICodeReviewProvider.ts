@@ -22,6 +22,11 @@ export function submitButtonVerb(provider: UICodeReviewProvider | null | undefin
   return provider?.submitButtonLabel?.() ?? t('Submit');
 }
 
+/** The verb for sending a new version of something already up for review (e.g. "Republish"). */
+export function resubmitButtonVerb(provider: UICodeReviewProvider | null | undefined): string {
+  return provider?.resubmitButtonLabel?.() ?? t('Resubmit');
+}
+
 /**
  * API to interact with Code Review for Repositories, e.g. GitHub and Phabricator.
  */
@@ -64,6 +69,9 @@ export interface UICodeReviewProvider {
    * Defaults to "Submit" when not implemented.
    */
   submitButtonLabel?(): string;
+
+  /** Counterpart of `submitButtonLabel` for a new version. Defaults to "Resubmit". */
+  resubmitButtonLabel?(): string;
 
   /**
    * Whether a commit carrying `diffId` should be treated as already having a

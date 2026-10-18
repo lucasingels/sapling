@@ -87,6 +87,7 @@ import {
 } from './commands';
 import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD, ErrorShortMessages} from './constants';
 import {GerritCodeReviewProvider, parseGerritRemote} from './gerrit/gerritCodeReviewProvider';
+import {RebasedRevisionFinder} from './gerrit/rebasedRevisions';
 import {GitHubCodeReviewProvider} from './github/githubCodeReviewProvider';
 import {isGithubEnterprise} from './github/queryGraphQL';
 import {
@@ -221,7 +222,11 @@ export class Repository {
     }
 
     if (remote.type === 'gerrit') {
-      this.codeReviewProvider = new GerritCodeReviewProvider(remote, ctx.logger);
+      this.codeReviewProvider = new GerritCodeReviewProvider(
+        remote,
+        ctx.logger,
+        new RebasedRevisionFinder(async args => (await runCommand(ctx, args)).stdout),
+      );
     }
 
     const shouldWait = (): boolean => {
