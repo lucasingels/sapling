@@ -494,7 +494,14 @@ export class Repository {
     if (ctx.cachedMergeTool !== undefined) {
       return ctx.cachedMergeTool;
     }
-    const tool = ctx.knownConfigs?.get('ui.merge') ?? 'internal:merge';
+    // Opening a merge tool from ISL is a user-initiated, interactive action, so honour
+    // ui.merge:interactive: users often set ui.merge to a non-interactive tool (:merge) for
+    // terminal-less runs and put their GUI tool there. sl copies a user-level ui.merge into
+    // ui.merge:interactive when the latter is unset; the fallback covers older sl versions.
+    const tool =
+      ctx.knownConfigs?.get('ui.merge:interactive') ??
+      ctx.knownConfigs?.get('ui.merge') ??
+      'internal:merge';
     let usesCustomMerge = tool !== 'internal:merge';
 
     if (usesCustomMerge) {

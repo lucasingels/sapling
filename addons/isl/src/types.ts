@@ -1003,6 +1003,7 @@ export const allConfigNames = [
   'isl.generated-files-regex',
   'ui.username',
   'ui.merge',
+  'ui.merge:interactive',
   'fbcodereview.code-browser-url',
   'extensions.commitcloud',
   'isl.show-authored-diffs',

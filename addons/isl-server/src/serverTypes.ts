@@ -29,7 +29,7 @@ export type RepositoryContext = {
   /** Whether we pass --verbose to sl commands */
   verbose?: boolean;
   /**
-   * Configured merge tool, from `ui.merge`, as long as merge-tools.$tool.gui is also True.
+   * Configured merge tool, from `ui.merge:interactive` or `ui.merge`, as long as merge-tools.$tool.gui is also True.
    * null -> no merge tool configured or not valid
    * undefined -> not cached yet
    */
