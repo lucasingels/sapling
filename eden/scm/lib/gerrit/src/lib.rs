@@ -17,6 +17,7 @@
 
 pub mod change;
 pub mod http;
+pub mod message;
 pub mod ssh;
 pub mod time;
 

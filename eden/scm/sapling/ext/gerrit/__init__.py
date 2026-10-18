@@ -32,6 +32,12 @@ Config::
     # wrapping rewriteutil.newcommitmessage.
     add-change-id = False
 
+    # Keep hard-wrapped body prose as written. By default a commit's body
+    # paragraphs are joined back into one line each as it is written, since
+    # Gerrit soft-wraps at 72 columns and a body filled at ~80 renders as a
+    # full line, a one-word stub, then the next full line.
+    unwrap-prose = False
+
     # The project a change belongs to, for building its web URL. Defaults to
     # the path of the remote URL.
     project = tools/sl
@@ -43,6 +49,7 @@ Config::
     autorefresh = False
 """
 
+from bindings import gerrit as _gerrit
 from sapling import extensions, git, mutation, rewriteutil, util
 
 from . import changeid, smartlog, status
@@ -135,7 +142,7 @@ def _copycommitmessage(orig, repo, message, operation, source):
 
 
 def _newcommitmessage(orig, repo, ctx, message):
-    """Give a commit a Change-Id trailer as it is written."""
+    """Unwrap a commit's body prose and give it a Change-Id as it is written."""
     message = orig(repo, ctx, message)
     if not message.strip():
         return message
@@ -143,6 +150,15 @@ def _newcommitmessage(orig, repo, ctx, message):
     # Probing here instead would put an SSH round-trip in front of every commit.
     if not repo.ui.config("gerrit", "url"):
         return message
+    if repo.ui.configbool("gerrit", "unwrap-prose", True) and not any(
+        message == description for description in _predecessor_descriptions(repo, ctx)
+    ):
+        # Only a message that was just written or edited. A joined line can
+        # itself look like a fixed-column fill, so unwrapping the same message
+        # again could join a break that was left on purpose; a rebase, or an
+        # amend that keeps the message, would then wear it away a line at a
+        # time.
+        message = _gerrit.unwrapprose(message)
     if not repo.ui.configbool("gerrit", "add-change-id", True):
         return message
     inherited = _inherited_change_id(repo, ctx)
@@ -157,25 +173,34 @@ def _inherited_change_id(repo, ctx):
     ``sl commit --amend -m ...`` (and reword, metaedit, histedit) replaces the
     description wholesale, dropping the trailer. Minting a fresh id there would
     open a second Gerrit change for work already under review, so carry the
-    predecessor's id across instead. Sapling records the predecessor in the
-    commit's mutation info, which is what those rewrites set.
+    predecessor's id across instead.
     """
     if changeid.extract(ctx.description()):
         return None
-    try:
-        mutinfo = ctx.mutinfo()
-    except Exception:
-        return None
-    if not mutinfo:
-        return None
-    for node in mutation.nodesfrominfo(mutinfo.get("mutpred")) or []:
-        try:
-            found = changeid.extract(repo[node].description())
-        except Exception:
-            continue
+    for description in _predecessor_descriptions(repo, ctx):
+        found = changeid.extract(description)
         if found:
             return found
     return None
+
+
+def _predecessor_descriptions(repo, ctx):
+    """The descriptions of the commits ``ctx`` rewrites, if any.
+
+    Sapling records them in the commit's mutation info, which amend, rebase,
+    metaedit, histedit and the like set.
+    """
+    try:
+        mutinfo = ctx.mutinfo()
+    except Exception:
+        return
+    if not mutinfo:
+        return
+    for node in mutation.nodesfrominfo(mutinfo.get("mutpred")) or []:
+        try:
+            yield repo[node].description()
+        except Exception:
+            continue
 
 
 def _p1hex(ctx):

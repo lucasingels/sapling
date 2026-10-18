@@ -77,6 +77,7 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
             )
         ),
     )?;
+    m.add(py, "unwrapprose", py_fn!(py, unwrap_prose(message: String)))?;
     Ok(m)
 }
 
@@ -159,4 +160,8 @@ fn add_reviewer(
     py.allow_threads(|| client.add_reviewer(&change.0, &reviewer))
         .map_pyerr(py)?;
     Ok(PyNone)
+}
+
+fn unwrap_prose(_py: Python, message: String) -> PyResult<String> {
+    Ok(gerrit::message::unwrap_prose(&message))
 }
