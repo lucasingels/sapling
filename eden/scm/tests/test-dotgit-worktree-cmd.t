@@ -39,7 +39,8 @@ Add a linked worktree at the current commit, with a label:
     "current": true,
     "node": "*", (glob)
     "stale": false,
-    "missing": false
+    "missing": false,
+    "locked": false
   },
   {
     "path": "$TESTTMP/wt1",
@@ -48,7 +49,8 @@ Add a linked worktree at the current commit, with a label:
     "current": false,
     "node": "*", (glob)
     "stale": false,
-    "missing": false
+    "missing": false,
+    "locked": false
   }
   ]
 

@@ -29,6 +29,7 @@ use worktree::with_worktree_path_op_lock;
 
 use crate::CurrentGroup;
 use crate::WorktreeOpts;
+use crate::canonical;
 use crate::require_group;
 
 pub(crate) fn run(
@@ -58,6 +59,17 @@ pub(crate) fn run(
         .collect::<Result<_>>()?;
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
     validate_targets(&current_group, &target_refs)?;
+    let locked = locked_worktrees(worktrees)?;
+    for target in &target_refs {
+        if let Some(reason) = locked.get(*target) {
+            abort!(
+                "{} is locked{}; unlock it with `git worktree unlock {}` first",
+                target.display(),
+                lock_reason_suffix(reason),
+                target.display()
+            );
+        }
+    }
 
     remove_and_update_registry(
         ctx,
@@ -73,6 +85,28 @@ pub(crate) fn run(
     // they were standing in (see D98226466).
 
     Ok(0)
+}
+
+/// The reason of each worktree locked with `git worktree lock` (empty when
+/// it has none), by canonical path. EdenFS checkouts have no locks.
+pub(crate) fn locked_worktrees(worktrees: &Worktrees) -> Result<BTreeMap<PathBuf, String>> {
+    if worktrees.kind() != WorktreeKind::Git {
+        return Ok(BTreeMap::new());
+    }
+    Ok(worktrees
+        .list()?
+        .into_iter()
+        .filter_map(|wt| Some((canonical(&wt.path), wt.locked?)))
+        .collect())
+}
+
+/// " (<reason>)" for a lock with a reason.
+pub(crate) fn lock_reason_suffix(reason: &str) -> String {
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    }
 }
 
 /// Validate that all user-specified paths are removable linked worktrees.
@@ -191,7 +225,19 @@ fn run_remove_all(
     worktrees: &Worktrees,
 ) -> Result<u8> {
     let logger = ctx.logger();
-    let candidate_paths: Vec<PathBuf> = current_group.linked().cloned().collect();
+    // A locked worktree is in use, e.g. by an agent: keep it.
+    let locked = locked_worktrees(worktrees)?;
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    for path in current_group.linked() {
+        match locked.get(path) {
+            Some(reason) => ctx.io().write_err(format!(
+                "keeping {}: it is locked{}\n",
+                path.display(),
+                lock_reason_suffix(reason)
+            ))?,
+            None => candidate_paths.push(path.clone()),
+        }
+    }
     if candidate_paths.is_empty() {
         logger.info("no linked worktrees to remove");
         return Ok(0);

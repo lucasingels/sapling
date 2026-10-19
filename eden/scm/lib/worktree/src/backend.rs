@@ -38,6 +38,8 @@ pub struct ListedWorktree {
     /// [`is_missing`]). Git still lists such a linked worktree until it is
     /// removed or pruned.
     pub missing: bool,
+    /// Set when `git worktree lock` locked it: the reason, empty without one.
+    pub locked: Option<String>,
     /// Git's administrative dir of a linked worktree (`.git/worktrees/<id>`),
     /// which holds its sl state too (`<admin dir>/sl`).
     pub admin_dir: Option<PathBuf>,
@@ -147,6 +149,7 @@ impl WorktreeBackend for SaplingBackend {
                             label: entry.label.clone(),
                             current: *path == current,
                             missing: false,
+                            locked: None,
                             admin_dir: None,
                         })
                         .collect()
@@ -183,6 +186,7 @@ impl WorktreeBackend for GitBackend {
                     label: labels.get(&canonical_path).cloned(),
                     current: canonical_path == current,
                     missing: !worktree.is_main && is_missing(&worktree.path),
+                    locked: worktree.locked,
                     admin_dir: admin_dirs.get(&admin_dir_key(&worktree.path)).cloned(),
                     path: worktree.path,
                     is_main: worktree.is_main,

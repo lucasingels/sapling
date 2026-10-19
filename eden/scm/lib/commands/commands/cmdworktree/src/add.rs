@@ -630,14 +630,23 @@ fn count_linked_worktrees(
 }
 
 /// Git refuses to add a worktree where one it still lists was deleted behind
-/// its back. Drop that registration first, the way `remove` would; the
-/// registry entry is replaced when the new worktree is registered.
+/// its back. Drop that registration first, the way `remove` would, unless it
+/// is locked; the registry entry is replaced when the new worktree is
+/// registered.
 fn forget_missing_worktree(worktrees: &Worktrees, dest: &Path) -> Result<()> {
     let missing = worktrees
         .list()?
         .into_iter()
         .find(|wt| wt.missing && crate::canonical(&wt.path) == dest);
     if let Some(wt) = missing {
+        if let Some(reason) = &wt.locked {
+            abort!(
+                "{} is a missing but locked worktree{}; unlock it with `git worktree unlock {}` first",
+                dest.display(),
+                crate::remove::lock_reason_suffix(reason),
+                dest.display()
+            );
+        }
         worktrees.remove(&wt.path)?;
     }
     Ok(())

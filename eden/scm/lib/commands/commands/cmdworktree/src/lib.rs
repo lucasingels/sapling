@@ -200,10 +200,14 @@ pub fn doc() -> &'static str {
     a later version of it, is public) or abandoned (the commit is hidden and
     no later version of it is visible), and the missing ones (see below).
     The main checkout and the current one are never removed, and neither is
-    a stale worktree whose commit was rewritten into a visible draft commit,
-    nor one that cannot be read. `--dry-run` lists what would be removed and
+    a locked worktree, a stale worktree whose commit was rewritten into a
+    visible draft commit, nor one that cannot be read. `--dry-run` lists what would be removed and
     why. Removal works as in `remove`, including the confirmation prompt
     (skipped with `-y`) and the pre-worktree-remove hooks.
+
+    A worktree locked with `git worktree lock` is in use: `prune` and
+    `remove --all` keep it, and `remove PATH` refuses it until `git worktree
+    unlock`. An agent working in a worktree should lock it while it runs.
 
     A linked git worktree whose directory was deleted behind sl's back stays
     in `list`, marked missing, until `remove PATH` or `prune` removes what is
@@ -212,8 +216,9 @@ pub fn doc() -> &'static str {
 
     With -Tjson, `list` also gives each worktree's checked out commit
     ("node"), whether it is stale ("stale", "stale_reason"): another
-    worktree rewrote that commit or one below it (see `update-stale`), and
-    whether it is missing ("missing").
+    worktree rewrote that commit or one below it (see `update-stale`),
+    whether it is missing ("missing"), and whether it is locked ("locked",
+    "lock_reason").
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path when configured. Otherwise, for git-backed

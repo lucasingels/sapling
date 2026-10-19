@@ -339,6 +339,10 @@ export type WorktreeEntry = {
    * leaves such entries out: there is no checkout to show.
    */
   missing?: boolean;
+  /** Whether `git worktree lock` locked the worktree, e.g. while an agent works in it. */
+  locked?: boolean;
+  /** Why the worktree is locked, when a reason was given. */
+  lockReason?: string;
 };
 
 export type ApplicationInfo = {

@@ -36,6 +36,10 @@ pub(crate) struct ListOutputEntry {
     stale_reason: Option<String>,
     /// Whether its directory was deleted behind sl's back.
     missing: bool,
+    /// Whether `git worktree lock` locked it, and why.
+    locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_reason: Option<String>,
 }
 
 impl Formattable for ListOutputEntry {
@@ -60,6 +64,9 @@ impl Formattable for ListOutputEntry {
         }
         if self.stale {
             write!(writer, "   (stale)")?;
+        }
+        if self.locked {
+            write!(writer, "   (locked)")?;
         }
         writeln!(writer)?;
         Ok(())
@@ -130,6 +137,8 @@ pub(crate) fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntr
         stale: stale.is_some(),
         stale_reason: stale.map(|state| state.message(repo)),
         missing: entry.missing,
+        locked: entry.locked.is_some(),
+        lock_reason: entry.locked.filter(|reason| !reason.is_empty()),
     }
 }
 
@@ -272,6 +281,25 @@ mod tests {
         assert_eq!(
             mock_output(&w),
             "  linked  /repos/linked   dev   (missing)\n"
+        );
+    }
+
+    #[test]
+    fn test_format_plain_missing_and_locked() {
+        let entry = ListOutputEntry {
+            path: PathBuf::from("/repos/linked"),
+            role: "linked",
+            missing: true,
+            locked: true,
+            ..Default::default()
+        };
+        let mut w = MockWriter(Vec::new());
+        entry
+            .format_plain(&FormatOptions::default(), &mut w)
+            .unwrap();
+        assert_eq!(
+            mock_output(&w),
+            "  linked  /repos/linked   (missing)   (locked)\n"
         );
     }
 

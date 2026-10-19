@@ -62,6 +62,24 @@ describe('listWorktrees', () => {
     expect(worktrees[1]).toMatchObject({stale: true, staleReason: 'rewritten'});
   });
 
+  it('maps lock_reason to lockReason', async () => {
+    mockWorktreeList([
+      {path: '/repo', role: 'main'},
+      {
+        path: '/repo/.worktrees/agent',
+        role: 'linked',
+        locked: true,
+        lock_reason: 'claude-session:1234',
+        missing: false,
+      },
+    ]);
+
+    const [, agent] = await listWorktrees(ctx);
+
+    expect(agent).toMatchObject({locked: true, lockReason: 'claude-session:1234'});
+    expect(agent).not.toHaveProperty('lock_reason');
+  });
+
   it('keeps entries from older sl versions without a missing field', async () => {
     mockWorktreeList([{path: '/repo', role: 'main'}]);
 

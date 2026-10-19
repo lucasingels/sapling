@@ -225,14 +225,21 @@ export async function listWorktrees(ctx: RepositoryContext): Promise<WorktreeEnt
       'list',
       '-Tjson',
     ]);
-    // `node`, `stale` and `stale_reason` are missing from older `sl` versions.
-    const entries: Array<Omit<WorktreeEntry, 'staleReason'> & {stale_reason?: string}> = JSON.parse(
-      result.stdout,
-    );
+    // `node`, `stale`, `stale_reason` and later fields are missing from older `sl` versions.
+    const entries: Array<
+      Omit<WorktreeEntry, 'staleReason' | 'lockReason'> & {
+        stale_reason?: string;
+        lock_reason?: string;
+      }
+    > = JSON.parse(result.stdout);
     // A worktree deleted behind sl's back has no checkout to show or query.
     return entries
       .filter(entry => entry.missing !== true)
-      .map(({stale_reason, ...entry}) => ({...entry, staleReason: stale_reason}));
+      .map(({stale_reason, lock_reason, ...entry}) => ({
+        ...entry,
+        staleReason: stale_reason,
+        lockReason: lock_reason,
+      }));
   } catch (error) {
     ctx.logger.error(`Failed to list worktrees for ${ctx.cwd}`, error);
     return [];
