@@ -21,10 +21,33 @@ commands, which are Python too. ``view`` needs none of that, so it is native.
 from sapling import commands, error, git, node as nodemod, registrar, scmutil
 from sapling.i18n import _
 
-from . import api, changeid, status
+from . import api, changeid, landed, status
 
 cmdtable = {}
 command = registrar.command(cmdtable)
+
+
+@command("debuggerritmarker", commands.dryrunopts)
+def debuggerritmarker(ui, repo, **opts):
+    """mark drafts whose change Gerrit has submitted as landed
+
+    A draft is landed when a public commit carries its Change-Id: Gerrit
+    rebases or cherry-picks a change as it submits it, so the commit that
+    lands is not the local one. Each such draft is recorded as landed as that
+    commit, and hidden. ``@prog@ pull`` does this itself unless
+    ``gerrit.hide-landed-commits`` is off.
+
+    A draft holding work that was never uploaded, or that another worktree
+    has checked out, is left visible with a warning.
+    """
+    if not ui.config("gerrit", "url"):
+        raise error.Abort(_("this is not a Gerrit repo (gerrit.url is not set)"))
+    ui.setconfig("gerrit", "hide-landed-commits", True, "debuggerritmarker")
+    # Every public commit in reach is read again, rather than only those
+    # new since the last pull, in case the cached index missed one.
+    if not landed.marklanded(ui, repo, dry_run=opts.get("dry_run"), full=True):
+        ui.status(_("no landed commits found\n"))
+    return 0
 
 
 @command("debuggerrit", [], _("<pull|review|refresh>"), subonly=True)

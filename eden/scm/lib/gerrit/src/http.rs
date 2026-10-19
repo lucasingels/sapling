@@ -166,6 +166,11 @@ pub fn parse(value: &Value) -> Change {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        branch: value
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         owner: value
             .get("owner")
             .and_then(|o| o.get("username").or_else(|| o.get("name")))
@@ -352,6 +357,7 @@ mod tests {
             "change_id": "I1111111111111111111111111111111111111111",
             "subject": "do a thing",
             "status": "NEW",
+            "branch": "main",
             "owner": {"username": "alice"},
             "updated": "2006-01-02 22:04:05.000000000",
             "work_in_progress": true,
@@ -372,6 +378,7 @@ mod tests {
         let change = parse(&row);
         assert_eq!(change.number, 142);
         assert_eq!(change.owner, "alice");
+        assert_eq!(change.branch, "main");
         assert_eq!(change.patchset, 3);
         assert_eq!(change.revision, "abc");
         assert_eq!(change.fetch_ref, "refs/changes/42/142/3");

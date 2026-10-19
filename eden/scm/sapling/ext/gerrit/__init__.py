@@ -47,12 +47,22 @@ Config::
 
     # Don't refresh the review status cache after a push or a pull.
     autorefresh = False
+
+    # Leave drafts visible after their change has been submitted. By default
+    # a pull marks a draft whose Change-Id is on a public commit of the
+    # change's branch as landed as that commit, and hides it, unless it holds
+    # work that was never uploaded (see :mod:`landed`).
+    hide-landed-commits = False
+
+    # How many public commits to read at most, newest first, when looking
+    # for where drafts landed.
+    landed-scan-limit = 10000
 """
 
 from bindings import gerrit as _gerrit
 from sapling import extensions, git, mutation, rewriteutil, util
 
-from . import changeid, smartlog, status
+from . import changeid, landed, smartlog, status
 from .changeid import extract as extract_change_id  # noqa: F401 – for callers
 from .cmd import cmdtable  # noqa: F401 – registers the gerrit subcommands
 from .detect import isgerrit  # noqa: F401 – re-export for external callers
@@ -68,9 +78,18 @@ def extsetup(ui):
     # the command for git repos, so a command wrapper would not see the push
     # that `sl push --to refs/for/...` and `sl gerrit publish` both end in.
     extensions.wrapfunction(git, "push", _push)
+    # `pull --rebase` rebases inside the pull command, before any post-pull
+    # hook runs, and these are where it marks landed commits first so the
+    # rebase skips them rather than replaying them onto the trunk.
+    from sapling.ext import remotenames, tweakdefaults
+
+    extensions.wrapfunction(remotenames, "_marklanded", _marklanded)
+    extensions.wrapfunction(tweakdefaults, "_marklanded", _marklanded)
 
 
 def reposetup(ui, repo):
+    # Hooks run in name order; this one is named to run before the refresh.
+    ui.setconfig("hooks", "post-pull.gerrit-landed", landed.hook, "gerrit")
     ui.setconfig("hooks", "post-pull.gerrit-refresh", _postpull, "gerrit")
     # Only in a Gerrit repo: elsewhere smartlog's review slots belong to
     # whichever provider that repo does use.
@@ -84,16 +103,34 @@ def _autorefresh(repo):
     )
 
 
+def _marklanded(orig, ui, repo):
+    orig(ui, repo)
+    landed.marklanded(ui, repo)
+
+
+def _uploads(pushnode_to_pairs):
+    """The commits in a push that go to Gerrit's upload refs."""
+    return [
+        pushnode
+        for pushnode, ref in pushnode_to_pairs
+        if pushnode is not None
+        and ref
+        and str(ref).startswith(git.GERRIT_UPLOAD_REFS)
+    ]
+
+
 def _push(orig, repo, dest, pushnode_to_pairs, force=False):
-    """Refresh the review status of whatever was just uploaded to Gerrit."""
+    """Remember and refresh whatever was just uploaded to Gerrit."""
     result = orig(repo, dest, pushnode_to_pairs, force=force)
-    if not _autorefresh(repo):
+    uploads = _uploads(pushnode_to_pairs)
+    if not uploads or not repo.ui.config("gerrit", "url"):
         return result
-    if not any(
-        str(ref).startswith(git.GERRIT_UPLOAD_REFS)
-        for _pushnode, ref in pushnode_to_pairs
-        if ref
-    ):
+    if result == 0:
+        # The whole draft stack below each commit went up with it.
+        landed.recorduploaded(
+            repo, [repo[r].node() for r in repo.revs("draft() & ::%ln", uploads)]
+        )
+    if not _autorefresh(repo):
         return result
     # The whole stack was uploaded, not only the commit named, and Gerrit
     # renumbers patchsets across it.

@@ -132,6 +132,7 @@ pub fn parse(value: &Value) -> Change {
         change_id: string(value.get("id")),
         subject: string(value.get("subject")),
         status: string(value.get("status")),
+        branch: string(value.get("branch")),
         owner: patchset_owner(value),
         updated: value
             .get("lastUpdated")
@@ -224,6 +225,7 @@ mod tests {
             "id": "I1111111111111111111111111111111111111111",
             "subject": "do a thing",
             "status": "NEW",
+            "branch": "main",
             "owner": {"username": "alice"},
             "lastUpdated": 1136214245i64,
             "dependsOn": [{"number": 141, "open": true}],
@@ -243,6 +245,7 @@ mod tests {
         assert_eq!(change.number, 142);
         assert_eq!(change.change_id, "I1111111111111111111111111111111111111111");
         assert_eq!(change.owner, "alice");
+        assert_eq!(change.branch, "main");
         assert_eq!(change.patchset, 3);
         assert_eq!(change.fetch_ref, "refs/changes/42/142/3");
         assert_eq!(change.parents, vec!["def".to_string()]);

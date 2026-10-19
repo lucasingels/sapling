@@ -23,7 +23,7 @@ _CHANGE_ID_RE = re.compile(r"^Change-Id:[ \t]*(I[0-9a-f]{40})[ \t]*$", re.MULTIL
 
 
 def extract(description):
-    """Return the Change-Id in ``description``, or None.
+    """Return the Change-Id in the footer of ``description``, or None.
 
     >>> extract("commit\\n\\nChange-Id: I" + "a" * 40)
     'Iaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -31,9 +31,57 @@ def extract(description):
     True
     >>> extract("commit") is None
     True
+
+    Only the footer -- the last paragraph -- counts, as it does for Gerrit. A
+    Change-Id quoted in the body is not the commit's own, and what is read here
+    decides which commits are taken to have landed:
+
+    >>> extract("revert\\n\\nChange-Id: I" + "a" * 40 + "\\n\\nwas wrong.") is None
+    True
+
+    Two different ids in the footer are ambiguous, and Gerrit refuses them:
+
+    >>> extract("c\\n\\nChange-Id: I" + "a" * 40 + "\\nChange-Id: I" + "b" * 40) is None
+    True
+
+    That makes this the wrong question for whether a message needs an id
+    added; see :func:`has`.
     """
-    match = _CHANGE_ID_RE.search(description)
-    return match.group(1) if match else None
+    ids = set(_CHANGE_ID_RE.findall(_footer(description)))
+    return ids.pop() if len(ids) == 1 else None
+
+
+def has(description):
+    """Whether the footer of ``description`` has any Change-Id line.
+
+    Unlike :func:`extract`, two ids count: the message already says which
+    change it is for, however ambiguously, and adding a third would only make
+    it worse on every amend.
+
+    >>> has("c\\n\\nChange-Id: I" + "a" * 40 + "\\nChange-Id: I" + "b" * 40)
+    True
+    >>> has("c\\n\\nChange-Id: I" + "a" * 40 + "\\n\\nwas quoted.")
+    False
+    """
+    return bool(_CHANGE_ID_RE.search(_footer(description)))
+
+
+def _footer(description):
+    """The last paragraph of ``description``, without the subject line.
+
+    >>> _footer("subject\\n\\nbody\\n\\nA: b\\nC: d\\n")
+    'A: b\\nC: d'
+    >>> _footer("subject\\nA: b")
+    'A: b'
+    >>> _footer("subject")
+    ''
+    """
+    paragraphs = re.split(r"\n[ \t]*\n", description.strip())
+    last = paragraphs[-1]
+    if len(paragraphs) == 1:
+        # The subject is never a footer line.
+        last = last.partition("\n")[2]
+    return last
 
 
 def generate(*parts):
@@ -58,7 +106,7 @@ def attach(description, change_id):
     Change-Id: Ibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     <BLANKLINE>
     """
-    if extract(description):
+    if has(description):
         return description
     body = description.rstrip()
     if not body:
@@ -88,8 +136,15 @@ def ensure(description, *parts):
     Signed-off-by: alice
     Change-Id: I8fc659a29a4b089d55ce3fd08ad8f41a01ce14c6
     <BLANKLINE>
+
+    A footer with two ids typed into it is left as it is, rather than given a
+    third each time the commit is rewritten:
+
+    >>> twoids = "c\\n\\nChange-Id: I" + "a" * 40 + "\\nChange-Id: I" + "b" * 40
+    >>> ensure(twoids, "alice", "deadbeef") == twoids
+    True
     """
-    if extract(description):
+    if has(description):
         return description
     body = description.rstrip()
     if not body:

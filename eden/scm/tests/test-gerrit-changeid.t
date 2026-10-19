@@ -87,3 +87,28 @@ copy gets its own Change-Id instead of attaching to the source's review:
   
   Change-Id: I9fe08c9b2eadc5b8a1ccf244cb46b3983272d117
   --
+
+A message whose footer already has a Change-Id is left with what it has, even
+two of them typed by hand, which Gerrit would refuse: adding another on every
+commit and amend would only make it worse.
+
+  $ newrepo
+  $ enable amend
+  $ setconfig gerrit.url=https://gerrit.example.com
+  $ cat > "$TESTTMP/msg" <<EOT
+  > two ids typed by hand
+  > 
+  > Change-Id: I1111111111111111111111111111111111111111
+  > Change-Id: I2222222222222222222222222222222222222222
+  > EOT
+  $ echo d > d
+  $ sl commit -Aq -l "$TESTTMP/msg" -d '0 0'
+  $ echo e >> d
+  $ sl amend -q
+  $ echo f >> d
+  $ sl amend -q -l "$TESTTMP/msg"
+  $ sl log -r . -T '{desc}\n'
+  two ids typed by hand
+  
+  Change-Id: I1111111111111111111111111111111111111111
+  Change-Id: I2222222222222222222222222222222222222222

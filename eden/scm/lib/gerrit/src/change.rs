@@ -24,6 +24,9 @@ pub struct Change {
     pub subject: String,
     /// `NEW`, `MERGED` or `ABANDONED`.
     pub status: String,
+    /// The branch the change is for review against, e.g. `main`. The same
+    /// Change-Id on another branch is another change.
+    pub branch: String,
     pub owner: String,
     /// When the change last moved, as epoch seconds.
     pub updated: i64,
