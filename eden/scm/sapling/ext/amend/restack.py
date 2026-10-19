@@ -6,7 +6,7 @@
 # restack.py - rebase to make a stack connected again
 
 
-from sapling import commands, merge as mergemod, scmutil
+from sapling import commands, merge as mergemod, scmutil, worktreestale
 from sapling.ext import rebase
 from sapling.i18n import _
 
@@ -37,13 +37,27 @@ def restack(ui, repo, **rebaseopts):
             revs = list(repo.revs("successors(%ld)+predecessors(%ld)", revs, revs))
             # 3. Connect revs via changelog again to cover missing revs
             revs = list(repo.revs("draft() & ((draft() & %ld)::)", revs))
+        else:
+            revs = list(scmutil.revrange(repo, rebaseopts["rev"]))
 
+        # In a worktree group, each checkout restacks its own stack.
+        allrevs = revs
+        revs, owners = worktreestale.ownrevs(repo, revs)
+        noted = worktreestale.noteleft(ui, repo, owners)
+        ret = None
+        if len(revs) != len(allrevs) and not repo.revs(
+            "(%ld - obsolete()) & ((draft() & obsolete())::)", revs
+        ):
+            # Nothing this checkout restacks is on an old version of a commit.
+            if not noted:
+                ui.status(_("nothing to restack\n"))
+            ret = 1
+        else:
             rebaseopts["rev"] = [ctx.hex() for ctx in repo.set("%ld", revs)]
+            rebaseopts["dest"] = ["_destrestack(SRC)"]
 
-        rebaseopts["dest"] = ["_destrestack(SRC)"]
-
-        _notelandedmergesides(ui, repo, rebaseopts["rev"])
-        rebase.rebase(ui, repo, **rebaseopts)
+            _notelandedmergesides(ui, repo, rebaseopts["rev"])
+            rebase.rebase(ui, repo, **rebaseopts)
 
         # Ensure that we always end up on the latest version of the
         # current changeset. Usually, this will be taken care of
@@ -54,6 +68,7 @@ def restack(ui, repo, **rebaseopts):
         successor = repo.revs("successors(.) - .").last()
         if successor is not None:
             commands.update(ui, repo, rev=repo[successor].hex())
+        return ret
 
 
 def _notelandedmergesides(ui, repo, revs):

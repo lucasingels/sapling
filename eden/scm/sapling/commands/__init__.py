@@ -6429,7 +6429,10 @@ def updatestale(ui, repo):
 
     This moves the working copy to the latest version of its commit and
     restacks its own commits onto the latest versions of the ones below,
-    carrying uncommitted changes along.
+    carrying uncommitted changes along. Commits another checkout has checked
+    out, or stacked its own commits on, are left for that checkout to update,
+    except the commits below this checkout's own commit: those are restacked,
+    and the checkouts on them become stale.
 
     Set ``worktree.auto-update-stale=true`` to have those commands update a
     stale checkout automatically before they run, instead of refusing.

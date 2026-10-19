@@ -169,6 +169,7 @@ Set in a config file, it also restacks with uncommitted changes set aside:
   B3
   $ sl metaedit -m B4
   note: 94cd8d1654d1 "A2", below this worktree's commit, was rewritten in another worktree
+  note: left 037085e2525a "P" for worktree $TESTTMP/dirty; run 'sl update-stale' there
   note: restacked this worktree's commits onto the latest versions, now on 3f0065896a64 "B3"; files changed to match
   $ sl log -r '.^::.' -T '{desc}\n'
   A2

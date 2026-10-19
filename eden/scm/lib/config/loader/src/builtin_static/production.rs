@@ -694,6 +694,11 @@ agent=## Sapling for AI Coding Agents
  - In a stale checkout, commands that would build on the stale commits abort.
  Run `sl update-stale` to move onto the latest versions. Uncommitted changes
  come along.
+ - `sl amend`, `sl restack` and `sl update-stale` restack only this checkout's
+ own stack. They leave alone the commits another checkout has checked out or
+ stacked its commits on, and the commits above them, and print which worktree
+ must run `sl update-stale`. The exception is commits below this checkout's
+ own commit, which they do restack; checkouts on those become stale.
  - Do not run `sl goto` onto commits another worktree has checked out, or
  rewrite them. Ask the agent that owns that worktree.
 agent-performance=## Keeping Commands Fast

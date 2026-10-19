@@ -20,6 +20,16 @@ changes along. With ``worktree.auto-update-stale=true``, those commands run
 that update first instead. Every other command, ``status`` and ``whereami``
 included, only notes that the checkout is stale.
 
+A restack (``@prog@ restack``, the one after ``@prog@ amend``, and the one
+``update-stale`` runs) only restacks the checkout's own stack: the commits
+below and above its working copy parent, and those stacked on an older version
+of a commit below it. It leaves alone the commits another checkout has checked
+out or stacked its commits on, and the commits above them, and notes which
+checkouts must update themselves. The exception is the commits below this
+checkout's own commit, which it restacks; checkouts on them become stale.
+``worktree.restack-foreign=true`` restacks every connected commit, as outside a
+worktree group.
+
 Detecting the state is shared with the Rust commands: see the
 ``worktree_stale`` crate, reached through ``repo._rsrepo``.
 """
@@ -58,6 +68,18 @@ ORPHANED = "orphaned"
 # The checkouts stacked on them are listed once the command is done.
 _rewritten = {}
 
+# The checkouts a restack in the current command left stale, by the root of the
+# repo it ran in. They were noted already, so they are not listed again.
+_left = {}
+
+
+def _schedule(repo):
+    """list the stale checkouts once the current command is done"""
+    if repo.root not in _rewritten:
+        _rewritten[repo.root] = set()
+        _left[repo.root] = set()
+        repo.ui.atexit(_notestale, repo)
+
 
 def _ingroup(repo):
     """whether the repo is a checkout of a git worktree group with others"""
@@ -93,7 +115,7 @@ def _latest(repo, node):
     return repo[repo.revs("max(%ln)", succs).first()].node()
 
 
-def _describe(repo, node):
+def describe(repo, node):
     try:
         title = repo[node].description().split("\n", 1)[0]
     except error.RepoLookupError:
@@ -201,7 +223,7 @@ def _move(ui, repo, state, target):
             hg.update(repo, target, quietempty=True)
         ui.warn(
             _("note: moved this worktree to the latest version %s; files changed to match\n")
-            % _describe(repo, target)
+            % describe(repo, target)
         )
         state = _stalestate(repo, target)
         if state is None:
@@ -221,7 +243,7 @@ def _move(ui, repo, state, target):
             "note: restacked this worktree's commits onto the latest versions, now on "
             "%s; files changed to match\n"
         )
-        % _describe(repo, new)
+        % describe(repo, new)
     )
 
 
@@ -286,31 +308,42 @@ def _unshelve(ui, repo, shelved):
 def _conflictsmessage(repo, shelved, conflicts):
     return _(
         "uncommitted changes conflict with %s in %s (they are also kept as shelve '%s')"
-    ) % (_describe(repo, repo["."].node()), ", ".join(conflicts), shelved)
+    ) % (describe(repo, repo["."].node()), ", ".join(conflicts), shelved)
 
 
 def _restack(ui, repo):
-    """restack the stack under the clean working copy"""
+    """restack the stack under the clean working copy, leaving alone the
+    commits other checkouts own"""
     try:
-        _sl(
+        proc = _sl(
             repo.root,
             [
                 "--config",
                 "extensions.rebase=",
                 "--config",
                 "rebase.experimental.inmemory=true",
+                "--config",
+                "worktree.restack-foreign=false",
                 "rebase",
                 "--restack",
                 "--noconflict",
             ],
         )
+        # The checkouts the restack left stale, or made stale by restacking
+        # commits below this one that they are on.
+        for line in proc.stderr.decode("utf-8", "replace").splitlines():
+            if line.startswith(("note: left ", "note: worktree ")):
+                ui.warn("%s\n" % line)
     finally:
         repo.invalidateall()
         mutation.clearobsoletecache(repo)
 
 
 def _checkouts(repo):
-    """{path: node} for every detached checkout of the git worktree group"""
+    """{path: node} for every detached checkout of the git worktree group
+
+    Sapling keeps the checkouts it manages on a detached HEAD. A worktree on a
+    git branch is one git manages, and is not listed."""
     out = git.callgit(repo, ["worktree", "list", "--porcelain"], checkreturncode=False)
     checkouts = {}
     for entry in out.decode("utf-8", "surrogateescape").split("\n\n"):
@@ -325,14 +358,98 @@ def _checkouts(repo):
     return checkouts
 
 
+def ownrevs(repo, revs):
+    """split revs, about to be restacked, into the ones this checkout restacks
+    and the ones it leaves to the other checkouts of its worktree group.
+
+    A checkout restacks its own stack: the commits below and above its working
+    copy parent, and those stacked on an older version of a commit below it.
+    Of those, the ones another checkout has checked out or stacked its commits
+    on, and every commit above them, are that checkout's to restack. The
+    exception is the commits below this checkout's own commit, and the older
+    versions of them: it restacks those, and checkouts on them become stale.
+
+    With no other live checkouts in the group, every rev is restacked.
+
+    Returns (the revs to restack, {path: node} of the other checkouts whose
+    commits are left alone). With ``worktree.restack-foreign=true``, or outside
+    a worktree group, every rev is restacked."""
+    revs = list(revs)
+    if (
+        not revs
+        or not _ingroup(repo)
+        or repo.ui.configbool("worktree", "restack-foreign")
+    ):
+        return revs, {}
+    root = os.path.realpath(repo.root)
+    hasnode = repo.changelog.hasnode
+    others = {
+        path: node
+        for path, node in _checkouts(repo).items()
+        if os.path.realpath(path) != root and hasnode(node)
+    }
+    if not others:
+        return revs, {}
+    own = repo.revs(
+        "%ld & ((draft() & ::.) + .:: + ((predecessors(draft() & ::.) - ::.)::))",
+        revs,
+    )
+    # Leaving out what is below this checkout's own commit, and the older
+    # versions of it, keeps them restackable when another checkout is stacked
+    # on them too.
+    foreign = repo.revs(
+        "(%ld & ::%ln) - ::. - predecessors(draft() & ::.)",
+        own,
+        list(others.values()),
+    )
+    owners = {}
+    if foreign:
+        left = repo.revs("%ld & (%ld::)", own, foreign)
+        torev = repo.changelog.rev
+        owners = {path: node for path, node in others.items() if torev(node) in left}
+        own = repo.revs("%ld - %ld", own, left)
+    return list(own), owners
+
+
+def checkoutsin(repo, revs):
+    """{path: node} for the other checkouts of the worktree group that have
+    one of revs checked out"""
+    if not _ingroup(repo):
+        return {}
+    root = os.path.realpath(repo.root)
+    hasnode = repo.changelog.hasnode
+    torev = repo.changelog.rev
+    revs = set(revs)
+    return {
+        path: node
+        for path, node in _checkouts(repo).items()
+        if os.path.realpath(path) != root and hasnode(node) and torev(node) in revs
+    }
+
+
+def noteleft(ui, repo, owners):
+    """note which checkouts a restack left stale, for them to update; whether
+    there were any"""
+    noted = False
+    for path, node in sorted(owners.items()):
+        if _stalestate(repo, node) is None:
+            continue
+        _schedule(repo)
+        _left[repo.root].add(os.path.realpath(path))
+        ui.warn(
+            _("note: left %s for worktree %s; run '@prog@ update-stale' there\n")
+            % (describe(repo, node), path)
+        )
+        noted = True
+    return noted
+
+
 def scheduleafterrewrite(repo, oldnodes):
     """list the checkouts this command makes stale by rewriting oldnodes, once
     it is done"""
     if not oldnodes or not _ingroup(repo):
         return
-    if repo.root not in _rewritten:
-        _rewritten[repo.root] = set()
-        repo.ui.atexit(_notestale, repo)
+    _schedule(repo)
     _rewritten[repo.root].update(oldnodes)
 
 
@@ -355,6 +472,7 @@ def _stackedon(repo, node, nodes):
 
 def _notestale(repo):
     rewritten = _rewritten.pop(repo.root, set())
+    noted = _left.pop(repo.root, set())
     ui = repo.ui
     root = os.path.realpath(repo.root)
     if ui.configbool("worktree", "auto-update-stale"):
@@ -365,10 +483,15 @@ def _notestale(repo):
     else:
         then = _("'@prog@ update-stale' there moves it onto the latest versions")
     for path, node in sorted(_checkouts(repo).items()):
-        if os.path.realpath(path) == root or not _stackedon(repo, node, rewritten):
+        realpath = os.path.realpath(path)
+        if (
+            realpath == root
+            or realpath in noted
+            or not _stackedon(repo, node, rewritten)
+        ):
             continue
         if _stalestate(repo, node) is not None:
             ui.warn(
                 _("note: worktree %s is now stale (it is on %s); %s\n")
-                % (path, _describe(repo, node), then)
+                % (path, describe(repo, node), then)
             )

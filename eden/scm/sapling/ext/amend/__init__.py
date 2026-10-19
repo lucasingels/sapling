@@ -62,6 +62,7 @@ from sapling import (
     registrar,
     rewriteutil,
     scmutil,
+    worktreestale,
 )
 from sapling.i18n import _
 from sapling.node import short
@@ -434,17 +435,62 @@ def amend(ui, repo, *pats, **opts):
             repo._bookmarks.applychanges(repo, tr, changes)
 
         if rebase and haschildren:
-            noconflictmsg = _(
-                "restacking would create conflicts (%s in %s), so you must run it manually\n(run `@prog@ restack` manually to restack this commit's children)"
-            )
-            revs = [c.hex() for c in repo.set("(%n::)-%n", old.node(), old.node())]
-            with ui.configoverride({("rebase", "noconflictmsg"): noconflictmsg}):
-                # Note: this has effects on linearizing (old:: - old). That can
-                # fail. If that fails, it might make sense to try a plain
-                # rebase -s (old:: - old) -d new.
-                restack.restack(ui, repo, rev=revs, noconflict=noconflict)
+            children = list(repo.nodes("children(%n)", old.node()))
+            if noconflict and len(children) > 1:
+                _restacksubtrees(ui, repo, old, children)
+            else:
+                noconflictmsg = _(
+                    "restacking would create conflicts (%s in %s), so you must run it manually\n(run `@prog@ restack` manually to restack this commit's children)"
+                )
+                revs = [
+                    c.hex() for c in repo.set("(%n::)-%n", old.node(), old.node())
+                ]
+                with ui.configoverride({("rebase", "noconflictmsg"): noconflictmsg}):
+                    # Note: this has effects on linearizing (old:: - old). That can
+                    # fail. If that fails, it might make sense to try a plain
+                    # rebase -s (old:: - old) -d new.
+                    restack.restack(ui, repo, rev=revs, noconflict=noconflict)
 
         showtemplate(ui, repo, repo[node], **opts)
+
+
+def _restacksubtrees(ui, repo, old, children):
+    """restack the commits on each child of the amended commit old separately,
+    so one that would conflict does not keep the others on the old version"""
+    for child in children:
+        noconflictmsg = _("restacking %s would create conflicts (%%s in %%s)") % (
+            worktreestale.describe(repo, child).replace("%", "%%")
+        )
+        revs = [c.hex() for c in repo.set("%n::", child)]
+        with ui.configoverride({("rebase", "noconflictmsg"): noconflictmsg}):
+            restack.restack(ui, repo, rev=revs, noconflict=True)
+
+    # What is still on the old version, apart from what other checkouts of a
+    # worktree group restack themselves (noted by the restack).
+    left = worktreestale.ownrevs(
+        repo, repo.revs("((%n::) - %n) - obsolete()", old.node(), old.node())
+    )[0]
+    roots = list(repo.revs("roots(%ld)", left))
+    if not roots:
+        return
+    # In a worktree group, other checkouts' commits are only restacked, and
+    # so only left here, with worktree.restack-foreign=true.
+    checkouts = worktreestale.checkoutsin(repo, left)
+    for rev in roots:
+        desc = worktreestale.describe(repo, repo[rev].node())
+        where = [
+            path
+            for path, node in sorted(checkouts.items())
+            if rev in repo.revs("::%n", node)
+        ]
+        if where:
+            ui.status(
+                _("left on the old version: %s (checked out in worktree %s)\n")
+                % (desc, ", ".join(where))
+            )
+        else:
+            ui.status(_("left on the old version: %s\n") % desc)
+    ui.status(_("(run `@prog@ restack` manually to restack them)\n"))
 
 
 def fixupamend(ui, repo, noconflict=None, noconflictmsg=None):
