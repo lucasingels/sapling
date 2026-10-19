@@ -270,6 +270,13 @@ pub fn other_checkout_finished(
     })
 }
 
+/// Whether a merge, rebase, graft, ... is unfinished in the checkout at
+/// `root`.
+pub fn other_checkout_unfinished(root: &Path) -> Result<bool> {
+    let info = RepoMinimalInfo::from_repo_root(root.to_path_buf())?;
+    has_unfinished_operation(&info.dot_hg_path)
+}
+
 /// In a checkout's dot dir: the draft commit `sl worktree add` made it on.
 const DRAFT_BASE_FILE: &str = "worktree-draft-base";
 

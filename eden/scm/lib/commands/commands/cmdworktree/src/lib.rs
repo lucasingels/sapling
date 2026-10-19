@@ -219,7 +219,7 @@ pub fn doc() -> &'static str {
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
       path LABEL [-Tjson]                               Print the path of the worktree labeled LABEL
-      prune [--dry-run] [-y]                            Remove linked worktrees that are done with or missing
+      prune [PATH...] [--dry-run] [-y]                  Remove linked worktrees that are done with or missing
 
     `remove` refuses to remove a worktree with uncommitted changes, untracked
     files included (ignored files do not count), or with shelves (`sl
@@ -242,9 +242,12 @@ pub fn doc() -> &'static str {
     where nothing was committed. The main checkout and the current one are
     never removed, and neither is a locked worktree, a stale worktree whose
     commit was rewritten into a visible draft commit, nor one that cannot be
-    read. `--dry-run` lists what would be removed and why. Removal works as
-    in `remove`, including the confirmation prompt (skipped with `-y`) and
-    the pre-worktree-remove hooks.
+    read. With PATHs, `prune` only considers those worktrees, without waiting
+    for them to age, and says why each one it keeps stays: a session
+    that is done with its worktree can prune just that one, while a sweep
+    leaves young worktrees alone. `--dry-run` lists what would be removed
+    and why. Removal works as in `remove`, including the confirmation prompt
+    (skipped with `-y`) and the pre-worktree-remove hooks.
 
     A worktree locked with `git worktree lock` is in use: `prune` and
     `remove --all` keep it, and `remove PATH` refuses it until `git worktree

@@ -51,16 +51,8 @@ pub(crate) fn run(
         abort!("usage: sl worktree remove PATH [PATH...]");
     }
 
-    let targets: BTreeSet<PathBuf> = path_args
-        .iter()
-        .map(|s| -> Result<PathBuf> {
-            Ok(util::path::strip_unc_prefix(
-                util::path::canonical_path_allow_missing(s)?,
-            ))
-        })
-        .collect::<Result<_>>()?;
+    let targets = resolve_targets(&current_group, path_args, Verb::Remove)?;
     let target_refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
-    validate_targets(&current_group, &target_refs)?;
     let locked = locked_worktrees(worktrees)?;
     for target in &target_refs {
         if let Some(reason) = locked.get(*target) {
@@ -111,28 +103,58 @@ pub(crate) fn lock_reason_suffix(reason: &str) -> String {
     }
 }
 
-/// Validate that all user-specified paths are removable linked worktrees.
-fn validate_targets(current_group: &CurrentGroup, targets: &[&Path]) -> Result<()> {
-    for target in targets {
-        if !current_group.members.contains(*target) {
+/// The command that names worktrees by path, for messages.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Verb {
+    Remove,
+    Prune,
+}
+
+/// The linked worktrees named by `args`, as canonical paths. Abort unless
+/// all of them are linked worktrees of `current_group`.
+pub(crate) fn resolve_targets(
+    current_group: &CurrentGroup,
+    args: &[String],
+    verb: Verb,
+) -> Result<BTreeSet<PathBuf>> {
+    let targets: BTreeSet<PathBuf> = args
+        .iter()
+        .map(|s| -> Result<PathBuf> {
+            Ok(util::path::strip_unc_prefix(
+                util::path::canonical_path_allow_missing(s)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    for target in &targets {
+        if !current_group.members.contains(target) {
+            let not = match verb {
+                Verb::Remove => "not removing",
+                Verb::Prune => "not pruning",
+            };
             if let Some(parent_wt) = current_group.members.iter().find(|wt| target.starts_with(wt)) {
                 abort!(
-                    "{} is not the root of checkout {}, not removing",
+                    "{} is not the root of checkout {}, {not}",
                     target.display(),
                     parent_wt.display()
                 );
             }
-            abort!(
-                "{} is not in this worktree group, use `{}` instead",
-                target.display(),
-                current_group.kind.remove_command()
-            );
+            match verb {
+                Verb::Remove => abort!(
+                    "{} is not in this worktree group, use `{}` instead",
+                    target.display(),
+                    current_group.kind.remove_command()
+                ),
+                Verb::Prune => abort!("{} is not in this worktree group", target.display()),
+            }
         }
         if *target == current_group.main {
-            abort!("cannot remove a main worktree with linked worktrees");
+            match verb {
+                Verb::Remove => abort!("cannot remove a main worktree with linked worktrees"),
+                Verb::Prune => abort!("cannot prune the main worktree"),
+            }
         }
     }
-    Ok(())
+    Ok(targets)
 }
 
 /// Confirm, run hooks, tear down EdenFS mounts, and update the worktree registry.

@@ -142,11 +142,12 @@ Nothing is left to prune from here; from the main checkout, "here" goes too:
   pre-remove $TESTTMP/here
   removed $TESTTMP/here (landed)
 
-prune takes no arguments, nor --force:
+prune with a PATH only looks at that worktree, and says why it stays;
+prune takes no --force:
 
   $ sl worktree prune $TESTTMP/wip
-  abort: usage: sl worktree prune [--dry-run] [-y]
-  [255]
+  keeping $TESTTMP/wip: its commit has not landed and was not abandoned
+  no worktrees to prune
   $ sl worktree prune --force
   abort: --force cannot be used with 'worktree prune'
   [255]

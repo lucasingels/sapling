@@ -27,7 +27,9 @@ use crate::canonical;
 use crate::dot_dir;
 use crate::last_used;
 use crate::remove::lock_reason_suffix;
+use crate::remove::Verb;
 use crate::remove::remove_and_update_registry;
+use crate::remove::resolve_targets;
 use crate::remove::uncommitted_changes;
 use crate::require_group;
 use crate::shelves;
@@ -38,16 +40,14 @@ const DEFAULT_PRUNE_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Remove the linked worktrees that are done with: clean, without shelves,
 /// and on a commit that landed or was abandoned, idle for long enough, or
 /// deleted behind sl's back. Never the main checkout, the current one, or a
-/// locked one.
+/// locked one. With PATHs, only those, idle or not, saying why each one that
+/// stays does.
 pub(crate) fn run(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
     _wc: &WorkingCopy,
     worktrees: &Worktrees,
 ) -> Result<u8> {
-    if ctx.opts.args.len() > 1 {
-        abort!("usage: sl worktree prune [--dry-run] [-y]");
-    }
     if ctx.opts.force {
         abort!("--force cannot be used with 'worktree prune'");
     }
@@ -56,6 +56,12 @@ pub(crate) fn run(
     }
 
     let current_group = require_group(repo, worktrees)?;
+    // Named worktrees are known to be done with, e.g. by the session that
+    // used one: no need to wait for them to age.
+    let named = match &ctx.opts.args[1..] {
+        [] => None,
+        args => Some(resolve_targets(&current_group, args, Verb::Prune)?),
+    };
     let current = canonical(repo.path());
     // Commits under the current checkout are not abandoned while it builds on them.
     let wdir_parents = workingcopy::fast_path_wdir_parents(repo.path(), repo.ident())?.to_vec();
@@ -72,7 +78,7 @@ pub(crate) fn run(
 
     let mut reasons: BTreeMap<PathBuf, &str> = BTreeMap::new();
     for path in current_group.linked() {
-        if *path == current {
+        if named.as_ref().is_some_and(|named| !named.contains(path)) {
             continue;
         }
         let keep = |why: String| -> Result<()> {
@@ -80,6 +86,12 @@ pub(crate) fn run(
                 .write_err(format!("keeping {}{why}\n", path.display()))?;
             Ok(())
         };
+        if *path == current {
+            if named.is_some() {
+                keep(": it is the current checkout".to_string())?;
+            }
+            continue;
+        }
         let Some(entry) = listed.get(path) else {
             continue;
         };
@@ -92,7 +104,12 @@ pub(crate) fn run(
             }
             match finished_state(repo, path, &wdir_parents) {
                 Some(finished) => Some(finished),
-                None => continue,
+                None => {
+                    if named.is_some() {
+                        keep(not_done_reason(path))?;
+                    }
+                    continue;
+                }
             }
         };
         // Deleted behind sl's back: nothing is left to lose but shelves.
@@ -110,7 +127,7 @@ pub(crate) fn run(
             keep(format!(" ({reason}): it has shelved changes"))?;
             continue;
         }
-        if finished.is_some_and(Finished::needs_age) {
+        if finished.is_some_and(Finished::needs_age) && named.is_none() {
             let used = entry.admin_dir.as_deref().and_then(last_used);
             if let Some(why) = too_young(used, now, min_age) {
                 keep(format!(" ({reason}): {why}"))?;
@@ -172,6 +189,15 @@ fn finished_state(repo: &Repo, path: &Path, wdir_parents: &[types::HgId]) -> Opt
         );
         None
     })
+}
+
+/// Why the checkout at `path` is not done with, for a worktree named to
+/// `prune`.
+fn not_done_reason(path: &Path) -> String {
+    match worktree_stale::other_checkout_unfinished(path) {
+        Ok(true) => ": a merge, rebase, ... is unfinished there".to_string(),
+        _ => ": its commit has not landed and was not abandoned".to_string(),
+    }
 }
 
 /// Why a worktree that is only done with once unused for `min_age` stays, if
