@@ -56,6 +56,9 @@ define_flags! {
         #[short('r')]
         reviewer: Vec<String>,
 
+        /// upload changes below the one published even if all that changed is their base
+        force_republish: bool,
+
         #[args]
         args: Vec<String>,
     }
@@ -75,6 +78,7 @@ const PUBLISH_OPTS: &[&str] = &[
     "topic",
     "hashtag",
     "label",
+    "force-republish",
 ];
 const VIEW_OPTS: &[&str] = &["user"];
 const PULL_OPTS: &[&str] = &[];
@@ -128,6 +132,7 @@ fn given_opts(opts: &GerritOpts) -> Vec<&'static str> {
         ("user", !opts.user.is_empty()),
         ("label", !opts.label.is_empty()),
         ("reviewer", !opts.reviewer.is_empty()),
+        ("force-republish", opts.force_republish),
     ] {
         if set {
             given.push(name);
@@ -174,6 +179,9 @@ fn run_publish(ctx: ReqCtx<GerritOpts>, repo: &Repo) -> Result<u8> {
     if let Some(rev) = rest.first() {
         args.push("-r".to_string());
         args.push(rev.clone());
+    }
+    if ctx.opts.force_republish {
+        args.push("--force-republish".to_string());
     }
 
     // Collect Gerrit push options as %key or %key=value suffixes.

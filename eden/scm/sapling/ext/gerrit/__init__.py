@@ -57,12 +57,22 @@ Config::
     # How many public commits to read at most, newest first, when looking
     # for where drafts landed.
     landed-scan-limit = 10000
+
+    # Don't refuse a push for review that carries a Change-Id another live
+    # draft also has (see :mod:`republish`).
+    check-duplicate-change-ids = False
+
+    # What to do when changes pushed for review would get patchsets that only
+    # rebase them: warn (the default), abort (--force-republish overrides
+    # it), or off.
+    republish-check = abort
 """
 
 from bindings import gerrit as _gerrit
-from sapling import extensions, git, mutation, rewriteutil, util
+from sapling import cmdutil, commands, extensions, git, mutation, rewriteutil, util
+from sapling.i18n import _
 
-from . import changeid, landed, smartlog, status
+from . import changeid, landed, republish, smartlog, status
 from .changeid import extract as extract_change_id  # noqa: F401 – for callers
 from .cmd import cmdtable  # noqa: F401 – registers the gerrit subcommands
 from .detect import isgerrit  # noqa: F401 – re-export for external callers
@@ -78,6 +88,21 @@ def extsetup(ui):
     # the command for git repos, so a command wrapper would not see the push
     # that `sl push --to refs/for/...` and `sl gerrit publish` both end in.
     extensions.wrapfunction(git, "push", _push)
+    # The option is read by a pre-push hook rather than a command wrapper:
+    # remotenames' wrapper does a git push itself instead of calling through,
+    # so one installed beneath it would never run.
+    _aliases, entry = cmdutil.findcmd("push", commands.table)
+    entry[1].append(
+        (
+            "",
+            "force-republish",
+            None,
+            _(
+                "upload changes for Gerrit review even if all that changed is "
+                "their base (Gerrit remotes only)"
+            ),
+        )
+    )
     # `pull --rebase` rebases inside the pull command, before any post-pull
     # hook runs, and these are where it marks landed commits first so the
     # rebase skips them rather than replaying them onto the trunk.
@@ -91,6 +116,7 @@ def reposetup(ui, repo):
     # Hooks run in name order; this one is named to run before the refresh.
     ui.setconfig("hooks", "post-pull.gerrit-landed", landed.hook, "gerrit")
     ui.setconfig("hooks", "post-pull.gerrit-refresh", _postpull, "gerrit")
+    ui.setconfig("hooks", "pre-push.gerrit-republish", _prepush, "gerrit")
     # Only in a Gerrit repo: elsewhere smartlog's review slots belong to
     # whichever provider that repo does use.
     if ui.config("gerrit", "url"):
@@ -108,6 +134,11 @@ def _marklanded(orig, ui, repo):
     landed.marklanded(ui, repo)
 
 
+def _prepush(ui, repo, opts=None, **kwargs):
+    if opts and opts.get("force_republish"):
+        repo.ui.setconfig("gerrit", "force-republish", True, "--force-republish")
+
+
 def _uploads(pushnode_to_pairs):
     """The commits in a push that go to Gerrit's upload refs."""
     return [
@@ -120,11 +151,12 @@ def _uploads(pushnode_to_pairs):
 
 
 def _push(orig, repo, dest, pushnode_to_pairs, force=False):
-    """Remember and refresh whatever was just uploaded to Gerrit."""
-    result = orig(repo, dest, pushnode_to_pairs, force=force)
+    """Check an upload to Gerrit, then remember and refresh it."""
     uploads = _uploads(pushnode_to_pairs)
     if not uploads or not repo.ui.config("gerrit", "url"):
-        return result
+        return orig(repo, dest, pushnode_to_pairs, force=force)
+    republish.check(repo, pushnode_to_pairs)
+    result = orig(repo, dest, pushnode_to_pairs, force=force)
     if result == 0:
         # The whole draft stack below each commit went up with it.
         landed.recorduploaded(

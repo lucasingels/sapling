@@ -32,6 +32,7 @@ def testmod(name, optionflags=0, testtarget=None):
 
 testmod("sapling.pathlog")
 testmod("sapling.ext.gerrit.changeid")
+testmod("sapling.ext.gerrit.republish")
 testmod("sapling.repl_record")
 testmod("sapling.ext.github.archive_commit")
 testmod("sapling.ext.github.github_repo_util")
