@@ -24,7 +24,13 @@ def prefetchtextstream(
 
 
 def _prefetchtextstream(repo, ctxstream):
+    from . import git
+
     is_agent = agentdetect.is_agent()
+    if is_agent and git.isgitformat(repo):
+        # The guard protects lazily fetched monorepos. A git repo has all of
+        # its history locally, so scanning it is cheap.
+        is_agent = repo.ui.configbool("agent", "git-fetch-guard")
     max_count = repo.ui.configint("agent", "max-commit-fetch-count", 100_000)
     batch_size = repo.ui.configint("experimental", "commit-fetch-batch-size", 10_000)
     count = 0

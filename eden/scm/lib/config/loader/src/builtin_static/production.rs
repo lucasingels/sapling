@@ -667,6 +667,49 @@ use-rust=true
 supported-url-regex = ^.*\.(facebook|tfbnw|mononoke)\..*$
 
 [help]
+agent=## Sapling for AI Coding Agents
+ 
+ Sapling runs in agent mode when one of `CODING_AGENT_METADATA`, `CLAUDECODE`,
+ `AI_AGENT`, `CODEX_SANDBOX` or `CODEX_SANDBOX_NETWORK_DISABLED` is set. Apart
+ from `CODING_AGENT_METADATA`, an empty value does not count.
+ 
+ ## Rules
+ 
+ - NEVER let a command open an editor. Pass `-m MSG`, or `-l FILE` for a long
+ message, to `sl commit`, `sl amend`, `sl metaedit` and `sl fold`.
+ - Run `sl status` and `sl log -r .` before rewriting anything.
+ - Changing, rebasing onto or checking out an old version of a commit aborts in
+ agent mode, since it would diverge the stack. Find the latest version with
+ `sl log -r 'successors(HASH)'` and work on that instead.
+ - For `sl commit -i`, `sl amend -i` and `sl revert -i`, read
+ `sl help agent interactive` first.
+ 
+ ## Worktrees
+ 
+ Each checkout of a git worktree group (`sl worktree add`) belongs to one agent.
+ 
+ - Rewriting a commit moves only the checkout that ran the command. Other
+ checkouts that have the commit checked out, or their own commits stacked on
+ it, become stale.
+ - In a stale checkout, commands that would build on the stale commits abort.
+ Run `sl update-stale` to move onto the latest versions. Uncommitted changes
+ come along.
+ - Do not run `sl goto` onto commits another worktree has checked out, or
+ rewrite them. Ask the agent that owns that worktree.
+agent-performance=## Keeping Commands Fast
+ 
+ In agent mode, a revset that scans more than `agent.max-commit-fetch-count`
+ commits (100000 by default) aborts, since fetching that much history from a
+ lazily fetched repo is slow. In a git repo the history is local, so the guard
+ is off unless `agent.git-fetch-guard=true` is set.
+ 
+ - Bound `sl log` with `-l N`, for example `sl log -l 20`.
+ - Narrow revsets to what you need: `draft()`, `::.`, `.~10::.`, `limit(...)`,
+ or a range between two commits, rather than `all()` or `author(...)` over the
+ whole history.
+ - To look at your own work, use `sl log -r 'draft() & ::.'` or `sl ssl`.
+ - If you really need the full scan, run the command with
+ `--config agent.max-commit-fetch-count=0`.
 agent-interactive=## Interactive Chunk Selection
  
  `sl commit -i`, `sl amend -i` and `sl revert -i` select individual files, hunks

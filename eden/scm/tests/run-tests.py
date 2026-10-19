@@ -1610,6 +1610,9 @@ class Test(unittest.TestCase):
             + " EDENSCM_LOG LOG FAILPOINTS"
             # Used by dummyssh
             + " DUMMYSSH_STABLE_ORDER"
+            # Set by coding agents; they turn on Sapling's agent mode
+            + " CODING_AGENT_METADATA CLAUDECODE AI_AGENT"
+            + " CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED"
         ).split()
 
         # pyrefly: ignore [missing-attribute]
