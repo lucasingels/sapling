@@ -46,9 +46,9 @@ Config::
 
 from sapling import error, git
 from sapling.i18n import _, _n
-from sapling.node import bin, short
+from sapling.node import bin, hex, short
 
-from . import changeid, diffs, status
+from . import api, changeid, diffs, status
 
 
 def uploads(pushnode_to_pairs):
@@ -274,3 +274,47 @@ def _rebasehint(repo, pushed, rebased):
 def _describe(repo, rev):
     ctx = repo[rev]
     return "%s %s" % (short(ctx.node()), ctx.description().split("\n", 1)[0])
+
+
+def alreadyuploaded(repo, pushnode_to_pairs):
+    """The change whose current patchset a failed push's commit already is.
+
+    Gerrit rejects a push with nothing new in it as "(no new changes)", and
+    git reports that as a failure; when the commit is already the change's
+    current patchset, the change is exactly as asked and the push did its job.
+    Asking the server is cheaper than parsing git's output, which goes straight
+    to the terminal, and answers the question that matters.
+
+    Not when the ref carries push options (``%topic=``, ``%wip``, reviewers,
+    labels, ...): those were never applied, so the push did not do what was
+    asked. And not when the server cannot be asked: a push that failed because
+    it is down must stay failed, whatever the cache last heard.
+    """
+    pairs = [
+        (node, str(ref))
+        for node, ref in pushnode_to_pairs
+        if node is not None and ref and str(ref).startswith(git.GERRIT_UPLOAD_REFS)
+    ]
+    if len(pairs) != 1 or "%" in pairs[0][1]:
+        return None
+    tip, ref = pairs[0]
+    target = branch(ref)
+    cid = changeid.extract(repo[tip].description())
+    if not cid:
+        return None
+    try:
+        changes = api.query(repo.ui, "change:%s" % cid)
+    except Exception as exc:
+        repo.ui.debug("gerrit: could not check the change: %s\n" % exc)
+        return None
+    for change in changes:
+        if (
+            change.get("change_id") == cid
+            and change.get("branch", target) in (target, "")
+            and change.get("revision") == hex(tip)
+        ):
+            cache = status.load(repo)
+            cache[cid] = change
+            status.save(repo, cache)
+            return change
+    return None

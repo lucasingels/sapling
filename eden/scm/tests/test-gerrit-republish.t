@@ -75,6 +75,10 @@ change asked for, newest last, as Gerrit does over the same connection.
 
   $ cat > "$TESTTMP/ssh" <<'EOF'
   > #!/bin/sh
+  > if [ -e "$TESTTMP/ssh-down" ]; then
+  >   echo "ssh: connect to host gerrit.example.com port 29418: Connection refused" >&2
+  >   exit 255
+  > fi
   > sent="$*"
   > case "$sent" in
   >   *git-upload-pack*)
@@ -360,3 +364,43 @@ not a republish:
   $ uploads
   #106 patchset 1: change m1 (release)
   #107 patchset 1: change m2 (release)
+
+"(no new changes)"
+-------------------
+
+Pushing a commit again has nothing new in it. Gerrit refuses that as "no new
+changes", but when the commit is already the change's current patchset the
+change is exactly as asked, so it is not an error:
+
+  $ sl push --to refs/for/release -r .
+  remote: no new changes* (glob)
+  To ssh://gerrit.example.com:29418/server
+   ! [remote rejected] * -> refs/for/release (pre-receive hook declined) (glob)
+  error: failed to push some refs to 'ssh://gerrit.example.com:29418/server'
+  change #107 already has this commit as its current patchset
+  $ uploads
+
+Not when the push carried options: the topic, reviewers or labels it asked for
+were never applied.
+
+  $ sl push -q --to 'refs/for/release%topic=again' -r .
+  remote: no new changes* (glob)
+  To ssh://gerrit.example.com:29418/server
+   ! [remote rejected] * -> refs/for/release%topic=again (pre-receive hook declined) (glob)
+  error: failed to push some refs to 'ssh://gerrit.example.com:29418/server'
+  [1]
+  $ sl gerrit publish -q --topic again > /dev/null 2>&1
+  [1]
+
+Nor when Gerrit cannot be asked. The push failed, and what the cache last
+heard does not say why:
+
+  $ touch "$TESTTMP/ssh-down"
+  $ sl push -q --to refs/for/release -r .
+  ssh: connect to host gerrit.example.com port 29418: Connection refused
+  fatal: Could not read from remote repository.
+  
+  Please make sure you have the correct access rights
+  and the repository exists.
+  [128]
+  $ rm "$TESTTMP/ssh-down"

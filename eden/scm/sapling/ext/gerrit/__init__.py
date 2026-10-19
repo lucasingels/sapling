@@ -157,6 +157,14 @@ def _push(orig, repo, dest, pushnode_to_pairs, force=False):
         return orig(repo, dest, pushnode_to_pairs, force=force)
     republish.check(repo, pushnode_to_pairs)
     result = orig(repo, dest, pushnode_to_pairs, force=force)
+    if result != 0:
+        change = republish.alreadyuploaded(repo, pushnode_to_pairs)
+        if change:
+            repo.ui.status(
+                _("change #%s already has this commit as its current patchset\n")
+                % change.get("number", "?")
+            )
+            result = 0
     if result == 0:
         # The whole draft stack below each commit went up with it.
         landed.recorduploaded(
