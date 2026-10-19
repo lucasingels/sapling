@@ -342,8 +342,9 @@ pub(crate) fn uncommitted_changes(
     repo: &Repo,
     path: &Path,
 ) -> Result<Vec<String>> {
-    // A checkout already gone behind our back has nothing left to lose.
-    if !path.exists() {
+    // A checkout already gone behind our back has nothing left to lose. One
+    // that cannot be read is not gone: the status below fails for it.
+    if worktree::is_missing(path) {
         return Ok(Vec::new());
     }
     // A git worktree made with plain git has no sl state until the first `sl`

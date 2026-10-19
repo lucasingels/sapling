@@ -229,7 +229,10 @@ export async function listWorktrees(ctx: RepositoryContext): Promise<WorktreeEnt
     const entries: Array<Omit<WorktreeEntry, 'staleReason'> & {stale_reason?: string}> = JSON.parse(
       result.stdout,
     );
-    return entries.map(({stale_reason, ...entry}) => ({...entry, staleReason: stale_reason}));
+    // A worktree deleted behind sl's back has no checkout to show or query.
+    return entries
+      .filter(entry => entry.missing !== true)
+      .map(({stale_reason, ...entry}) => ({...entry, staleReason: stale_reason}));
   } catch (error) {
     ctx.logger.error(`Failed to list worktrees for ${ctx.cwd}`, error);
     return [];

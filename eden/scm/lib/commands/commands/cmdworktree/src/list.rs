@@ -20,7 +20,7 @@ use worktree::Worktrees;
 
 use crate::WorktreeOpts;
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub(crate) struct ListOutputEntry {
     pub(crate) path: PathBuf,
     role: &'static str,
@@ -34,6 +34,8 @@ pub(crate) struct ListOutputEntry {
     stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stale_reason: Option<String>,
+    /// Whether its directory was deleted behind sl's back.
+    missing: bool,
 }
 
 impl Formattable for ListOutputEntry {
@@ -52,6 +54,9 @@ impl Formattable for ListOutputEntry {
         )?;
         if let Some(label) = &self.label {
             write!(writer, "   {label}")?;
+        }
+        if self.missing {
+            write!(writer, "   (missing)")?;
         }
         if self.stale {
             write!(writer, "   (stale)")?;
@@ -124,6 +129,7 @@ pub(crate) fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntr
         node,
         stale: stale.is_some(),
         stale_reason: stale.map(|state| state.message(repo)),
+        missing: entry.missing,
     }
 }
 
@@ -165,6 +171,7 @@ mod tests {
             node: None,
             stale: false,
             stale_reason: None,
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -183,6 +190,7 @@ mod tests {
             node: None,
             stale: false,
             stale_reason: None,
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -201,6 +209,7 @@ mod tests {
             node: None,
             stale: false,
             stale_reason: None,
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -219,6 +228,7 @@ mod tests {
             node: None,
             stale: false,
             stale_reason: None,
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry
@@ -237,12 +247,32 @@ mod tests {
             node: Some("1".repeat(40)),
             stale: true,
             stale_reason: Some("rewritten".to_string()),
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry
             .format_plain(&FormatOptions::default(), &mut w)
             .unwrap();
         assert_eq!(mock_output(&w), "  linked  /repos/linked   dev   (stale)\n");
+    }
+
+    #[test]
+    fn test_format_plain_missing() {
+        let entry = ListOutputEntry {
+            path: PathBuf::from("/repos/linked"),
+            role: "linked",
+            label: Some("dev".to_string()),
+            missing: true,
+            ..Default::default()
+        };
+        let mut w = MockWriter(Vec::new());
+        entry
+            .format_plain(&FormatOptions::default(), &mut w)
+            .unwrap();
+        assert_eq!(
+            mock_output(&w),
+            "  linked  /repos/linked   dev   (missing)\n"
+        );
     }
 
     #[test]
@@ -255,6 +285,7 @@ mod tests {
             node: None,
             stale: false,
             stale_reason: None,
+            ..Default::default()
         };
         let mut w = MockWriter(Vec::new());
         entry

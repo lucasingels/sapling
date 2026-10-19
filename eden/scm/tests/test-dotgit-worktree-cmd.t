@@ -38,7 +38,8 @@ Add a linked worktree at the current commit, with a label:
     "role": "main",
     "current": true,
     "node": "*", (glob)
-    "stale": false
+    "stale": false,
+    "missing": false
   },
   {
     "path": "$TESTTMP/wt1",
@@ -46,7 +47,8 @@ Add a linked worktree at the current commit, with a label:
     "label": "first",
     "current": false,
     "node": "*", (glob)
-    "stale": false
+    "stale": false,
+    "missing": false
   }
   ]
 
@@ -231,16 +233,19 @@ Remove worktrees, including one with local changes; git forgets them too:
   worktree $TESTTMP/wt1
   worktree $TESTTMP/wt2
 
-A worktree deleted behind sl's back is dropped from the list:
+A worktree deleted behind sl's back stays listed, as missing, until it is
+removed:
 
   $ rm -rf $TESTTMP/wt1
   $ sl worktree list
   * main    $TESTTMP/repo
+    linked  $TESTTMP/wt1   (missing)
     linked  $TESTTMP/wt2   second
 
 Remove everything that is left:
 
   $ sl worktree remove --all -y
+  removed $TESTTMP/wt1
   removed $TESTTMP/wt2
   $ sl worktree list
   * main    $TESTTMP/repo

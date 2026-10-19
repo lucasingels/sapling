@@ -407,6 +407,7 @@ pub(crate) fn run(
         };
         match kind {
             WorktreeKind::Git => {
+                forget_missing_worktree(worktrees, &dest)?;
                 worktrees
                     .add(&dest, target.map(|target| target.to_hex()).as_deref())
                     .inspect_err(|_| partial_checkout_warning())?;
@@ -614,13 +615,32 @@ fn count_linked_worktrees(
     group_main_path: &Path,
 ) -> Result<usize> {
     if worktrees.kind() == WorktreeKind::Git {
-        return Ok(worktrees.list()?.iter().filter(|wt| !wt.is_main).count());
+        // A worktree deleted behind git's back takes no room.
+        return Ok(worktrees
+            .list()?
+            .iter()
+            .filter(|wt| !wt.is_main && !wt.missing)
+            .count());
     }
     Ok(registry
         .find_group_for_path(group_main_path)
         .and_then(|group_id| registry.groups.get(&group_id))
         .map(Group::linked_worktree_count)
         .unwrap_or(0))
+}
+
+/// Git refuses to add a worktree where one it still lists was deleted behind
+/// its back. Drop that registration first, the way `remove` would; the
+/// registry entry is replaced when the new worktree is registered.
+fn forget_missing_worktree(worktrees: &Worktrees, dest: &Path) -> Result<()> {
+    let missing = worktrees
+        .list()?
+        .into_iter()
+        .find(|wt| wt.missing && crate::canonical(&wt.path) == dest);
+    if let Some(wt) = missing {
+        worktrees.remove(&wt.path)?;
+    }
+    Ok(())
 }
 
 /// Runs the `worktree.path-generator` command and returns the generated path.

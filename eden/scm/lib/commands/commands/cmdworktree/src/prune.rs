@@ -6,6 +6,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,7 +26,8 @@ use crate::remove::uncommitted_changes;
 use crate::require_group;
 
 /// Remove the linked worktrees that are done with: clean, and on a commit that
-/// landed or was abandoned. Never the main checkout or the current one.
+/// landed or was abandoned, or deleted behind sl's back. Never the main
+/// checkout or the current one.
 pub(crate) fn run(
     ctx: &ReqCtx<WorktreeOpts>,
     repo: &Repo,
@@ -47,24 +49,50 @@ pub(crate) fn run(
     // Commits under the current checkout are not abandoned while it builds on them.
     let wdir_parents = workingcopy::fast_path_wdir_parents(repo.path(), repo.ident())?.to_vec();
 
+    let missing: BTreeSet<PathBuf> = worktrees
+        .list()?
+        .into_iter()
+        .filter(|wt| wt.missing)
+        .map(|wt| canonical(&wt.path))
+        .collect();
+
     let mut reasons: BTreeMap<PathBuf, &str> = BTreeMap::new();
     for path in current_group.linked() {
         if *path == current {
             continue;
         }
+        let keep = |why: String| -> Result<()> {
+            ctx.io()
+                .write_err(format!("keeping {}{why}\n", path.display()))?;
+            Ok(())
+        };
+        // Deleted behind sl's back: there is nothing left to lose.
+        if missing.contains(path) {
+            reasons.insert(path.clone(), "missing");
+            continue;
+        }
+        if let Err(err) = std::fs::symlink_metadata(path) {
+            keep(format!(": cannot read it: {err}"))?;
+            continue;
+        }
         let Some(finished) = finished_state(repo, path, &wdir_parents) else {
             continue;
         };
-        let changes = uncommitted_changes(ctx, repo, path)?;
-        if !changes.is_empty() {
-            ctx.io().write_err(format!(
-                "keeping {} ({}): it has uncommitted changes\n",
-                path.display(),
-                finished.as_str()
-            ))?;
-            continue;
+        let reason = finished.as_str();
+        match uncommitted_changes(ctx, repo, path) {
+            Ok(changes) if changes.is_empty() => {}
+            Ok(_) => {
+                keep(format!(" ({reason}): it has uncommitted changes"))?;
+                continue;
+            }
+            Err(err) => {
+                keep(format!(
+                    " ({reason}): cannot check for uncommitted changes: {err}"
+                ))?;
+                continue;
+            }
         }
-        reasons.insert(path.clone(), finished.as_str());
+        reasons.insert(path.clone(), reason);
     }
 
     if reasons.is_empty() {

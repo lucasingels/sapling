@@ -41,6 +41,7 @@ use util::lock::PathLock;
 pub use crate::backend::ListedWorktree;
 pub use crate::backend::WorktreeKind;
 pub use crate::backend::Worktrees;
+pub use crate::backend::is_missing;
 
 // --- Data Model ---
 

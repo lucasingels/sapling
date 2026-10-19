@@ -334,6 +334,11 @@ export type WorktreeEntry = {
   stale?: boolean;
   /** Why the worktree is stale, when it is. */
   staleReason?: string;
+  /**
+   * Whether the worktree's directory was deleted behind sl's back. `listWorktrees`
+   * leaves such entries out: there is no checkout to show.
+   */
+  missing?: boolean;
 };
 
 export type ApplicationInfo = {

@@ -185,7 +185,7 @@ pub fn doc() -> &'static str {
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
       path LABEL [-Tjson]                               Print the path of the worktree labeled LABEL
-      prune [--dry-run] [-y]                            Remove linked worktrees that landed or were abandoned
+      prune [--dry-run] [-y]                            Remove linked worktrees that landed, were abandoned or are missing
 
     `remove` refuses to remove a worktree with uncommitted changes, untracked
     files included, unless `--force` is given; the confirmation prompt then
@@ -198,15 +198,22 @@ pub fn doc() -> &'static str {
     `prune` (git worktrees only) removes the linked worktrees that have no
     uncommitted changes and whose commit is done with: landed (the commit, or
     a later version of it, is public) or abandoned (the commit is hidden and
-    no later version of it is visible). The main checkout and the current
-    one are never removed, and neither is a stale worktree whose commit was
-    rewritten into a visible draft commit. `--dry-run` lists what would be
-    removed and why. Removal works as in `remove`, including the
-    confirmation prompt (skipped with `-y`) and the pre-worktree-remove hooks.
+    no later version of it is visible), and the missing ones (see below).
+    The main checkout and the current one are never removed, and neither is
+    a stale worktree whose commit was rewritten into a visible draft commit,
+    nor one that cannot be read. `--dry-run` lists what would be removed and
+    why. Removal works as in `remove`, including the confirmation prompt
+    (skipped with `-y`) and the pre-worktree-remove hooks.
+
+    A linked git worktree whose directory was deleted behind sl's back stays
+    in `list`, marked missing, until `remove PATH` or `prune` removes what is
+    left of it; `add` at its path replaces it. A directory that exists but
+    cannot be read is not missing.
 
     With -Tjson, `list` also gives each worktree's checked out commit
-    ("node") and whether it is stale ("stale", "stale_reason"): another
-    worktree rewrote that commit or one below it (see `update-stale`).
+    ("node"), whether it is stale ("stale", "stale_reason"): another
+    worktree rewrote that commit or one below it (see `update-stale`), and
+    whether it is missing ("missing").
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path when configured. Otherwise, for git-backed

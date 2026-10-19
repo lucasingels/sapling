@@ -34,6 +34,22 @@ pub struct ListedWorktree {
     pub label: Option<String>,
     /// Whether this is the working tree from which the command was run.
     pub current: bool,
+    /// Whether the checkout was deleted behind the backend's back (see
+    /// [`is_missing`]). Git still lists such a linked worktree until it is
+    /// removed or pruned.
+    pub missing: bool,
+    /// Git's administrative dir of a linked worktree (`.git/worktrees/<id>`),
+    /// which holds its sl state too (`<admin dir>/sl`).
+    pub admin_dir: Option<PathBuf>,
+}
+
+/// Whether nothing is at `path`. Only "not found" counts: a checkout that
+/// cannot be read (permissions, I/O errors, ...) is still there.
+pub fn is_missing(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// What a repository's linked worktrees are.
@@ -130,6 +146,8 @@ impl WorktreeBackend for SaplingBackend {
                             is_main: *path == group.main,
                             label: entry.label.clone(),
                             current: *path == current,
+                            missing: false,
+                            admin_dir: None,
                         })
                         .collect()
                 })
@@ -149,21 +167,25 @@ impl WorktreeBackend for GitBackend {
         let labels = load_labels(&shared_store_path)?;
         let current = canonicalize_or_original(&self.repo_path);
 
+        let admin_dirs = linked_admin_dirs(self.git.common_dir());
+
+        // A linked worktree deleted behind git's back stays listed until it
+        // is removed or pruned. It is listed as missing, so that `sl
+        // worktree` can show it and clean it up.
         Ok(self
             .git
             .list_worktrees()
             .context("failed to list Git worktrees")?
             .into_iter()
-            // A linked worktree deleted behind git's back stays listed (as prunable) until
-            // `git worktree prune`; it is not a usable checkout, so leave it out.
-            .filter(|worktree| worktree.is_main || worktree.path.exists())
             .map(|worktree| {
                 let canonical_path = canonicalize_or_original(&worktree.path);
                 ListedWorktree {
-                    path: worktree.path,
-                    is_main: worktree.is_main,
                     label: labels.get(&canonical_path).cloned(),
                     current: canonical_path == current,
+                    missing: !worktree.is_main && is_missing(&worktree.path),
+                    admin_dir: admin_dirs.get(&admin_dir_key(&worktree.path)).cloned(),
+                    path: worktree.path,
+                    is_main: worktree.is_main,
                 }
             })
             .collect())
@@ -189,21 +211,58 @@ impl WorktreeBackend for GitBackend {
     }
 
     /// `--force` because the point of `sl worktree remove` is to discard the
-    /// checkout; the caller has already confirmed with the user. The prune also
-    /// drops the admin dirs of worktrees deleted behind git's back, `path`
-    /// included when it is already gone; without `--expire now` git keeps them
-    /// for `gc.worktreePruneExpire` (three months by default).
+    /// checkout; the caller has already confirmed with the user. For a
+    /// checkout deleted behind git's back, git only drops its admin dir. An
+    /// older git that refuses to remove a missing worktree gets its admin dir
+    /// deleted directly, which is all `git worktree prune` would do for it.
     fn remove(&self, path: &Path) -> Result<()> {
-        if path.exists() {
-            self.git
-                .call("worktree", &["remove", "--force", &path.display().to_string()])
-                .with_context(|| format!("git worktree remove {}", path.display()))?;
+        let removed = self
+            .git
+            .call("worktree", &["remove", "--force", &path.display().to_string()])
+            .with_context(|| format!("git worktree remove {}", path.display()));
+        let err = match removed {
+            Ok(_) => return Ok(()),
+            Err(err) => err,
+        };
+        if !is_missing(path) {
+            return Err(err);
         }
-        self.git
-            .call("worktree", &["prune", "--expire", "now"])
-            .context("git worktree prune")?;
+        let admin_dirs = linked_admin_dirs(self.git.common_dir());
+        let Some(admin_dir) = admin_dirs.get(&admin_dir_key(path)) else {
+            return Err(err);
+        };
+        fs::remove_dir_all(admin_dir)
+            .with_context(|| format!("removing {} after: {err:#}", admin_dir.display()))?;
         Ok(())
     }
+}
+
+/// The admin dir (`<common git dir>/worktrees/<id>`) of each linked worktree,
+/// by [`admin_dir_key`] of its path. The admin dir's `gitdir` file points to
+/// the worktree's `.git` file, by an absolute path or, with
+/// `worktree.useRelativePaths`, one relative to the admin dir.
+fn linked_admin_dirs(common_git_dir: &Path) -> BTreeMap<PathBuf, PathBuf> {
+    let Ok(entries) = fs::read_dir(common_git_dir.join("worktrees")) else {
+        return BTreeMap::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let admin_dir = entry.ok()?.path();
+            let gitdir = fs::read_to_string(admin_dir.join("gitdir")).ok()?;
+            let dotgit = admin_dir.join(gitdir.trim_end_matches(['\n', '\r']));
+            let worktree = dotgit.parent()?;
+            Some((admin_dir_key(worktree), admin_dir))
+        })
+        .collect()
+}
+
+/// `path` made comparable whether git spelled it relative to an admin dir, or
+/// through a symlink, and whether or not it still exists.
+fn admin_dir_key(path: &Path) -> PathBuf {
+    let path = util::path::normalize(path);
+    util::path::canonical_path_allow_missing(&path)
+        .map(util::path::strip_unc_prefix)
+        .unwrap_or(path)
 }
 
 /// A worktree created inside the main checkout (e.g. `<root>/.worktrees/<name>`)
@@ -330,4 +389,61 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
     util::path::canonicalize_best_effort(path)
         .map(util::path::strip_unc_prefix)
         .unwrap_or_else(|_| path.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_missing(dir.path()));
+        assert!(is_missing(&dir.path().join("gone")));
+        assert!(is_missing(&dir.path().join("gone/deeper")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_is_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir_all(parent.join("checkout")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&parent).is_ok();
+        let missing = is_missing(&parent.join("checkout"));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root reads through any permissions.
+        if !readable {
+            assert!(!missing);
+        }
+    }
+
+    #[test]
+    fn test_linked_admin_dirs_relative_and_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = util::path::strip_unc_prefix(std::fs::canonicalize(dir.path()).unwrap());
+        let common = root.join("main/.git");
+        for (id, gitdir) in [
+            ("abs", root.join("abs/.git").display().to_string()),
+            ("rel", "../../../../rel/.git".to_string()),
+        ] {
+            std::fs::create_dir_all(common.join("worktrees").join(id)).unwrap();
+            std::fs::write(common.join("worktrees").join(id).join("gitdir"), gitdir + "\n")
+                .unwrap();
+        }
+        std::fs::create_dir_all(root.join("abs")).unwrap();
+        let dirs = linked_admin_dirs(&common);
+        assert_eq!(
+            dirs.get(&admin_dir_key(&root.join("abs"))),
+            Some(&common.join("worktrees/abs"))
+        );
+        // "rel" does not exist: it was deleted behind git's back.
+        assert_eq!(
+            dirs.get(&admin_dir_key(&root.join("rel"))),
+            Some(&common.join("worktrees/rel"))
+        );
+    }
 }
