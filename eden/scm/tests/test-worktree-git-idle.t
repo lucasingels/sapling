@@ -207,3 +207,83 @@ work landed before it moved on to its next task ("next") is idle:
   keeping $TESTTMP/next (idle): it was made or moved less than 1d ago
   keeping $TESTTMP/old (idle): it was made or moved less than 1d ago
   no worktrees to prune
+
+The worktree's own commit is told by its hash, not its message: commits that
+reuse a message do not make a worktree landed. In "wip", the first of two
+"wip" commits lands and the worktree goes back to it; in "deps", the agent's
+draft has the message of an upstream commit, and the worktree moves to that
+one for its next task; in "same", one of three "same" commits lands and the
+worktree goes back to it. An amended commit that lands is still the
+worktree's own ("amended"):
+
+  $ setconfig extensions.amend=
+  $ sl pull -q
+  $ sl worktree add -q -r origin/main $TESTTMP/wip
+  $ cd $TESTTMP/wip
+  $ echo x > x
+  $ sl commit -qAm wip
+  $ echo y > y
+  $ sl commit -qAm wip
+  $ sl push -q -r .^ --to main
+  $ sl prev -q
+  [ca8c71] wip
+  $ sl worktree add -q -r origin/main $TESTTMP/same
+  $ cd $TESTTMP/same
+  $ for name in same1 same2 same3; do
+  >   echo $name > $name
+  >   sl commit -qAm same
+  > done
+  $ sl push -q -r .^ --to main
+  $ sl goto -q .^
+  $ sl worktree add -q -r origin/main $TESTTMP/amended
+  $ cd $TESTTMP/amended
+  $ echo amended > amended
+  $ sl commit -qAm amended
+  $ sl amend -q -m 'amended, with a better message'
+  $ sl push -q -r . --to main
+  $ sl worktree add -q -r origin/main $TESTTMP/deps
+  $ cd $TESTTMP/deps
+  $ echo mine > mine
+  $ sl commit -qAm 'Update deps'
+  $ cd $TESTTMP/server
+  $ git checkout -q main
+  $ echo theirs > theirs
+  $ git add theirs
+  $ git commit -q -m 'Update deps'
+  $ git checkout -q --detach
+  $ cd $TESTTMP/deps
+  $ sl pull -q
+  $ sl goto -q origin/main
+  $ cd $TESTTMP/repo
+  $ sl worktree prune --dry-run
+  keeping $TESTTMP/deps (idle): it was made or moved less than 1d ago
+  keeping $TESTTMP/m (idle): it was made or moved less than 1d ago
+  keeping $TESTTMP/next (idle): it was made or moved less than 1d ago
+  keeping $TESTTMP/old (idle): it was made or moved less than 1d ago
+  keeping $TESTTMP/same (idle): it was made or moved less than 1d ago
+  keeping $TESTTMP/wip (idle): it was made or moved less than 1d ago
+  would remove $TESTTMP/amended (landed)
+
+Shelving does not change which commit is the worktree's own: commit, shelve
+other work (and unshelve it again), then land the commit:
+
+  $ sl worktree add -q -r origin/main $TESTTMP/shelf
+  $ cd $TESTTMP/shelf
+  $ echo shelf > shelf
+  $ sl commit -qAm shelf
+  $ echo wip > shelf
+  $ sl shelve -q
+  $ sl push -q -r . --to main
+  $ sl worktree add -q -r origin/main $TESTTMP/unshelved
+  $ cd $TESTTMP/unshelved
+  $ echo unshelved > unshelved
+  $ sl commit -qAm unshelved
+  $ echo wip > unshelved
+  $ sl shelve -q
+  $ sl unshelve -q
+  $ sl revert -q -C --all
+  $ sl push -q -r . --to main
+  $ cd $TESTTMP/repo
+  $ sl worktree prune --dry-run 2>&1 | grep -E '/(shelf|unshelved) '
+  keeping $TESTTMP/shelf (landed): it has shelved changes
+  would remove $TESTTMP/unshelved (landed)

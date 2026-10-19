@@ -40,7 +40,7 @@ import time
 
 from . import error, git, hg, merge as mergemod, mutation, util
 from .i18n import _
-from .node import bin, nullid, short
+from .node import bin, hex, nullid, short
 
 # Commands that would build on, rewrite or publish the stale commits.
 DEFAULT_BLOCKED_COMMANDS = [
@@ -55,6 +55,11 @@ DEFAULT_BLOCKED_COMMANDS = [
     "unamend",
     "uncommit",
 ]
+
+# In a linked git worktree's dot dir: the commit `sl commit` or `sl amend` last
+# made there. The worktree_stale crate reads it to tell a worktree whose own work
+# landed from one that only sits on a landed commit.
+LASTCOMMIT = "worktree-last-commit"
 
 # The working copy parent itself was rewritten.
 REWRITTEN = "rewritten"
@@ -93,6 +98,27 @@ def _ingroup(repo):
         return bool(os.listdir(os.path.join(dotgit, "worktrees")))
     except OSError:
         return False
+
+
+def recordcommit(repo, node):
+    """note that `sl commit` or `sl amend` made node in this checkout, when it
+    is a linked git worktree"""
+    # Commits made inside a larger operation (shelve, unshelve, rebase,
+    # histedit, split, ...) are not the checkout's own: the operation may
+    # still abort, or hide them. Rewrites are found as later versions of the
+    # recorded commit instead.
+    if repo.currenttransaction() is not None:
+        return
+    if git.DOTGIT_REQUIREMENT not in repo.requirements:
+        return
+    if not os.path.isfile(repo.wvfs.join(".git")):
+        return
+    try:
+        repo.localvfs.writeutf8(LASTCOMMIT, "%s\n" % hex(node))
+    except OSError:
+        # Only `sl worktree prune` is the poorer for it: the worktree reads
+        # as idle rather than landed.
+        pass
 
 
 def _stalestate(repo, node):

@@ -4063,6 +4063,11 @@ def amend(ui, repo, old, extra, pats, opts):
 
     copies.record_amend_copies(repo, amend_copies, old, repo[node])
 
+    if node != old.node():
+        from . import worktreestale
+
+        worktreestale.recordcommit(repo, node)
+
     return node
 
 

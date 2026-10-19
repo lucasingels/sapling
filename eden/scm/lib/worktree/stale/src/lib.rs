@@ -323,6 +323,10 @@ pub fn other_checkout_unfinished(root: &Path) -> Result<bool> {
     has_unfinished_operation(&info.dot_hg_path)
 }
 
+/// In a checkout's dot dir: the commit `sl commit` or `sl amend` last made
+/// there, written by `worktreestale.recordcommit`.
+const LAST_COMMIT_FILE: &str = "worktree-last-commit";
+
 /// In a checkout's dot dir: the draft commit `sl worktree add` made it on.
 const DRAFT_BASE_FILE: &str = "worktree-draft-base";
 
@@ -450,23 +454,23 @@ impl<'a> Graph<'a> {
 
     /// What the checkout with dot dir `dot_path` did with the public commit
     /// `node` it is on: [`Finished::Landed`] when `node` is the commit it last
-    /// made with `sl commit`, [`Finished::LandedUnused`] when `sl worktree add`
-    /// made it on `node` while `node` was a draft, else [`Finished::Idle`].
+    /// made with `sl commit` or `sl amend`, or a later version of that commit,
+    /// [`Finished::LandedUnused`] when `sl worktree add` made it on `node`
+    /// while `node` was a draft, else [`Finished::Idle`].
     ///
     /// Only the checkout's own records can tell: the repo-wide history does
     /// not say which checkout a draft belonged to, so a fresh checkout on a
     /// commit another checkout landed would look landed too. Those records are
-    /// a linked git worktree's: its dot dir is `<admin dir>/sl` and git logs
-    /// each commit the checkout moves to in `<admin dir>/logs/HEAD`. Other
+    /// a linked git worktree's, in its dot dir `<admin dir>/sl`. Other
     /// checkouts are idle.
     async fn public_verdict(&self, dot_path: &Path, node: &HgId) -> Result<Finished> {
-        let Some(admin_dir) = dot_path
+        let in_git_worktree = dot_path
             .parent()
-            .filter(|dir| dir.join("commondir").is_file())
-        else {
+            .is_some_and(|admin_dir| admin_dir.join("commondir").is_file());
+        if !in_git_worktree {
             return Ok(Finished::Idle);
-        };
-        if self.committed_here(admin_dir, dot_path, node).await? {
+        }
+        if self.committed_here(dot_path, node).await? {
             return Ok(Finished::Landed);
         }
         let base = fs::read_to_string(dot_path.join(DRAFT_BASE_FILE)).unwrap_or_default();
@@ -476,43 +480,24 @@ impl<'a> Graph<'a> {
         Ok(Finished::Idle)
     }
 
-    /// Whether `node` is the commit that `sl commit` last made in the git
-    /// worktree with admin dir `admin_dir` and dot dir `dot_path`, and the
-    /// worktree is still on it. `sl commit` leaves its message in the dot dir
-    /// (`last-message.txt`) as it commits; the worktree moved to `node` (it is
-    /// in `logs/HEAD`), `node` is not the commit the worktree was made on nor
-    /// below it, and `node` has that message. A worktree that committed and
-    /// then moved elsewhere, e.g. `sl goto origin/main` for its next task, did
-    /// not commit the commit it is on; neither did one that only shelved.
-    async fn committed_here(&self, admin_dir: &Path, dot_path: &Path, node: &HgId) -> Result<bool> {
-        let Ok(message) = fs::read_to_string(dot_path.join("last-message.txt")) else {
+    /// Whether `node` is the commit that `sl commit` or `sl amend` last made
+    /// in the checkout with dot dir `dot_path`, which they record there
+    /// (`worktreestale.recordcommit`), or a later version of it, e.g. the one
+    /// that landed. A checkout that committed and then moved elsewhere, e.g.
+    /// `sl goto origin/main` for its next task, is not on its own commit, even
+    /// when the commit there has the same message.
+    async fn committed_here(&self, dot_path: &Path, node: &HgId) -> Result<bool> {
+        let recorded = fs::read_to_string(dot_path.join(LAST_COMMIT_FILE)).unwrap_or_default();
+        let Ok(recorded) = HgId::from_hex(recorded.trim().as_bytes()) else {
             return Ok(false);
         };
-        let Ok(reflog) = fs::read_to_string(admin_dir.join("logs/HEAD")) else {
-            return Ok(false);
-        };
-        let visited: Vec<HgId> = reflog
-            .lines()
-            .filter_map(|line| HgId::from_hex(line.split(' ').nth(1)?.as_bytes()).ok())
-            .collect();
-        let Some(made_on) = visited.first() else {
-            return Ok(false);
-        };
-        if !visited.contains(node) {
-            return Ok(false);
+        if recorded == *node {
+            return Ok(true);
         }
-        if self.has_node(made_on).await?
-            && self
-                .dag
-                .is_ancestor(vertex(node), vertex(made_on))
-                .await?
-        {
-            return Ok(false);
-        }
-        let Some(fields) = self.dag.get_commit_fields(&vertex(node)).await? else {
-            return Ok(false);
-        };
-        Ok(fields.description()?.trim_end() == message.trim_end())
+        Ok(self
+            .visible_newer_versions(&recorded, false)
+            .await?
+            .contains(node))
     }
 
     /// The number of draft (not public) commits that `node` is on, itself

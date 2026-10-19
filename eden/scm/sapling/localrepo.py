@@ -2836,6 +2836,10 @@ class localrepository:
         finally:
             lockmod.release(tr, lock, wlock)
 
+        from . import worktreestale
+
+        worktreestale.recordcommit(self, ret)
+
         self.hook("commit", node=hex(ret), parent1=hookp1, parent2=hookp2)
 
         return ret
