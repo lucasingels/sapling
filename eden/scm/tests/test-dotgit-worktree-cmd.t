@@ -39,6 +39,9 @@ Add a linked worktree at the current commit, with a label:
     "current": true,
     "node": "*", (glob)
     "stale": false,
+    "unfinished": false,
+    "drafts": 2,
+    "shelved": 0,
     "missing": false,
     "locked": false
   },
@@ -49,6 +52,9 @@ Add a linked worktree at the current commit, with a label:
     "current": false,
     "node": "*", (glob)
     "stale": false,
+    "unfinished": false,
+    "drafts": 2,
+    "shelved": 0,
     "missing": false,
     "locked": false
   }

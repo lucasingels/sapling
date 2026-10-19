@@ -60,6 +60,9 @@ define_flags! {
         #[short('n')]
         dry_run: bool,
 
+        /// also tell which worktrees have uncommitted changes (for 'list' and 'path' with -Tjson)
+        status: bool,
+
         formatter_opts: FormatterOpts,
 
         #[args]
@@ -71,6 +74,9 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
     let subcmd = ctx.opts.args.first().map(|s| s.as_str()).unwrap_or("");
     if !ctx.opts.rev.is_empty() && subcmd != "add" {
         abort!("--rev can only be used with 'worktree add'");
+    }
+    if ctx.opts.status && !matches!(subcmd, "list" | "ls" | "path") {
+        abort!("--status can only be used with 'worktree list' and 'worktree path'");
     }
     let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy, &Worktrees) -> Result<u8> =
         match subcmd {
@@ -214,7 +220,7 @@ pub fn doc() -> &'static str {
 
     Subcommands::
 
-      list [-Tjson]                                     List all worktrees in the group, marking stale ones
+      list [-Tjson [--status]]                          List all worktrees in the group, marking stale ones
       add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
@@ -261,8 +267,13 @@ pub fn doc() -> &'static str {
     With -Tjson, `list` also gives each worktree's checked out commit
     ("node"), whether it is stale ("stale", "stale_reason"): another
     worktree rewrote that commit or one below it (see `update-stale`),
-    whether it is missing ("missing"), and whether it is locked ("locked",
-    "lock_reason").
+    why `prune` would consider it done with ("finished": "landed",
+    "abandoned" or "idle"; left out for the main and the current checkout),
+    whether a merge, rebase, ... is unfinished there ("unfinished"), how
+    many draft commits its stack has ("drafts"), how many shelves it keeps
+    ("shelved"), whether it is missing ("missing"), and whether it is locked
+    ("locked", "lock_reason"). With `--status`, also whether it has
+    uncommitted changes ("dirty"), which takes a status run per worktree.
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path when configured. Otherwise, for git-backed

@@ -14,6 +14,7 @@ use workingcopy::workingcopy::WorkingCopy;
 use worktree::Worktrees;
 
 use crate::WorktreeOpts;
+use crate::list::current_parents;
 use crate::list::output_entry;
 
 /// Print the path of the worktree labeled LABEL, so `cd "$(sl wt path LABEL)"`
@@ -60,7 +61,12 @@ pub(crate) fn run(
         ctx.io().write(format!("{}\n", entry.path.display()))?;
     } else {
         formatter.begin_list()?;
-        formatter.format_item(&output_entry(repo, entry))?;
+        formatter.format_item(&output_entry(
+            ctx,
+            repo,
+            entry,
+            Some(&current_parents(repo)),
+        )?)?;
         formatter.end_list()?;
     }
     Ok(0)

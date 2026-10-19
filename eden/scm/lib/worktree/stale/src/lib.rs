@@ -15,9 +15,10 @@
 //!
 //! This crate only detects that state, and which checkouts are done with
 //! (their commit landed or was abandoned, or they sit unused on a public
-//! commit) for `sl worktree prune`. Moving a stale checkout onto the latest
-//! versions (`sl update-stale`) lives in Python, in `worktreestale.py`, which
-//! calls into this crate through the `repo` bindings.
+//! commit) for `sl worktree prune` and `sl worktree list`. Moving a stale
+//! checkout onto the latest versions (`sl update-stale`) lives in Python, in
+//! `worktreestale.py`, which calls into this crate through the `repo`
+//! bindings.
 
 use std::collections::HashSet;
 use std::fs;
@@ -254,19 +255,64 @@ pub fn other_checkout_finished(
     node: &HgId,
     wdir_parents: &[HgId],
 ) -> Result<Option<Finished>> {
+    Ok(summarize(repo, root, node, wdir_parents, false)?.finished)
+}
+
+/// What `sl worktree list` says about another checkout of `repo`'s group.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CheckoutSummary {
+    /// See [`other_checkout_finished`].
+    pub finished: Option<Finished>,
+    /// A merge, rebase, graft, ... is unfinished there.
+    pub unfinished: bool,
+    /// The number of draft commits in the checked out stack, the checked out
+    /// commit included.
+    pub drafts: u64,
+}
+
+/// [`other_checkout_finished`] for the checkout at `root`, which has `node`
+/// checked out, along with whether an operation is unfinished there and how
+/// many drafts its stack has.
+pub fn other_checkout_summary(
+    repo: &Repo,
+    root: &Path,
+    node: &HgId,
+    wdir_parents: &[HgId],
+) -> Result<CheckoutSummary> {
+    summarize(repo, root, node, wdir_parents, true)
+}
+
+fn summarize(
+    repo: &Repo,
+    root: &Path,
+    node: &HgId,
+    wdir_parents: &[HgId],
+    count_drafts: bool,
+) -> Result<CheckoutSummary> {
     let info = RepoMinimalInfo::from_repo_root(root.to_path_buf())?;
-    if has_unfinished_operation(&info.dot_hg_path)? {
-        return Ok(None);
-    }
+    let unfinished = has_unfinished_operation(&info.dot_hg_path)?;
     let dag = repo.dag_commits()?;
     let dag = dag.read();
     block_on(async {
         let graph = Graph::new(repo, &**dag, wdir_parents).await?;
-        let finished = graph.finished_state(node).await?;
+        let mut finished = if unfinished {
+            None
+        } else {
+            graph.finished_state(node).await?
+        };
         if finished == Some(Finished::Landed) && graph.is_public(node).await? {
-            return Ok(Some(graph.public_verdict(&info.dot_hg_path, node).await?));
+            finished = Some(graph.public_verdict(&info.dot_hg_path, node).await?);
         }
-        Ok(finished)
+        let drafts = if count_drafts {
+            graph.draft_count(node).await?
+        } else {
+            0
+        };
+        Ok(CheckoutSummary {
+            finished,
+            unfinished,
+            drafts,
+        })
     })
 }
 
@@ -467,6 +513,20 @@ impl<'a> Graph<'a> {
             return Ok(false);
         };
         Ok(fields.description()?.trim_end() == message.trim_end())
+    }
+
+    /// The number of draft (not public) commits that `node` is on, itself
+    /// included.
+    async fn draft_count(&self, node: &HgId) -> Result<u64> {
+        if !self.has_node(node).await? {
+            return Ok(0);
+        }
+        let stack = self
+            .dag
+            .ancestors(Set::from_static_names([vertex(node)]))
+            .await?
+            - self.public.clone();
+        Ok(stack.count().await?)
     }
 
     async fn finished_state(&self, node: &HgId) -> Result<Option<Finished>> {

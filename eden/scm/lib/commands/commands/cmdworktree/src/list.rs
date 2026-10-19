@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use clidispatch::ReqCtx;
@@ -17,8 +18,12 @@ use repo::repo::Repo;
 use serde::Serialize;
 use worktree::ListedWorktree;
 use worktree::Worktrees;
+use worktree_stale::Finished;
 
 use crate::WorktreeOpts;
+use crate::dot_dir;
+use crate::remove::uncommitted_changes;
+use crate::shelves;
 
 #[derive(Default, Serialize)]
 pub(crate) struct ListOutputEntry {
@@ -34,12 +39,30 @@ pub(crate) struct ListOutputEntry {
     stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stale_reason: Option<String>,
+    /// Why `prune` would consider the checkout done with: "landed",
+    /// "abandoned" or "idle". Left out for the main and the current
+    /// checkout, which `prune` never removes, and during a merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished: Option<&'static str>,
+    /// Whether a merge, rebase, graft, ... is unfinished there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unfinished: Option<bool>,
+    /// The number of draft commits in the checked out stack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drafts: Option<u64>,
+    /// The number of shelves (`sl shelve`) kept with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shelved: Option<u64>,
     /// Whether its directory was deleted behind sl's back.
     missing: bool,
     /// Whether `git worktree lock` locked it, and why.
     locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     lock_reason: Option<String>,
+    /// Whether it has uncommitted changes, untracked files included; only
+    /// with `--status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty: Option<bool>,
 }
 
 impl Formattable for ListOutputEntry {
@@ -97,25 +120,45 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees
         return Ok(0);
     }
 
+    // The plain format shows none of the details.
+    let wdir_parents = (!formatter.is_plain()).then(|| current_parents(repo));
     formatter.begin_list()?;
     for entry in entries {
-        formatter.format_item(&output_entry(repo, entry))?;
+        formatter.format_item(&output_entry(
+            ctx,
+            repo,
+            entry,
+            wdir_parents.as_deref(),
+        )?)?;
     }
     formatter.end_list()?;
 
     Ok(0)
 }
 
-pub(crate) fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntry {
+/// The working copy parents of the checkout running the command.
+pub(crate) fn current_parents(repo: &Repo) -> Vec<types::HgId> {
+    workingcopy::fast_path_wdir_parents(repo.path(), repo.ident())
+        .map(|parents| parents.to_vec())
+        .unwrap_or_default()
+}
+
+/// The `list` entry of `entry`. With `wdir_parents` (those of the checkout
+/// running the command), also what `prune` would make of it, and with
+/// `--status`, whether it is dirty.
+pub(crate) fn output_entry(
+    ctx: &ReqCtx<WorktreeOpts>,
+    repo: &Repo,
+    entry: ListedWorktree,
+    wdir_parents: Option<&[types::HgId]>,
+) -> Result<ListOutputEntry> {
     // Read the way `whereami -R <path>` does; a checkout mid-checkout or gone
     // behind git's back just has no node.
     let parents = workingcopy::fast_path_wdir_parents(&entry.path, repo.ident())
         .map(|parents| parents.to_vec())
         .unwrap_or_default();
-    let node = parents
-        .first()
-        .filter(|p1| !p1.is_null())
-        .map(|p1| p1.to_hex());
+    let p1 = parents.first().filter(|p1| !p1.is_null());
+    let node = p1.map(|p1| p1.to_hex());
     let stale = if entry.current {
         worktree_stale::checkout_state(repo, &parents)
     } else {
@@ -128,17 +171,76 @@ pub(crate) fn output_entry(repo: &Repo, entry: ListedWorktree) -> ListOutputEntr
         );
         None
     });
-    ListOutputEntry {
-        path: entry.path,
+    let mut output = ListOutputEntry {
+        path: entry.path.clone(),
         role: if entry.is_main { "main" } else { "linked" },
-        label: entry.label,
+        label: entry.label.clone(),
         current: entry.current,
         node,
         stale: stale.is_some(),
         stale_reason: stale.map(|state| state.message(repo)),
         missing: entry.missing,
         locked: entry.locked.is_some(),
-        lock_reason: entry.locked.filter(|reason| !reason.is_empty()),
+        lock_reason: entry.locked.clone().filter(|reason| !reason.is_empty()),
+        ..Default::default()
+    };
+    let Some(wdir_parents) = wdir_parents else {
+        return Ok(output);
+    };
+
+    // The missing checkout's dot dir survives in its admin dir.
+    let dot_dir = dot_dir(&entry)
+        .or_else(|| (!entry.missing).then(|| repo.ident().resolve_full_dot_dir(&entry.path)));
+    output.shelved = dot_dir.map(|dot_dir| shelves(&dot_dir).len() as u64);
+    if entry.missing {
+        return Ok(output);
+    }
+
+    if let Some(p1) = p1 {
+        match worktree_stale::other_checkout_summary(repo, &entry.path, p1, wdir_parents) {
+            Ok(summary) => {
+                let in_merge = parents.get(1).is_some_and(|p2| !p2.is_null());
+                // Like prune, no verdict during a merge, nor for checkouts it
+                // never removes.
+                if !(entry.is_main || entry.current || in_merge) {
+                    output.finished = summary.finished.map(Finished::as_str);
+                }
+                output.unfinished = Some(summary.unfinished);
+                output.drafts = Some(summary.drafts);
+            }
+            Err(err) => tracing::warn!(
+                "cannot check whether {} is done with: {err:?}",
+                entry.path.display()
+            ),
+        }
+    }
+
+    if ctx.opts.status {
+        output.dirty = dirty(ctx, repo, &entry.path);
+    }
+    Ok(output)
+}
+
+/// Whether the checkout at `path` has uncommitted changes, or None, with a
+/// warning, when that cannot be told. Unlike `remove` and `prune`, a plain
+/// list does not set up sl's state in a worktree that has none yet.
+fn dirty(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, path: &Path) -> Option<bool> {
+    if !repo.ident().resolve_full_dot_dir(path).exists() {
+        ctx.logger().warn(format!(
+            "cannot check {} for uncommitted changes: sl has not used it yet",
+            path.display()
+        ));
+        return None;
+    }
+    match uncommitted_changes(ctx, repo, path) {
+        Ok(changes) => Some(!changes.is_empty()),
+        Err(err) => {
+            ctx.logger().warn(format!(
+                "cannot check {} for uncommitted changes: {err}",
+                path.display()
+            ));
+            None
+        }
     }
 }
 

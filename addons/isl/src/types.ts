@@ -343,6 +343,16 @@ export type WorktreeEntry = {
   locked?: boolean;
   /** Why the worktree is locked, when a reason was given. */
   lockReason?: string;
+  /** Why `sl worktree prune` would consider the worktree done with. */
+  finished?: 'landed' | 'abandoned' | 'idle';
+  /** Whether a merge, rebase, ... is unfinished in the worktree. */
+  unfinished?: boolean;
+  /** How many draft commits the worktree's checked-out stack has. */
+  drafts?: number;
+  /** How many shelves (`sl shelve`) the worktree keeps. */
+  shelved?: number;
+  /** Whether the worktree has uncommitted changes; only from `list --status`. */
+  dirty?: boolean;
 };
 
 export type ApplicationInfo = {
