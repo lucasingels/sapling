@@ -30,7 +30,9 @@ use worktree::with_worktree_path_op_lock;
 use crate::CurrentGroup;
 use crate::WorktreeOpts;
 use crate::canonical;
+use crate::dot_dir;
 use crate::require_group;
+use crate::shelves;
 
 pub(crate) fn run(
     ctx: &ReqCtx<WorktreeOpts>,
@@ -150,7 +152,8 @@ pub(crate) fn remove_and_update_registry(
     let logger = ctx.logger();
 
     let changes = check_uncommitted_changes(ctx, repo, targets)?;
-    confirm_remove(ctx, targets, &changes, reasons)?;
+    let shelved = check_shelves(ctx, worktrees, targets)?;
+    confirm_remove(ctx, targets, &changes, &shelved, reasons)?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let multi_target = targets.len() > 1;
@@ -271,7 +274,8 @@ fn run_remove_all(
 
     let path_refs: Vec<&Path> = linked_paths.iter().map(|p| p.as_path()).collect();
     let changes = check_uncommitted_changes(ctx, repo, &path_refs)?;
-    confirm_remove(ctx, &path_refs, &changes, &BTreeMap::new())?;
+    let shelved = check_shelves(ctx, worktrees, &path_refs)?;
+    confirm_remove(ctx, &path_refs, &changes, &shelved, &BTreeMap::new())?;
 
     let pre_hooks = hook::Hooks::from_config(repo.config(), ctx.io(), "pre-worktree-remove");
     let mut removed_paths = Vec::new();
@@ -382,6 +386,39 @@ fn check_uncommitted_changes(
     Ok(changes)
 }
 
+/// The shelves (`sl shelve`) of each checkout in `paths` that has some. They
+/// live in the worktree's admin dir, which goes with it. Like
+/// [`check_uncommitted_changes`]: without `--force`, list them and abort.
+fn check_shelves(
+    ctx: &ReqCtx<WorktreeOpts>,
+    worktrees: &Worktrees,
+    paths: &[&Path],
+) -> Result<BTreeMap<PathBuf, Vec<String>>> {
+    let dot_dirs: BTreeMap<PathBuf, PathBuf> = worktrees
+        .list()?
+        .iter()
+        .filter_map(|wt| Some((canonical(&wt.path), dot_dir(wt)?)))
+        .collect();
+    let shelved: BTreeMap<PathBuf, Vec<String>> = paths
+        .iter()
+        .filter_map(|path| {
+            let names = shelves(dot_dirs.get(*path)?);
+            (!names.is_empty()).then(|| (path.to_path_buf(), names))
+        })
+        .collect();
+    if !ctx.opts.force && !shelved.is_empty() {
+        for (path, names) in &shelved {
+            ctx.io()
+                .write_err(format!("{} has shelved changes:\n", path.display()))?;
+            for name in names {
+                ctx.io().write_err(format!("  {name}\n"))?;
+            }
+        }
+        abort!("not removing worktrees with shelved changes (use --force to remove them anyway)");
+    }
+    Ok(shelved)
+}
+
 /// The `sl status` lines of the checkout at `path`, untracked files included.
 pub(crate) fn uncommitted_changes(
     ctx: &ReqCtx<WorktreeOpts>,
@@ -426,6 +463,7 @@ fn confirm_remove(
     ctx: &ReqCtx<WorktreeOpts>,
     paths: &[&Path],
     changes: &BTreeMap<PathBuf, Vec<String>>,
+    shelved: &BTreeMap<PathBuf, Vec<String>>,
     reasons: &BTreeMap<PathBuf, &str>,
 ) -> Result<()> {
     if ctx.global_opts().noninteractive {
@@ -443,6 +481,13 @@ fn confirm_remove(
                 .write(format!("{indent}uncommitted changes that will be lost:\n"))?;
             for line in lines {
                 ctx.io().write(format!("{indent}  {line}\n"))?;
+            }
+        }
+        if let Some(names) = shelved.get(path) {
+            ctx.io()
+                .write(format!("{indent}shelved changes that will be lost:\n"))?;
+            for name in names {
+                ctx.io().write(format!("{indent}  {name}\n"))?;
             }
         }
         Ok(())

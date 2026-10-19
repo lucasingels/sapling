@@ -14,7 +14,8 @@
 //! another workspace rewrites its working-copy commit.
 //!
 //! This crate only detects that state, and which checkouts are done with
-//! (their commit landed or was abandoned) for `sl worktree prune`. Moving a stale checkout onto the latest
+//! (their commit landed or was abandoned, or they sit unused on a public
+//! commit) for `sl worktree prune`. Moving a stale checkout onto the latest
 //! versions (`sl update-stale`) lives in Python, in `worktreestale.py`, which
 //! calls into this crate through the `repo` bindings.
 
@@ -199,16 +200,32 @@ pub fn stale_state(repo: &Repo, node: &HgId, wdir_parents: &[HgId]) -> Result<Op
 pub enum Finished {
     /// The commit, or a later version of it, is public.
     Landed,
+    /// The commit is public, and the checkout was made on it while it was a
+    /// draft, but nothing was committed there. Whoever made the checkout may
+    /// still be using it, so, like an idle one, it is only done with once it
+    /// has not been used for a while.
+    LandedUnused,
     /// The commit is hidden and no later version of it is visible.
     Abandoned,
+    /// The commit is public and never was this checkout's draft. A fresh
+    /// checkout looks like this, so it is only done with once it has not been
+    /// used for a while.
+    Idle,
 }
 
 impl Finished {
     pub fn as_str(self) -> &'static str {
         match self {
-            Finished::Landed => "landed",
+            Finished::Landed | Finished::LandedUnused => "landed",
             Finished::Abandoned => "abandoned",
+            Finished::Idle => "idle",
         }
+    }
+
+    /// Whether the checkout is only done with once it has not been used for
+    /// a while.
+    pub fn needs_age(self) -> bool {
+        matches!(self, Finished::LandedUnused | Finished::Idle)
     }
 }
 
@@ -228,7 +245,9 @@ pub fn finished_state(repo: &Repo, node: &HgId, wdir_parents: &[HgId]) -> Result
 
 /// Like [`finished_state`], for the checkout at `root` of `repo`'s group,
 /// which has `node` checked out. None while an operation (merge, rebase, ...)
-/// is unfinished there: that checkout is in use.
+/// is unfinished there: that checkout is in use. For a public `node`, the
+/// checkout's own records tell [`Finished::Landed`], [`Finished::LandedUnused`]
+/// and [`Finished::Idle`] apart (see `Graph::public_verdict`).
 pub fn other_checkout_finished(
     repo: &Repo,
     root: &Path,
@@ -239,7 +258,35 @@ pub fn other_checkout_finished(
     if has_unfinished_operation(&info.dot_hg_path)? {
         return Ok(None);
     }
-    finished_state(repo, node, wdir_parents)
+    let dag = repo.dag_commits()?;
+    let dag = dag.read();
+    block_on(async {
+        let graph = Graph::new(repo, &**dag, wdir_parents).await?;
+        let finished = graph.finished_state(node).await?;
+        if finished == Some(Finished::Landed) && graph.is_public(node).await? {
+            return Ok(Some(graph.public_verdict(&info.dot_hg_path, node).await?));
+        }
+        Ok(finished)
+    })
+}
+
+/// In a checkout's dot dir: the draft commit `sl worktree add` made it on.
+const DRAFT_BASE_FILE: &str = "worktree-draft-base";
+
+/// Note in the dot dir `dot_path` of a new checkout of `repo`'s group that it
+/// was made on `node`, when `node` is a draft, so that it does not count as
+/// idle once `node` lands (see [`other_checkout_finished`]).
+pub fn record_checkout_base(repo: &Repo, dot_path: &Path, node: &HgId) -> Result<()> {
+    let dag = repo.dag_commits()?;
+    let dag = dag.read();
+    let public = block_on(async {
+        let graph = Graph::new(repo, &**dag, &[*node]).await?;
+        graph.is_public(node).await
+    })?;
+    if !public {
+        fs::write(dot_path.join(DRAFT_BASE_FILE), format!("{}\n", node.to_hex()))?;
+    }
+    Ok(())
 }
 
 /// The commit graph as the stale check sees it, matching Python's
@@ -346,6 +393,73 @@ impl<'a> Graph<'a> {
             level = next;
         }
         Ok(found)
+    }
+
+    /// What the checkout with dot dir `dot_path` did with the public commit
+    /// `node` it is on: [`Finished::Landed`] when `node` is the commit it last
+    /// made with `sl commit`, [`Finished::LandedUnused`] when `sl worktree add`
+    /// made it on `node` while `node` was a draft, else [`Finished::Idle`].
+    ///
+    /// Only the checkout's own records can tell: the repo-wide history does
+    /// not say which checkout a draft belonged to, so a fresh checkout on a
+    /// commit another checkout landed would look landed too. Those records are
+    /// a linked git worktree's: its dot dir is `<admin dir>/sl` and git logs
+    /// each commit the checkout moves to in `<admin dir>/logs/HEAD`. Other
+    /// checkouts are idle.
+    async fn public_verdict(&self, dot_path: &Path, node: &HgId) -> Result<Finished> {
+        let Some(admin_dir) = dot_path
+            .parent()
+            .filter(|dir| dir.join("commondir").is_file())
+        else {
+            return Ok(Finished::Idle);
+        };
+        if self.committed_here(admin_dir, dot_path, node).await? {
+            return Ok(Finished::Landed);
+        }
+        let base = fs::read_to_string(dot_path.join(DRAFT_BASE_FILE)).unwrap_or_default();
+        if base.trim() == node.to_hex() {
+            return Ok(Finished::LandedUnused);
+        }
+        Ok(Finished::Idle)
+    }
+
+    /// Whether `node` is the commit that `sl commit` last made in the git
+    /// worktree with admin dir `admin_dir` and dot dir `dot_path`, and the
+    /// worktree is still on it. `sl commit` leaves its message in the dot dir
+    /// (`last-message.txt`) as it commits; the worktree moved to `node` (it is
+    /// in `logs/HEAD`), `node` is not the commit the worktree was made on nor
+    /// below it, and `node` has that message. A worktree that committed and
+    /// then moved elsewhere, e.g. `sl goto origin/main` for its next task, did
+    /// not commit the commit it is on; neither did one that only shelved.
+    async fn committed_here(&self, admin_dir: &Path, dot_path: &Path, node: &HgId) -> Result<bool> {
+        let Ok(message) = fs::read_to_string(dot_path.join("last-message.txt")) else {
+            return Ok(false);
+        };
+        let Ok(reflog) = fs::read_to_string(admin_dir.join("logs/HEAD")) else {
+            return Ok(false);
+        };
+        let visited: Vec<HgId> = reflog
+            .lines()
+            .filter_map(|line| HgId::from_hex(line.split(' ').nth(1)?.as_bytes()).ok())
+            .collect();
+        let Some(made_on) = visited.first() else {
+            return Ok(false);
+        };
+        if !visited.contains(node) {
+            return Ok(false);
+        }
+        if self.has_node(made_on).await?
+            && self
+                .dag
+                .is_ancestor(vertex(node), vertex(made_on))
+                .await?
+        {
+            return Ok(false);
+        }
+        let Some(fields) = self.dag.get_commit_fields(&vertex(node)).await? else {
+            return Ok(false);
+        };
+        Ok(fields.description()?.trim_end() == message.trim_end())
     }
 
     async fn finished_state(&self, node: &HgId) -> Result<Option<Finished>> {

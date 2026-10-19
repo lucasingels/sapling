@@ -6,6 +6,10 @@ A worktree locked with `git worktree lock` is in use, e.g. by an agent:
   $ . $TESTDIR/git.sh
   $ setconfig remotenames.rename.default=origin remotenames.hoist=origin
 
+Worktrees that only wait to age are covered in test-worktree-git-idle.t:
+
+  $ setconfig worktree.prune-min-age=0
+
   $ git init -q -b main $TESTTMP/server
   $ cd $TESTTMP/server
   $ echo base > base

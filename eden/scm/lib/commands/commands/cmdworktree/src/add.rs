@@ -411,6 +411,18 @@ pub(crate) fn run(
                 worktrees
                     .add(&dest, target.map(|target| target.to_hex()).as_deref())
                     .inspect_err(|_| partial_checkout_warning())?;
+                // Lets prune tell a checkout made on a draft that then
+                // landed from one made on a commit that was already public.
+                if let Some(target) = &target {
+                    let dot_dir = repo.ident().resolve_full_dot_dir(&dest);
+                    if let Err(err) = worktree_stale::record_checkout_base(repo, &dot_dir, target)
+                    {
+                        logger.warn(format!(
+                            "failed to record the commit {} was made on: {err:#}",
+                            dest.display()
+                        ));
+                    }
+                }
             }
             WorktreeKind::Eden => {
                 #[cfg(feature = "eden")]
@@ -631,8 +643,8 @@ fn count_linked_worktrees(
 
 /// Git refuses to add a worktree where one it still lists was deleted behind
 /// its back. Drop that registration first, the way `remove` would, unless it
-/// is locked; the registry entry is replaced when the new worktree is
-/// registered.
+/// is locked or keeps shelves, which go with it; the registry entry is
+/// replaced when the new worktree is registered.
 fn forget_missing_worktree(worktrees: &Worktrees, dest: &Path) -> Result<()> {
     let missing = worktrees
         .list()?
@@ -644,6 +656,17 @@ fn forget_missing_worktree(worktrees: &Worktrees, dest: &Path) -> Result<()> {
                 "{} is a missing but locked worktree{}; unlock it with `git worktree unlock {}` first",
                 dest.display(),
                 crate::remove::lock_reason_suffix(reason),
+                dest.display()
+            );
+        }
+        let shelves = crate::dot_dir(&wt)
+            .map(|dot_dir| crate::shelves(&dot_dir))
+            .unwrap_or_default();
+        if !shelves.is_empty() {
+            abort!(
+                "{} is a missing worktree with shelved changes ({}); remove them with it by `sl worktree remove --force {}` first",
+                dest.display(),
+                shelves.join(", "),
                 dest.display()
             );
         }

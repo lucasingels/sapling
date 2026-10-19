@@ -8,6 +8,10 @@ clean linked worktrees whose commit landed or was abandoned.
   $ setconfig remotenames.rename.default=origin remotenames.hoist=origin
   $ setconfig extensions.rebase=
 
+Worktrees that only wait to age are covered in test-worktree-git-idle.t:
+
+  $ setconfig worktree.prune-min-age=0
+
 A server, and a clone of it with a stack of draft commits:
 
   $ git init -q -b main $TESTTMP/server

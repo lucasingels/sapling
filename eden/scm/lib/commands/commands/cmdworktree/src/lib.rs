@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use clidispatch::ReqCtx;
 use clidispatch::abort;
@@ -26,6 +27,7 @@ use cmdutil::Result;
 use cmdutil::define_flags;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::ListedWorktree;
 use worktree::WorktreeKind;
 use worktree::Worktrees;
 use worktree::group_id_for_main_path;
@@ -154,6 +156,38 @@ pub(crate) fn require_group(repo: &Repo, worktrees: &Worktrees) -> Result<Curren
     })
 }
 
+/// When the linked git worktree with admin dir `admin_dir` was last used: made,
+/// or moved to another commit (a commit, checkout, ...). Git writes the admin
+/// dir's `commondir` once, when it makes the worktree, and its `HEAD` and
+/// reflog when the checkout moves. Reading the checkout (status, ...) does
+/// not count.
+pub(crate) fn last_used(admin_dir: &Path) -> Option<SystemTime> {
+    ["commondir", "HEAD", "logs/HEAD"]
+        .iter()
+        .filter_map(|name| admin_dir.join(name).metadata().ok()?.modified().ok())
+        .max()
+}
+
+/// The sl dot dir of a linked git worktree, `<admin dir>/sl`, even when the
+/// checkout itself is gone.
+pub(crate) fn dot_dir(entry: &ListedWorktree) -> Option<PathBuf> {
+    entry.admin_dir.as_ref().map(|admin_dir| admin_dir.join("sl"))
+}
+
+/// The names of the shelves (`sl shelve`) in the dot dir `dot_dir`.
+pub(crate) fn shelves(dot_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dot_dir.join("shelved")) else {
+        return Vec::new();
+    };
+    let names: BTreeSet<String> = entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            Some(name.split('.').next().unwrap_or(&name).to_string())
+        })
+        .collect();
+    names.into_iter().collect()
+}
+
 pub(crate) fn canonical(path: &Path) -> PathBuf {
     util::path::strip_unc_prefix(
         util::path::canonicalize_best_effort(path).unwrap_or_else(|_| path.to_path_buf()),
@@ -185,25 +219,32 @@ pub fn doc() -> &'static str {
       remove PATH [PATH...] [--all] [-f] [-y]           Remove linked worktree(s)
       label [PATH] TEXT [--remove]                      Set or remove a worktree label
       path LABEL [-Tjson]                               Print the path of the worktree labeled LABEL
-      prune [--dry-run] [-y]                            Remove linked worktrees that landed, were abandoned or are missing
+      prune [--dry-run] [-y]                            Remove linked worktrees that are done with or missing
 
     `remove` refuses to remove a worktree with uncommitted changes, untracked
-    files included, unless `--force` is given; the confirmation prompt then
-    lists the changes that will be lost.
+    files included (ignored files do not count), or with shelves (`sl
+    shelve`, kept with the worktree), unless `--force` is given; the
+    confirmation prompt then lists what will be lost.
 
     `path` prints the absolute path of the worktree with that label, so
     `cd "$(sl worktree path LABEL)"` works; with -Tjson it prints that
     worktree's `list -Tjson` entry.
 
     `prune` (git worktrees only) removes the linked worktrees that have no
-    uncommitted changes and whose commit is done with: landed (the commit, or
-    a later version of it, is public) or abandoned (the commit is hidden and
-    no later version of it is visible), and the missing ones (see below).
-    The main checkout and the current one are never removed, and neither is
-    a locked worktree, a stale worktree whose commit was rewritten into a
-    visible draft commit, nor one that cannot be read. `--dry-run` lists what would be removed and
-    why. Removal works as in `remove`, including the confirmation prompt
-    (skipped with `-y`) and the pre-worktree-remove hooks.
+    uncommitted changes and no shelves, and whose commit is done with:
+    landed (the commit, or a later version of it, is public) or abandoned
+    (the commit is hidden and no later version of it is visible), and the
+    missing ones (see below). A worktree on a public commit is landed only
+    when that commit is the one its last `sl commit` made, or `add` made the
+    worktree on it while it was a draft; otherwise it is idle. An idle
+    worktree may be a fresh one about to be used, so it only goes once it
+    was not made or moved for `worktree.prune-min-age`; so does a landed one
+    where nothing was committed. The main checkout and the current one are
+    never removed, and neither is a locked worktree, a stale worktree whose
+    commit was rewritten into a visible draft commit, nor one that cannot be
+    read. `--dry-run` lists what would be removed and why. Removal works as
+    in `remove`, including the confirmation prompt (skipped with `-y`) and
+    the pre-worktree-remove hooks.
 
     A worktree locked with `git worktree lock` is in use: `prune` and
     `remove --all` keep it, and `remove PATH` refuses it until `git worktree
@@ -230,6 +271,7 @@ pub fn doc() -> &'static str {
 
       worktree.max-count=N                     Hard limit on linked worktrees per repo group (0 = unlimited, the default)
       worktree.max-count-message=TEXT          Message shown instead of the default when max-count is reached
+      worktree.prune-min-age=DURATION          How long `prune` keeps an idle worktree after it was made or moved (default 1d)
       worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
       worktree.require-generated-path=true     Require path generator, disallow manual PATH
       worktree.path-generator=CMD              Shell command to generate PATH when omitted

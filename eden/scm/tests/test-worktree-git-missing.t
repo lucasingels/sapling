@@ -86,6 +86,29 @@ A new worktree at that path does not inherit the old label:
   abort: no worktree in this group is labeled 'c'
   [255]
 
+`add` does not replace a missing worktree that keeps shelves, which would go
+with it:
+
+  $ setconfig extensions.shelve=
+  $ sl worktree add -q $TESTTMP/s
+  $ cd $TESTTMP/s
+  $ echo wip > wip
+  $ sl add -q wip
+  $ sl shelve -q
+  $ cd $TESTTMP/repo
+  $ rm -rf $TESTTMP/s
+  $ sl worktree add -q $TESTTMP/s
+  abort: $TESTTMP/s is a missing worktree with shelved changes (default); remove them with it by `sl worktree remove --force $TESTTMP/s` first
+  [255]
+  $ sl worktree prune --dry-run
+  keeping $TESTTMP/s (missing): it has shelved changes
+  no worktrees to prune
+  $ sl worktree remove -y --force $TESTTMP/s
+  removed $TESTTMP/s
+  $ sl worktree add -q $TESTTMP/s
+  $ sl worktree remove -y $TESTTMP/s
+  removed $TESTTMP/s
+
 A worktree that cannot be read is not missing, and prune keeps it (there is
 no remote, so its commit is a draft and stays anyway once readable):
 
