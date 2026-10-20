@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+### 20 October 2026
+
+- The worktree panel no longer lists a worktree whose directory was deleted outside Sapling, which it could not open or query (needs Sapling 0.3.11)
+
 ## 0.3.1
 
 ### 18 October 2026
