@@ -6416,30 +6416,52 @@ def update(
         return result
 
 
-@command("update-stale", [])
-def updatestale(ui, repo):
+@command(
+    "update-stale",
+    [
+        (
+            "",
+            "noconflict",
+            False,
+            _(
+                "stay on the old versions when uncommitted changes would conflict "
+                "on the latest ones"
+            ),
+        ),
+    ],
+)
+def updatestale(ui, repo, noconflict=False):
     """move a stale worktree onto the latest versions of its commits
 
     A checkout of a git worktree group is stale once another checkout rewrites
-    the commit it has checked out, or a commit below it. Commands that would
-    build on, rewrite or publish the stale commits refuse to run there until
-    it is updated (see ``worktree.stale-blocked-commands``). Other commands,
-    ``status`` and ``whereami`` included, run as usual and note on stderr that
-    the checkout is stale.
+    the commit it has checked out, or a commit below it. The rewriting command
+    then runs this command there itself, so a checkout only stays stale when
+    its uncommitted changes would conflict on the latest versions, it was busy
+    with another command, or ``worktree.follow-rewrites=false`` is set.
+
+    In a stale checkout, commands that would build on, rewrite or publish the
+    stale commits refuse to run until it is updated (see
+    ``worktree.stale-blocked-commands``). Other commands, ``status`` and
+    ``whereami`` included, run as usual and note on stderr that the checkout
+    is stale.
 
     This moves the working copy to the latest version of its commit and
     restacks its own commits onto the latest versions of the ones below,
     carrying uncommitted changes along. Commits another checkout has checked
     out, or stacked its own commits on, are left for that checkout to update,
     except the commits below this checkout's own commit: those are restacked,
-    and the checkouts on them become stale.
+    and the checkouts on them are then moved too, the same way.
+
+    With --noconflict, uncommitted changes that would conflict on the latest
+    versions leave the checkout where it was, changes and all, instead of
+    leaving the conflicts marked in the files.
 
     Set ``worktree.auto-update-stale=true`` to have those commands update a
     stale checkout automatically before they run, instead of refusing.
 
     Returns 0 on success.
     """
-    return worktreestale.updatestale(ui, repo)
+    return worktreestale.updatestale(ui, repo, noconflict=noconflict)
 
 
 @command(

@@ -281,7 +281,7 @@ function WorktreeRowWithHover({
 }
 
 /** Marks a worktree whose checked-out commit was rewritten in another worktree. */
-function StaleWorktreeBadge({wt}: {wt: WorktreeEntry}) {
+export function StaleWorktreeBadge({wt}: {wt: WorktreeEntry}) {
   return (
     <Tooltip
       title={

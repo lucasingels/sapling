@@ -6,6 +6,12 @@ commits, the way a jj workspace does.
   $ . $TESTDIR/git.sh
   $ setconfig diff.git=true ui.allowemptycommit=true
 
+A rewrite moves the checkouts it makes stale (see
+test-dotgit-worktree-follow.t); here they are left stale, to see what that
+means:
+
+  $ setconfig worktree.follow-rewrites=false
+
   $ git init -q -b main $TESTTMP/repo
   $ cd $TESTTMP/repo
   $ echo base > base

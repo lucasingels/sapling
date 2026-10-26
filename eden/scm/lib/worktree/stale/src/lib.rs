@@ -473,9 +473,18 @@ impl<'a> Graph<'a> {
         if self.committed_here(dot_path, node).await? {
             return Ok(Finished::Landed);
         }
+        // A checkout moved along when another one rewrote its draft is on a
+        // later version of it, e.g. the one that landed.
         let base = fs::read_to_string(dot_path.join(DRAFT_BASE_FILE)).unwrap_or_default();
-        if base.trim() == node.to_hex() {
-            return Ok(Finished::LandedUnused);
+        if let Ok(base) = HgId::from_hex(base.trim().as_bytes()) {
+            if base == *node
+                || self
+                    .visible_newer_versions(&base, false)
+                    .await?
+                    .contains(node)
+            {
+                return Ok(Finished::LandedUnused);
+            }
         }
         Ok(Finished::Idle)
     }

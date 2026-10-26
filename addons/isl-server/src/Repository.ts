@@ -1051,8 +1051,15 @@ export class Repository {
               supportsMutation: this.info.isEdenFs || isDotGitDotDir(this.info.dotdir),
             }
           : undefined;
+      const before = this.getOtherWorktreeDotHashes().sort().join();
       this.worktreeInfo = worktreeInfo;
       this.worktreeInfoEmitter.emit('change', worktreeInfo);
+      // The smartlog revset includes the other worktrees' commits, so a fetch made
+      // before they moved (e.g. while a rewrite was moving them along) still shows
+      // the commits they have left.
+      if (this.getOtherWorktreeDotHashes().sort().join() !== before) {
+        this.fetchSmartlogCommits();
+      }
     } catch (err) {
       this.initialConnectionContext.logger.error('Failed to refresh worktree info:', err);
     }

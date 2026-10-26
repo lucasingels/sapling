@@ -29,10 +29,7 @@ import {highlightedCommits} from './HighlightedCommits';
 import {RegularGlyph, RenderDag, YouAreHereGlyph} from './RenderDag';
 import {StackActions} from './StackActions';
 import {latestCommitTitles} from './codeReview/CodeReviewInfo';
-import {
-  makeCheckedOutElsewhereVirtualCommit,
-  YOU_ARE_HERE_VIRTUAL_COMMIT,
-} from './dag/virtualCommit';
+import {YOU_ARE_HERE_VIRTUAL_COMMIT} from './dag/virtualCommit';
 import {T, t} from './i18n';
 import {localStorageBackedAtom, useAtomHas, useAtomSelect} from './jotaiUtils';
 import {CreateEmptyInitialCommitOperation} from './operations/CreateEmptyInitialCommitOperation';
@@ -92,13 +89,8 @@ const dagWithVirtualCommits = atom(get => {
   if (dot != null) {
     virtualCommits.push(YOU_ARE_HERE_VIRTUAL_COMMIT.set('parents', [dot.hash]));
   }
-  // Insert a virtual "checked out elsewhere" commit as a child of each hash
-  // that has sibling worktree checkouts, skipping hashes not present in the dag.
-  for (const hash of get(otherWorktreeCheckoutsByHash).keys()) {
-    if (dag.has(hash)) {
-      virtualCommits.push(makeCheckedOutElsewhereVirtualCommit(hash));
-    }
-  }
+  // Commits checked out in sibling worktrees are labeled on their own line
+  // (see InlineWorktreeLabels in Commit.tsx), not on a virtual row above them.
   if (virtualCommits.length > 0) {
     dag = dag.add(virtualCommits);
   }

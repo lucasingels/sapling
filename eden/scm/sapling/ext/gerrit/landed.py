@@ -23,9 +23,11 @@ landed commit.
 
 Hiding is what makes this dangerous, so a draft is left alone when it may hold
 work that is not in what landed: it has to be a commit that was uploaded, a
-trivial rebase of one, or the same patch as the landed commit. One that is
-another worktree's checkout is left alone too, since hiding it would leave
-that checkout stale under whoever is working there.
+trivial rebase of one, or the same patch as the landed commit. Another
+worktree on such a draft is moved onto the landed commit once the pull is
+done, as after any rewrite; with ``worktree.follow-rewrites=false`` the draft
+is left alone instead, since hiding it would leave that checkout stale under
+whoever is working there.
 
 Nothing is asked of the server: the public commits are already local after a
 pull. Their Change-Ids are indexed in the repo's cache, so a pull only reads
@@ -102,13 +104,17 @@ def marklanded(ui, repo, dry_run=False, full=False):
         revision = entry.get("revision") if isinstance(entry, dict) else None
         if revision and len(revision) == 40:
             uploaded.add(bin(revision))
-    torev = repo.changelog.rev
-    checkouts = {
-        node: path
-        for path, node in worktreestale.checkoutsin(
-            repo, [torev(draft) for draft, _public, _cid in landings]
-        ).items()
-    }
+    # When worktrees follow rewrites, one on a landed draft is moved onto the
+    # commit that landed once the pull is done, like one on a rebased commit.
+    checkouts = {}
+    if not worktreestale.follows(ui):
+        torev = repo.changelog.rev
+        checkouts = {
+            node: path
+            for path, node in worktreestale.checkoutsin(
+                repo, [torev(draft) for draft, _public, _cid in landings]
+            ).items()
+        }
 
     tohide = []
     for draft, public, cid in landings:

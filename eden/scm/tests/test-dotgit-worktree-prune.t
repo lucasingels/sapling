@@ -65,22 +65,23 @@ Land some of the work and set other work aside, from the main checkout:
   $ sl push -q -r 'desc(here)' --to main
   $ sl hide -q 'desc(gone)'
   $ sl metaedit -q -r 'desc(rebased)' -m rebased2
-  note: worktree $TESTTMP/rebased is now stale (it is on 67ba533e2674 "rebased"); 'sl update-stale' there moves it onto the latest versions
-  $ sl metaedit -q -r 'desc(stale)' -m stale2
+  note: moved worktree $TESTTMP/rebased onto the latest versions, now on e70c82320dc1 "rebased2"
+  $ sl metaedit -q -r 'desc(stale)' -m stale2 --config worktree.follow-rewrites=false
   note: worktree $TESTTMP/stale is now stale (it is on 55fb0dc47f8e "stale"); 'sl update-stale' there moves it onto the latest versions
   $ sl rebase -q -s 'desc(rebased2)' -d origin/main
+  note: moved worktree $TESTTMP/rebased onto the latest versions, now on bde1d966c701 "rebased2"
   $ sl push -q -r 'desc(rebased2)' --to main
   $ sl rebase -q -s 'desc(dirty)' -d origin/main
-  note: worktree $TESTTMP/dirty is now stale (it is on cd31913158af "dirty"); 'sl update-stale' there moves it onto the latest versions
+  note: moved worktree $TESTTMP/dirty onto the latest versions, now on c8fdc753353f "dirty"
   $ sl push -q -r 'desc(dirty)' --to main
   $ echo untracked > $TESTTMP/dirty/untracked
   $ sl worktree list
   * main    $TESTTMP/repo
-    linked  $TESTTMP/dirty   dirty   (stale)
+    linked  $TESTTMP/dirty   dirty
     linked  $TESTTMP/gone   gone
     linked  $TESTTMP/here   here
     linked  $TESTTMP/landed   landed
-    linked  $TESTTMP/rebased   rebased   (stale)
+    linked  $TESTTMP/rebased   rebased
     linked  $TESTTMP/stale   stale   (stale)
     linked  $TESTTMP/wip   wip
 
@@ -117,7 +118,7 @@ whose work goes on in a draft, and a draft one stay:
   removed $TESTTMP/rebased (landed)
   $ sl worktree list
     main    $TESTTMP/repo
-    linked  $TESTTMP/dirty   dirty   (stale)
+    linked  $TESTTMP/dirty   dirty
   * linked  $TESTTMP/here   here
     linked  $TESTTMP/stale   stale   (stale)
     linked  $TESTTMP/wip   wip

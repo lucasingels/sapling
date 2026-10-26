@@ -11,8 +11,14 @@ Another checkout that has the old version checked out, or its own commits
 stacked on it, is then stale, the way jj marks a workspace stale when another
 workspace rewrites its working-copy commit.
 
-Nothing touches a stale checkout from outside: its files only change when a
-command runs in it. The rewriting command lists the checkouts it made stale.
+Once the rewriting command is done, it moves each checkout it made stale onto
+the latest versions, the way it moves its own: it runs ``@prog@ update-stale``
+there, which carries uncommitted changes along, and then does the same for the
+checkouts those moves made stale in turn. A checkout whose uncommitted changes
+would conflict with the move is left where it is, as is one busy with another
+command, and the rewriting command says so. ``worktree.follow-rewrites=false``
+leaves every checkout where it is and only lists the ones it made stale.
+
 In a stale checkout, commands that would build on, rewrite or publish the
 stale commits (``worktree.stale-blocked-commands``) refuse to run until
 ``@prog@ update-stale`` moves it onto the latest versions, carrying uncommitted
@@ -74,8 +80,18 @@ ORPHANED = "orphaned"
 _rewritten = {}
 
 # The checkouts a restack in the current command left stale, by the root of the
-# repo it ran in. They were noted already, so they are not listed again.
+# repo it ran in. They were noted already, so they are not listed again; when
+# checkouts follow rewrites, they are moved with the others instead.
 _left = {}
+
+# How long a checkout followed after a rewrite may keep the rewriting command
+# waiting for its lock, in seconds, before it is left stale.
+DEFAULT_FOLLOW_LOCK_TIMEOUT = 5
+
+
+def follows(ui):
+    """whether a rewrite moves the checkouts it makes stale"""
+    return ui.configbool("worktree", "follow-rewrites", True)
 
 
 def _schedule(repo):
@@ -187,19 +203,29 @@ def checkstale(ui, repo, cmd):
     )
 
 
-def updatestale(ui, repo):
+def updatestale(ui, repo, noconflict=False):
     """the update-stale command"""
     state = _state(repo)
     if state is None:
         ui.status(_("this worktree is not stale\n"))
         return 0
     ui.warn(_("note: %s\n") % state[2])
-    return update(ui, repo, state)
+    before = set(_stalecheckouts(repo))
+    ret = update(ui, repo, state, noconflict=noconflict)
+    if follows(ui):
+        # Restacking the commits below this checkout's own made the checkouts
+        # on them stale.
+        _follow(ui, repo, set(_stalecheckouts(repo)) - before)
+    return ret
 
 
-def update(ui, repo, state):
+def update(ui, repo, state, noconflict=False):
     """move a stale checkout onto the latest versions of its commits, setting
-    uncommitted changes aside meanwhile and bringing them back afterwards"""
+    uncommitted changes aside meanwhile and bringing them back afterwards
+
+    With noconflict, uncommitted changes that would conflict on the latest
+    versions take the checkout back to where it was, changes and all."""
+    start = repo["."].node()
     target = None
     if state[0] == REWRITTEN:
         old = repo["."].node()
@@ -228,7 +254,21 @@ def update(ui, repo, state):
                     ui.warn(_conflictsmessage(repo, shelved, conflicts) + "\n")
         raise
     if shelved:
-        conflicts = _unshelve(ui, repo, shelved)
+        conflicts = _unshelve(ui, repo, shelved, origaside=noconflict)
+        if conflicts and noconflict:
+            _abortunshelve(repo, shelved)
+            with repo.wlock():
+                hg.update(repo, start, quietempty=True)
+            again = _unshelve(ui, repo, shelved, origaside=True)
+            if not again:
+                raise error.Abort(
+                    _(
+                        "uncommitted changes to %s would conflict with the latest "
+                        "versions; left on %s"
+                    )
+                    % (", ".join(conflicts), describe(repo, start))
+                )
+            conflicts = again
         if conflicts:
             raise error.Abort(
                 _conflictsmessage(repo, shelved, conflicts),
@@ -251,6 +291,7 @@ def _move(ui, repo, state, target):
             _("note: moved this worktree to the latest version %s; files changed to match\n")
             % describe(repo, target)
         )
+        mutation.clearobsoletecache(repo)
         state = _stalestate(repo, target)
         if state is None:
             return
@@ -276,12 +317,15 @@ def _move(ui, repo, state, target):
 def _sl(path, args):
     env = dict(os.environ)
     env["HGPLAIN"] = "1"
-    # The checkout is still stale while these run; they are the update.
+    # The checkout is still stale while these run; they are the update. The
+    # command that runs them moves the checkouts they make stale.
     cmd = util.hgcmd() + [
         "--cwd",
         path,
         "--config",
         "worktree.auto-update-stale=false",
+        "--config",
+        "worktree.follow-rewrites=false",
     ]
     cmd += args
     return subprocess.run(cmd, capture_output=True, env=env)
@@ -307,12 +351,19 @@ def _shelve(repo):
     return shelved
 
 
-def _unshelve(ui, repo, shelved):
+# Where the merge's .orig backups go when a conflicting unshelve is undone, so
+# a checkout left where it was is left as it was.
+_ORIGASIDE = ["--config", "ui.origbackuppath=@DOTDIR@/origbackups"]
+
+
+def _unshelve(ui, repo, shelved, origaside=False):
     """bring the changes set aside back onto the working copy; the files that
-    conflict, left with conflict markers and the unshelve unfinished"""
+    conflict, left with conflict markers and the unshelve unfinished. With
+    origaside, the merge's backups go to the dot dir, not next to the files."""
     proc = _sl(
         repo.root,
-        ["--config", "extensions.shelve=", "unshelve", "--name", shelved],
+        (_ORIGASIDE if origaside else [])
+        + ["--config", "extensions.shelve=", "unshelve", "--name", shelved],
     )
     repo.invalidateall()
     if proc.returncode == 0:
@@ -329,6 +380,20 @@ def _unshelve(ui, repo, shelved):
             hint=_("they are kept there; see '@prog@ shelve --list'"),
         )
     return conflicts
+
+
+def _abortunshelve(repo, shelved):
+    """undo an unshelve that conflicted, keeping the changes in the shelve"""
+    proc = _sl(
+        repo.root,
+        _ORIGASIDE + ["--config", "extensions.shelve=", "unshelve", "--abort"],
+    )
+    repo.invalidateall()
+    if proc.returncode != 0:
+        raise error.Abort(
+            _("cannot undo the conflicting unshelve of '%s': %s")
+            % (shelved, proc.stderr.decode("utf-8", "replace").strip())
+        )
 
 
 def _conflictsmessage(repo, shelved, conflicts):
@@ -356,10 +421,12 @@ def _restack(ui, repo):
             ],
         )
         # The checkouts the restack left stale, or made stale by restacking
-        # commits below this one that they are on.
-        for line in proc.stderr.decode("utf-8", "replace").splitlines():
-            if line.startswith(("note: left ", "note: worktree ")):
-                ui.warn("%s\n" % line)
+        # commits below this one that they are on. When checkouts follow
+        # rewrites, update-stale moves them afterwards and says so.
+        if not follows(ui):
+            for line in proc.stderr.decode("utf-8", "replace").splitlines():
+                if line.startswith(("note: left ", "note: worktree ")):
+                    ui.warn("%s\n" % line)
     finally:
         repo.invalidateall()
         mutation.clearobsoletecache(repo)
@@ -455,13 +522,16 @@ def checkoutsin(repo, revs):
 
 def noteleft(ui, repo, owners):
     """note which checkouts a restack left stale, for them to update; whether
-    there were any"""
+    there were any. When checkouts follow rewrites, they are moved once the
+    command is done instead, and this notes nothing."""
     noted = False
     for path, node in sorted(owners.items()):
         if _stalestate(repo, node) is None:
             continue
         _schedule(repo)
         _left[repo.root].add(os.path.realpath(path))
+        if follows(ui):
+            continue
         ui.warn(
             _("note: left %s for worktree %s; run '@prog@ update-stale' there\n")
             % (describe(repo, node), path)
@@ -496,11 +566,88 @@ def _stackedon(repo, node, nodes):
     return False
 
 
+def _stalecheckouts(repo):
+    """{path: node} for the other checkouts of the worktree group that are
+    stale"""
+    root = os.path.realpath(repo.root)
+    hasnode = repo.changelog.hasnode
+    return {
+        path: node
+        for path, node in _checkouts(repo).items()
+        if os.path.realpath(path) != root
+        and hasnode(node)
+        and _stalestate(repo, node) is not None
+    }
+
+
+def _follow(ui, repo, paths):
+    """move the stale checkouts at paths onto the latest versions, each with its
+    own update-stale, then the checkouts those moves made stale in turn"""
+    if not paths:
+        return
+    timeout = ui.configint(
+        "worktree", "follow-lock-timeout", DEFAULT_FOLLOW_LOCK_TIMEOUT
+    )
+    before = set(_stalecheckouts(repo))
+    pending = sorted(paths)
+    tried = set()
+    while pending:
+        path = pending.pop(0)
+        tried.add(path)
+        node = _checkouts(repo).get(path)
+        if node is None or path not in _stalecheckouts(repo):
+            continue
+        proc = _sl(
+            path,
+            ["--config", "ui.timeout=%d" % timeout, "update-stale", "--noconflict"],
+        )
+        repo.invalidateall()
+        mutation.clearobsoletecache(repo)
+        stale = _stalecheckouts(repo)
+        if path in stale:
+            ui.warn(
+                _(
+                    "note: worktree %s is still stale (it is on %s): %s; "
+                    "'@prog@ update-stale' there moves it\n"
+                )
+                % (path, describe(repo, node), _failure(proc))
+            )
+        else:
+            ui.warn(
+                _("note: moved worktree %s onto the latest versions, now on %s\n")
+                % (path, describe(repo, _checkouts(repo).get(path, node)))
+            )
+        for other in sorted(stale):
+            if other not in tried and other not in before and other not in pending:
+                pending.append(other)
+
+
+def _failure(proc):
+    """why an update-stale run in another checkout failed"""
+    lines = proc.stderr.decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        if line.startswith("abort: "):
+            return line[len("abort: ") :]
+    return _("update-stale exited with %d") % proc.returncode
+
+
 def _notestale(repo):
     rewritten = _rewritten.pop(repo.root, set())
     noted = _left.pop(repo.root, set())
     ui = repo.ui
     root = os.path.realpath(repo.root)
+    if follows(ui):
+        _follow(
+            ui,
+            repo,
+            {
+                path
+                for path, node in _stalecheckouts(repo).items()
+                if os.path.realpath(path) in noted
+                or _stackedon(repo, node, rewritten)
+            },
+        )
+        return
     if ui.configbool("worktree", "auto-update-stale"):
         then = _(
             "it moves onto the latest versions before the next command there "

@@ -276,11 +276,9 @@ footer that Gerrit would have refused:
 Other worktrees
 ---------------
 
-Another worktree with a landed draft checked out may be in the middle of work
-on it. Hiding the draft would make that worktree stale under whoever is working
-there, so it is left visible and the worktree named. A landed draft that a
-worktree only has work stacked on is hidden, and that worktree is noted stale,
-as after any rewrite:
+A landed draft that another worktree has checked out, or has work stacked on,
+is hidden like any other, and once the pull is done that worktree is moved onto
+what landed, uncommitted changes and all, as after any rewrite:
 
   $ newclient wt
   $ commit w1
@@ -297,21 +295,59 @@ as after any rewrite:
   $ sl worktree add -q "$TESTTMP/wt-c"
   $ sl goto -q main
   $ echo pending > "$TESTTMP/wt-b/pending"
+  $ sl --cwd "$TESTTMP/wt-b" add -q pending
   $ land $W1 w1 w1
   $ land $X1 x1 x1
   $ sl pull -q
-  change I* landed as *; not hiding *, which worktree $TESTTMP/wt-b has checked out (glob)
-  note: worktree $TESTTMP/wt-c is now stale (it is on * "change x2"); 'sl update-stale' there moves it onto the latest versions (glob)
+  note: moved worktree $TESTTMP/wt-b onto the latest versions, now on * "change w1" (glob)
+  note: moved worktree $TESTTMP/wt-c onto the latest versions, now on * "change x2" (glob)
   $ sl log -r 'draft() - obsolete()' -T '{desc|firstline}\n'
-  change w1
   change x2
+  $ sl -R "$TESTTMP/wt-b" log -r . -T '{phase}\n'
+  public
+  $ sl --cwd "$TESTTMP/wt-b" status
+  A pending
+  $ sl -R "$TESTTMP/wt-c" log -r '.^' -T '{phase} {desc|firstline}\n'
+  public change x1
+
+With worktree.follow-rewrites=false, a worktree may be in the middle of work on
+the landed draft it has checked out, and hiding the draft would make it stale
+under whoever is working there, so the draft is left visible and the worktree
+named. A landed draft that a worktree only has work stacked on is hidden, and
+that worktree is noted stale:
+
+  $ newclient wtoff
+  $ setconfig worktree.follow-rewrites=false
+  $ commit v1
+  $ V1=`sl log -r . -T '{node}'`
+  $ sl goto -q main
+  $ commit y1
+  $ Y1=`sl log -r . -T '{node}'`
+  $ commit y2
+  $ sl push -q --to refs/for/main -r $V1
+  $ sl push -q --to refs/for/main -r .
+  $ sl goto -q $V1
+  $ sl worktree add -q "$TESTTMP/wtoff-b"
+  $ sl goto -q 'desc("change y2")'
+  $ sl worktree add -q "$TESTTMP/wtoff-c"
+  $ sl goto -q main
+  $ echo pending > "$TESTTMP/wtoff-b/pending"
+  $ land $V1 v1 v1
+  $ land $Y1 y1 y1
+  $ sl pull -q
+  change I* landed as *; not hiding *, which worktree $TESTTMP/wtoff-b has checked out (glob)
+  note: worktree $TESTTMP/wtoff-c is now stale (it is on * "change y2"); 'sl update-stale' there moves it onto the latest versions (glob)
+  $ sl log -r 'draft() - obsolete()' -T '{desc|firstline}\n'
+  change v1
+  change y2
 
 The worktree with the draft checked out carries on as before:
 
-  $ cd "$TESTTMP/wt-b"
-  $ sl commit -Aqm 'more on w1'
+  $ cd "$TESTTMP/wtoff-b"
+  $ sl commit -Aqm 'more on v1'
   $ sl log -r . -T '{desc|firstline}\n'
-  more on w1
+  more on v1
+  $ setconfig worktree.follow-rewrites=true
 
 Turned off, and outside Gerrit
 ------------------------------

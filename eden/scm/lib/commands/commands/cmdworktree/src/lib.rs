@@ -242,8 +242,8 @@ pub fn doc() -> &'static str {
     (the commit is hidden and no later version of it is visible), and the
     missing ones (see below). A worktree on a public commit is landed only
     when that commit is the one its last `sl commit` or `sl amend` made (or
-    a later version of it), or `add` made the worktree on it while it was a
-    draft; otherwise it is idle. An idle
+    a later version of it), or `add` made the worktree on it (or on an older
+    version of it) while it was a draft; otherwise it is idle. An idle
     worktree may be a fresh one about to be used, so it only goes once it
     was not made or moved for `worktree.prune-min-age`; so does a landed one
     where nothing was committed. The main checkout and the current one are

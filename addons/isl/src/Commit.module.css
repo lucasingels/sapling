@@ -25,6 +25,52 @@
   gap: var(--spacing-quarter);
 }
 
+/* Agent worktrees can have long generated names; the tooltip has the full one. */
+.checkedOutElsewhereName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The open/rename/remove buttons only show while the label is hovered, so a
+   graph with many worktrees is not a wall of icons. */
+.checkedOutElsewhereActions {
+  display: none;
+  align-items: center;
+  gap: var(--spacing-quarter);
+}
+
+.checkedOutElsewhereGroup:hover .checkedOutElsewhereActions,
+.checkedOutElsewhereGroup:focus-within .checkedOutElsewhereActions,
+.checkedOutElsewhereListed .checkedOutElsewhereActions {
+  display: inline-flex;
+}
+
+.checkedOutElsewhereListed {
+  justify-content: space-between;
+}
+
+.checkedOutElsewhereGroupTag {
+  cursor: pointer;
+}
+
+/* In the list of several, leave room for the buttons beside a long name. */
+.checkedOutElsewhereListed .checkedOutElsewhereTag {
+  max-width: 180px;
+  overflow: hidden;
+}
+
+.checkedOutElsewhereStaleCount {
+  color: var(--signal-medium-fg, var(--warning-foreground));
+}
+
+.checkedOutElsewhereList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-half);
+}
+
 /* Codicons are `inline-block` with a hard-coded `16px/1` font, so the glyph
    baseline-aligns on a 16px strut and sits low next to the 11px tag text. */
 .checkedOutElsewhereTag :global(.codicon) {

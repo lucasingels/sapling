@@ -11,7 +11,7 @@ import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
 
 import {submitButtonVerb} from './codeReview/UICodeReviewProvider';
 import type {DagCommitInfo} from './dag/dag';
-import type {CommitInfo, MergeConflicts, SuccessorInfo, WorktreeEntry} from './types';
+import type {CommitInfo, Hash, MergeConflicts, SuccessorInfo, WorktreeEntry} from './types';
 import {succeedableRevset, WarningCheckResult} from './types';
 
 import {Button} from 'isl-components/Button';
@@ -28,13 +28,14 @@ import {useAutofocusRef} from 'shared/hooks';
 import {basename, guessPathSep, notEmpty, nullthrows} from 'shared/utils';
 import {AllBookmarksTruncated, Bookmark, Bookmarks, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
-import {worktreeMutationsSupported} from './CheckedOutElsewhere';
+import {isCheckedOutElsewhere, worktreeMutationsSupported} from './CheckedOutElsewhere';
 import css from './Commit.module.css';
 import {cloudSyncStateAtom} from './CommitCloud';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
 import {showComparison} from './ComparisonView/atoms';
 import {Row} from './ComponentUtils';
 import {DragToRebase} from './DragToRebase';
+import {DropdownFields} from './DropdownFields';
 import {EducationInfoTip} from './Education';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {Internal} from './Internal';
@@ -47,6 +48,7 @@ import {
   forgetWorktreeInWorkspace,
   openWorktreeInWindow,
   RenameWorktreeModal,
+  StaleWorktreeBadge,
   switchToWorktree,
 } from './WorktreeSection';
 import {tracker} from './analytics';
@@ -782,6 +784,7 @@ export const Commit = memo(
               stable={commit?.stableCommitMetadata ?? []}
               fullRepoBranch={commit.fullRepoBranch}
             />
+            <InlineWorktreeLabels hash={commit.hash} />
             {isPublic ? <CommitDate date={commit.date} /> : null}
             {treeWidth !== 'wide' ? (
               <>
@@ -850,33 +853,109 @@ function CommitLabel({children}: {children?: ReactNode}) {
   return <div className={css.commitLabel}>{children}</div>;
 }
 
+function worktreeName(wt: WorktreeEntry): string {
+  return wt.label != null && wt.label !== '' ? wt.label : basename(wt.path, guessPathSep(wt.path));
+}
+
 /**
  * A label naming a sibling worktree currently checked out (`.`) at this commit,
  * followed by buttons to open, rename, and (for linked worktrees) remove it.
+ * The buttons show on hover, or always with `showActions` (in a list of several).
  * Rename and remove are only shown where the server reports worktree mutations are supported.
  */
-export function CheckedOutElsewhereBadge({wt}: {wt: WorktreeEntry}) {
+export function CheckedOutElsewhereBadge({
+  wt,
+  showActions,
+}: {
+  wt: WorktreeEntry;
+  showActions?: boolean;
+}) {
   const canMutate = useAtomValue(worktreeMutationsSupported);
-  const name =
-    wt.label != null && wt.label !== '' ? wt.label : basename(wt.path, guessPathSep(wt.path));
+  const name = worktreeName(wt);
   const hoverTitle = t('Checked out in worktree $name', {replace: {$name: name}});
 
   return (
-    <span className={css.checkedOutElsewhereGroup}>
+    <span
+      className={
+        css.checkedOutElsewhereGroup + (showActions ? ' ' + css.checkedOutElsewhereListed : '')
+      }>
       <Tooltip title={hoverTitle}>
         <Tag
           className={css.checkedOutElsewhereTag}
           data-testid="checked-out-elsewhere-badge"
           aria-label={hoverTitle}>
           <Icon icon="worktree" size="XS" aria-hidden="true" />
-          {name}
+          <span className={css.checkedOutElsewhereName}>{name}</span>
         </Tag>
       </Tooltip>
-      <OpenWorktreeButton wt={wt} name={name} />
-      {canMutate && <RenameWorktreeButton wt={wt} name={name} />}
-      {canMutate && wt.role !== 'main' && <RemoveWorktreeButton wt={wt} name={name} />}
+      {wt.stale === true && <StaleWorktreeBadge wt={wt} />}
+      <span className={css.checkedOutElsewhereActions}>
+        <OpenWorktreeButton wt={wt} name={name} />
+        {canMutate && <RenameWorktreeButton wt={wt} name={name} />}
+        {canMutate && wt.role !== 'main' && <RemoveWorktreeButton wt={wt} name={name} />}
+      </span>
     </span>
   );
+}
+
+/**
+ * One label for several sibling worktrees checked out at the same commit, so a
+ * commit carries a single label however many agents sit on it. Clicking it lists
+ * them, each with its buttons.
+ */
+export function CheckedOutElsewhereGroupBadge({worktrees}: {worktrees: Array<WorktreeEntry>}) {
+  const count = worktrees.length;
+  const title = t('Checked out in $count worktrees', {replace: {$count: String(count)}});
+  const stale = worktrees.filter(wt => wt.stale === true).length;
+  return (
+    <Tooltip
+      trigger="click"
+      placement="bottom"
+      component={() => (
+        <DropdownFields
+          title={title}
+          icon="worktree"
+          data-testid="checked-out-elsewhere-group-dropdown">
+          <div className={css.checkedOutElsewhereList}>
+            {worktrees.map(wt => (
+              <CheckedOutElsewhereBadge key={wt.path} wt={wt} showActions />
+            ))}
+          </div>
+        </DropdownFields>
+      )}>
+      <Tag
+        className={css.checkedOutElsewhereTag + ' ' + css.checkedOutElsewhereGroupTag}
+        data-testid="checked-out-elsewhere-group-badge"
+        role="button"
+        title={worktrees.map(worktreeName).join(', ')}
+        aria-label={title}>
+        <Icon icon="worktree" size="XS" aria-hidden="true" />
+        <T replace={{$count: String(count)}}>$count worktrees</T>
+        {stale > 0 && (
+          <span className={css.checkedOutElsewhereStaleCount}>
+            <T replace={{$count: String(stale)}}>$count stale</T>
+          </span>
+        )}
+        <Icon icon="chevron-down" size="XS" aria-hidden="true" />
+      </Tag>
+    </Tooltip>
+  );
+}
+
+/**
+ * The labels for sibling worktrees checked out at this commit, on the commit's
+ * own line rather than a row of their own, so many worktrees do not stretch
+ * the graph. Several on one commit share one label.
+ */
+function InlineWorktreeLabels({hash}: {hash: Hash}) {
+  const worktrees = useAtomValue(isCheckedOutElsewhere(hash));
+  if (worktrees == null || worktrees.length === 0) {
+    return null;
+  }
+  if (worktrees.length === 1) {
+    return <CheckedOutElsewhereBadge wt={worktrees[0]} />;
+  }
+  return <CheckedOutElsewhereGroupBadge worktrees={worktrees} />;
 }
 
 /**

@@ -8,6 +8,11 @@ checkouts own: the ones they have checked out or stacked their commits on.
   $ setconfig diff.git=true ui.allowemptycommit=true
   $ setconfig amend.autorestack=no-conflict rebase.experimental.inmemory=true
 
+Those checkouts are left stale rather than moved afterwards (see
+test-dotgit-worktree-follow.t), so what the restack leaves alone shows:
+
+  $ setconfig worktree.follow-rewrites=false
+
   $ git init -q -b main $TESTTMP/repo
   $ cd $TESTTMP/repo
   $ echo base > base
