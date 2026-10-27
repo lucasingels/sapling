@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3
+
+### 27 October 2026
+
+- A commit checked out in other worktrees is labeled on its own line instead of on an extra row above it, so many worktrees no longer stretch the commit graph. Several worktrees on one commit share one "N worktrees" label that lists them with their buttons, and a single worktree's switch, rename and remove buttons appear on hover
+- A worktree left stale by a rewrite shows a "stale" badge in the commit graph
+- After a rebase, amend or pull moves other worktrees onto the latest versions of their commits (needs Sapling 0.3.12), the graph shows them there without a manual refresh
+
 ## 0.3.2
 
 ### 20 October 2026
