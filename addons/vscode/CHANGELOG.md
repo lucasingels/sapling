@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4
+
+### 27 October 2026
+
+- A worktree deleted outside Sapling, such as by `sl worktree prune` or an agent cleaning up, no longer stays a workspace folder: it is dropped when the window regains focus, without reloading it. The first workspace folder is never dropped, since that would reload the window
+- Sapling no longer runs `sl` in a workspace folder whose directory is gone, which logged `spawn sl ENOENT` errors as if `sl` were not installed
+
 ## 0.3.3
 
 ### 27 October 2026
