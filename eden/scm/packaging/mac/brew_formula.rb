@@ -70,10 +70,14 @@ class Sapling < Formula
 
     begin
       cd build_root/"eden/scm" do
-        system "rustup-init -y"
-        system "source %CACHEDIR%/cargo_cache/env && rustup target add %TARGET%"
-        system "source %CACHEDIR%/cargo_cache/env && "\
-               "#{python} ./build.py --oss --with-python #{python} "\
+        # Homebrew's rustup no longer provides `rustup-init` (it installs that
+        # binary as `rustup` itself), so install the toolchain with rustup
+        # directly. Its keg's bin holds the cargo and rustc proxies.
+        ENV.prepend_path "PATH", Formula["rustup"].opt_bin
+        system "rustup", "toolchain", "install", "stable", "--profile", "minimal"
+        system "rustup", "default", "stable"
+        system "rustup", "target", "add", "%TARGET%"
+        system "#{python} ./build.py --oss --with-python #{python} "\
                "--with-version %VERSION% --rust-target %TARGET%"
         bin.install "out/sl"
         lib.install "out/isl-dist.tar.xz"
