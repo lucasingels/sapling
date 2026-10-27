@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {Logger} from 'isl-server/src/logger';
 import type {Repository} from 'isl-server/src/Repository';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
 import type {PartiallySelectedDiffCommit} from 'isl/src/stackEdit/diffSplitTypes';
@@ -109,6 +110,59 @@ export function removeFolderFromWorkspace(path: string): void {
   const index = folders.findIndex(folder => pathsAreIdentical(folder.uri.fsPath, path));
   if (index >= 0) {
     vscode.workspace.updateWorkspaceFolders(index, 1);
+  }
+}
+
+/** Directory names a worktree's own directory sits in: ISL's, and agent tools' `.claude/worktrees`. */
+const WORKTREE_PARENT_DIR_NAMES = new Set([WORKTREES_DIR_NAME, 'worktrees']);
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await fs.promises.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `fsPath` is the folder of a worktree that was deleted: it is gone, and
+ * the worktrees directory it was in is still there. A folder on an unmounted
+ * volume, whose parent is gone too, does not count.
+ */
+async function isDeletedWorktreeFolder(fsPath: string): Promise<boolean> {
+  const parent = path.dirname(fsPath);
+  return (
+    WORKTREE_PARENT_DIR_NAMES.has(path.basename(parent)) &&
+    !(await pathExists(fsPath)) &&
+    (await pathExists(parent))
+  );
+}
+
+/**
+ * Drop the workspace folders of worktrees deleted outside ISL (by `sl worktree
+ * prune`, `git worktree remove` or an agent tool cleaning up), which VS Code would
+ * keep listing and Sapling would keep failing to run in. The first folder stays
+ * even then, since changing it reloads the window.
+ */
+export async function dropDeletedWorktreeFolders(logger: Logger): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const rest = folders.slice(1);
+  const deleted = await Promise.all(rest.map(f => isDeletedWorktreeFolder(f.uri.fsPath)));
+  if (!deleted.includes(true)) {
+    return;
+  }
+  // One call for every folder after the first: VS Code may refuse a second change
+  // made before the first one's event has fired.
+  const kept = rest
+    .filter((_, i) => !deleted[i])
+    .map(f => ({
+      uri: f.uri,
+      name: f.name === path.basename(f.uri.fsPath) ? undefined : f.name,
+    }));
+  const dropped = rest.filter((_, i) => deleted[i]).map(f => f.uri.fsPath);
+  if (vscode.workspace.updateWorkspaceFolders(1, rest.length, ...kept)) {
+    logger.info('dropped workspace folders of deleted worktrees:', dropped.join(', '));
   }
 }
 

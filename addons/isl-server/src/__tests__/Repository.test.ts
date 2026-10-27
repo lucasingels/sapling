@@ -104,6 +104,8 @@ describe('Repository', () => {
       logger: mockLogger,
       tracker: mockTracker,
     };
+    // The cwds here are made up; getRepoInfo checks that its cwd exists first.
+    jest.spyOn(fsUtils, 'exists').mockImplementation(async () => true);
   });
 
   it('setting command name', async () => {
@@ -306,11 +308,22 @@ describe('Repository', () => {
     const err = new Error('cwd does not exist') as Error & {code: string};
     err.code = 'ENOENT';
     mockEjeca([[/^sl root/, err]]);
+    jest.spyOn(fsUtils, 'exists').mockImplementation(async () => false);
     const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
     expect(info).toEqual({
       type: 'cwdDoesNotExist',
       cwd: '/path/to/cwd',
     });
+  });
+
+  it('does not run sl in a cwd that is gone', async () => {
+    // e.g. the workspace folder of a worktree deleted outside Sapling
+    const ejeca = mockEjeca([[/^sl root/, {stdout: '/path/to/cwd'}]]);
+    ejeca.mockClear();
+    jest.spyOn(fsUtils, 'exists').mockImplementation(async () => false);
+    const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+    expect(info).toEqual({type: 'cwdDoesNotExist', cwd: '/path/to/cwd'});
+    expect(ejeca).not.toHaveBeenCalled();
   });
 
   it('handles missing executables on windows', async () => {
@@ -1235,6 +1248,25 @@ describe('isDotGitDotDir', () => {
 });
 
 describe('getCwdInfo', () => {
+  beforeEach(() => {
+    jest.spyOn(fsUtils, 'exists').mockImplementation(async () => true);
+  });
+
+  it('does not run sl in a cwd that is gone', async () => {
+    const ejeca = mockEjeca([[/^sl root/, {stdout: '/path/to/myRepo'}]]);
+    ejeca.mockClear();
+    jest.spyOn(fsUtils, 'exists').mockImplementation(async () => false);
+    await expect(
+      Repository.getCwdInfo({
+        cmd: 'sl',
+        cwd: '/path/to/myRepo/.worktrees/deleted',
+        logger: mockLogger,
+        tracker: mockTracker,
+      }),
+    ).resolves.toEqual({cwd: '/path/to/myRepo/.worktrees/deleted'});
+    expect(ejeca).not.toHaveBeenCalled();
+  });
+
   it('computes cwd path and labels', async () => {
     mockEjeca([[/^sl root/, {stdout: '/path/to/myRepo'}]]);
     jest.spyOn(fs.promises, 'realpath').mockImplementation(async (path, _opts) => {

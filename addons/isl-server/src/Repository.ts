@@ -545,6 +545,12 @@ export class Repository {
    */
   static async getRepoInfo(ctx: RepositoryContext): Promise<RepoInfo> {
     const {cmd, cwd, logger} = ctx;
+    // Spawning in a directory that is gone fails as `spawn sl ENOENT`, as if sl
+    // itself were missing, and logs that for each command below. A workspace
+    // folder for a worktree deleted outside Sapling is one.
+    if (!(await exists(cwd))) {
+      return {type: 'cwdDoesNotExist', cwd};
+    }
     const [repoRoot, allRepoRoots, dotdir, configs] = await Promise.all([
       findRoot(ctx).catch((err: Error) => err),
       findRoots(ctx),
@@ -564,7 +570,7 @@ export class Repository {
     const preferredSubmitCommand = configs.get('github.preferred_submit_command');
 
     if (repoRoot instanceof Error) {
-      // first check that the cwd exists
+      // The cwd may have been removed while the commands above ran.
       const cwdExists = await exists(cwd);
       if (!cwdExists) {
         return {type: 'cwdDoesNotExist', cwd};
@@ -663,6 +669,10 @@ export class Repository {
    * Useful to determine if a cwd is valid and find the repo root without constructing a Repository.
    */
   static async getCwdInfo(ctx: RepositoryContext): Promise<CwdInfo> {
+    // See getRepoInfo: running sl in a directory that is gone only logs ENOENT.
+    if (!(await exists(ctx.cwd))) {
+      return {cwd: ctx.cwd};
+    }
     const root = await findRoot(ctx).catch((err: Error) => err);
 
     if (root instanceof Error || root == null) {

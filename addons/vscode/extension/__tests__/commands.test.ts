@@ -14,7 +14,7 @@ import type {RunnableOperation, WorktreeInfo} from 'isl/src/types';
 import fs from 'node:fs';
 import {ComparisonType, type Comparison} from 'shared/Comparison';
 import * as vscode from 'vscode';
-import {vscodeCommands} from '../commands';
+import {dropDeletedWorktreeFolders, vscodeCommands} from '../commands';
 import {shouldOpenBeside} from '../config';
 import {encodeDeletedFileUri} from '../DeletedFileContentProvider';
 import {encodeSaplingDiffUri} from '../DiffContentProvider';
@@ -439,6 +439,58 @@ describe('worktree commands', () => {
     mockIsBasecamp.mockReturnValue(false);
     setWorkspaceFolders([repoRoot]);
     mockUpdateWorkspaceFolders.mockReturnValue(true);
+  });
+
+  describe('dropDeletedWorktreeFolders', () => {
+    const logger = mockLogger;
+    const existing = (paths: Array<string>) =>
+      mockFsAccess.mockImplementation(async p =>
+        paths.includes(String(p)) ? undefined : Promise.reject(new Error('ENOENT')),
+      );
+    const setFolders = (paths: Array<string>) => {
+      (vscode.workspace as {workspaceFolders: unknown}).workspaceFolders = paths.map(
+        (fsPath, index) => ({
+          uri: vscode.Uri.file(fsPath),
+          name: fsPath.split('/').pop(),
+          index,
+        }),
+      );
+    };
+
+    it('drops the folders of deleted worktrees in one change, keeping the rest', async () => {
+      setFolders([
+        repoRoot,
+        '/repo/root/.worktrees/gone',
+        '/repo/root/.worktrees/alive',
+        '/repo/root/.claude/worktrees/agent-gone',
+      ]);
+      existing([
+        repoRoot,
+        '/repo/root/.worktrees',
+        '/repo/root/.worktrees/alive',
+        '/repo/root/.claude/worktrees',
+      ]);
+      await dropDeletedWorktreeFolders(logger);
+      expect(mockUpdateWorkspaceFolders).toHaveBeenCalledTimes(1);
+      expect(mockUpdateWorkspaceFolders).toHaveBeenCalledWith(1, 3, {
+        uri: expect.objectContaining({path: '/repo/root/.worktrees/alive'}),
+        name: undefined,
+      });
+    });
+
+    it('leaves the first folder, which would reload the window', async () => {
+      setFolders(['/repo/root/.worktrees/gone', '/other/project']);
+      existing(['/repo/root/.worktrees', '/other/project']);
+      await dropDeletedWorktreeFolders(logger);
+      expect(mockUpdateWorkspaceFolders).not.toHaveBeenCalled();
+    });
+
+    it('leaves a missing folder whose parent is gone too, or that is not a worktree', async () => {
+      setFolders([repoRoot, '/Volumes/ext/repo/.worktrees/wt', '/repo/root/.worktrees2/x']);
+      existing([repoRoot, '/repo/root/.worktrees2']);
+      await dropDeletedWorktreeFolders(logger);
+      expect(mockUpdateWorkspaceFolders).not.toHaveBeenCalled();
+    });
   });
 
   describe('sapling.worktree.switch', () => {
@@ -1176,7 +1228,8 @@ describe('commit and amend commands', () => {
     const amendSelected = vscodeCommands['sapling.amend-selected-files'];
 
     const fileUri = (name: string) => vscode.Uri.file(`${repoRoot}/${name}`);
-    const resourceState = (name: string) => ({resourceUri: fileUri(name)}) as vscode.SourceControlResourceState;
+    const resourceState = (name: string) =>
+      ({resourceUri: fileUri(name)}) as vscode.SourceControlResourceState;
 
     beforeEach(() => {
       jest.spyOn(repositoryCache, 'cachedRepositoryForPath').mockReturnValue(mockRepo);
