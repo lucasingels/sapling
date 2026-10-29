@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5
+
+### 29 October 2026
+
+- Clean up on a stack that another worktree sits on no longer leaves it in the graph. That worktree is shown on the commit the stack was built on, with an "abandoned" badge and a button to move it there; its files are untouched until you move or remove it
+- Clean up pulls first when a stack's Gerrit changes merged but have not been pulled yet, so they are hidden as landed and worktrees on them move onto the landed commits. Cleaning up a stack that is still there after its pull hides it
+- Switching to a worktree only changes what ISL shows; it is no longer added to the VS Code workspace as a folder. The command palette's "Add to Workspace" choice is now "Show in ISL"
+
 ## 0.3.4
 
 ### 27 October 2026
