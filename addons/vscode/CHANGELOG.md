@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6
+
+### 29 October 2026
+
+- A Gerrit stack with any unpublished commit offers "Publish stack", which pushes the whole stack. It offered "Republish stack" when a commit already up for review had changed too, which stopped at the highest commit already on Gerrit and left the unpublished commits above it behind
+
 ## 0.3.5
 
 ### 29 October 2026
