@@ -21,8 +21,8 @@ import type {Comparison} from 'shared/Comparison';
 import {repoRelativePathForAbsolutePath} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
 import {findPublicAncestor} from 'isl-server/src/utils';
-import {Operation} from 'isl/src/operations/Operation';
 import {AddWorktreeOperation} from 'isl/src/operations/AddWorktreeOperation';
+import {Operation} from 'isl/src/operations/Operation';
 import {PullOperation} from 'isl/src/operations/PullOperation';
 import {RemoveWorktreeOperation} from 'isl/src/operations/RemoveWorktreeOperation';
 import {RenameWorktreeOperation} from 'isl/src/operations/RenameWorktreeOperation';
@@ -79,29 +79,6 @@ export async function openFolderInWindowOrTile(
       t('Failed to open folder ($path)').replace('$path', path) + `: ${err}`,
     );
   }
-}
-
-/**
- * Add `path` to the current workspace as another folder, keeping every folder already
- * there. Unlike `vscode.openFolder` this neither reloads the window nor replaces a
- * multi-root workspace. Returns false if VS Code refused the change.
- */
-export function addFolderToWorkspace(path: string, label?: string): boolean {
-  const folders = vscode.workspace.workspaceFolders ?? [];
-  const uri = vscode.Uri.file(path);
-  if (folders.some(folder => pathsAreIdentical(folder.uri.fsPath, uri.fsPath))) {
-    return true;
-  }
-  const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, {
-    uri,
-    name: label || undefined,
-  });
-  if (!added) {
-    vscode.window.showErrorMessage(
-      t('Failed to add $path to the workspace').replace('$path', path),
-    );
-  }
-  return added;
 }
 
 /** Remove `path` from the current workspace, if it is one of its folders. */
@@ -164,14 +141,6 @@ export async function dropDeletedWorktreeFolders(logger: Logger): Promise<void> 
   if (vscode.workspace.updateWorkspaceFolders(1, rest.length, ...kept)) {
     logger.info('dropped workspace folders of deleted worktrees:', dropped.join(', '));
   }
-}
-
-/** Add the worktree to the workspace and show it in ISL, without reloading the window. */
-async function switchToWorktreeInWorkspace(path: string, label?: string): Promise<void> {
-  if (!addFolderToWorkspace(path, label)) {
-    return;
-  }
-  await vscode.commands.executeCommand('sapling.open-isl', vscode.Uri.file(path));
 }
 
 /**
@@ -470,9 +439,9 @@ export const vscodeCommands = {
     const choice = await vscode.window.showQuickPick(
       [
         {
-          label: t('Add to Workspace'),
+          label: t('Show in ISL'),
           description: t('Keeps the current window and workspace'),
-          action: 'workspace' as const,
+          action: 'isl' as const,
         },
         {label: t('Open in New Window'), action: 'new' as const},
         {
@@ -486,8 +455,11 @@ export const vscodeCommands = {
     if (choice == null) {
       return;
     }
-    if (choice.action === 'workspace') {
-      await switchToWorktreeInWorkspace(picked.worktree.path, picked.worktree.label);
+    if (choice.action === 'isl') {
+      await vscode.commands.executeCommand(
+        'sapling.open-isl',
+        vscode.Uri.file(picked.worktree.path),
+      );
       return;
     }
     await openFolderInWindowOrTile(

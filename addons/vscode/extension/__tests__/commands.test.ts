@@ -6,9 +6,9 @@
  */
 
 import {Set as ImSet} from 'immutable';
+import {Logger} from 'isl-server/src/logger';
 import type {Repository} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
-import {Logger} from 'isl-server/src/logger';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
 import type {RunnableOperation, WorktreeInfo} from 'isl/src/types';
 import fs from 'node:fs';
@@ -514,21 +514,18 @@ describe('worktree commands', () => {
       );
     });
 
-    it('adds the selected worktree to the workspace and shows it in ISL', async () => {
+    it('shows the selected worktree in ISL without changing the workspace', async () => {
       mockShowQuickPick
         .mockResolvedValueOnce({
           label: 'sibling',
           description: siblingWorktree.path,
           worktree: siblingWorktree,
         } as never)
-        .mockResolvedValueOnce({label: 'Add to Workspace', action: 'workspace'} as never);
+        .mockResolvedValueOnce({label: 'Show in ISL', action: 'isl'} as never);
 
       await switchCommand.apply(ctx);
 
-      expect(mockUpdateWorkspaceFolders).toHaveBeenCalledWith(1, 0, {
-        uri: expect.objectContaining({path: siblingWorktree.path}),
-        name: 'sibling',
-      });
+      expect(mockUpdateWorkspaceFolders).not.toHaveBeenCalled();
       expect(mockExecuteVSCodeCommand).toHaveBeenCalledWith(
         'sapling.open-isl',
         vscode.Uri.file(siblingWorktree.path),
@@ -540,7 +537,7 @@ describe('worktree commands', () => {
       );
     });
 
-    it('offers the workspace first, then the window options', async () => {
+    it('offers ISL first, then the window options', async () => {
       mockShowQuickPick
         .mockResolvedValueOnce({
           label: 'sibling',
@@ -553,50 +550,10 @@ describe('worktree commands', () => {
 
       const choices = mockShowQuickPick.mock.calls[1][0] as Array<{label: string}>;
       expect(choices.map(choice => choice.label)).toEqual([
-        'Add to Workspace',
+        'Show in ISL',
         'Open in New Window',
         'Open in Current Window',
       ]);
-    });
-
-    it('does not add a worktree that is already a workspace folder again', async () => {
-      setWorkspaceFolders([repoRoot, siblingWorktree.path]);
-      mockShowQuickPick
-        .mockResolvedValueOnce({
-          label: 'sibling',
-          description: siblingWorktree.path,
-          worktree: siblingWorktree,
-        } as never)
-        .mockResolvedValueOnce({label: 'Add to Workspace', action: 'workspace'} as never);
-
-      await switchCommand.apply(ctx);
-
-      expect(mockUpdateWorkspaceFolders).not.toHaveBeenCalled();
-      expect(mockExecuteVSCodeCommand).toHaveBeenCalledWith(
-        'sapling.open-isl',
-        vscode.Uri.file(siblingWorktree.path),
-      );
-    });
-
-    it('shows an error and does not open ISL when VS Code refuses the workspace change', async () => {
-      mockUpdateWorkspaceFolders.mockReturnValue(false);
-      mockShowQuickPick
-        .mockResolvedValueOnce({
-          label: 'sibling',
-          description: siblingWorktree.path,
-          worktree: siblingWorktree,
-        } as never)
-        .mockResolvedValueOnce({label: 'Add to Workspace', action: 'workspace'} as never);
-
-      await switchCommand.apply(ctx);
-
-      expect(mockShowErrorMessage).toHaveBeenCalledWith(
-        expect.stringContaining(siblingWorktree.path),
-      );
-      expect(mockExecuteVSCodeCommand).not.toHaveBeenCalledWith(
-        'sapling.open-isl',
-        expect.anything(),
-      );
     });
 
     it('does nothing when the worktree picker is cancelled', async () => {

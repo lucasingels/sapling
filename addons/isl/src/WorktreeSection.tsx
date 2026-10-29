@@ -482,14 +482,10 @@ export function changeCwd(newCwd: string) {
 }
 
 /**
- * Show the worktree at `path` in this ISL. In VS Code the worktree is first added
- * to the current workspace as a folder (a no-op if it already is one), so the
- * editor keeps its windows and workspace instead of reloading onto a bare folder.
+ * Show the worktree at `path` in this ISL. In VS Code the window and its workspace
+ * folders stay as they are.
  */
 export function switchToWorktree(path: string) {
-  if (platform.platformName === 'vscode') {
-    serverAPI.postMessage({type: 'platform/addToWorkspace', path});
-  }
   changeCwd(path);
 }
 

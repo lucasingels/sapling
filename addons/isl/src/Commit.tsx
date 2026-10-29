@@ -971,9 +971,9 @@ function InlineWorktreeLabels({hash}: {hash: Hash}) {
 }
 
 /**
- * Switches this ISL to the worktree. In VS Code the worktree is added to the
- * current workspace first, so nothing reloads; right-click offers a new window
- * instead. Basecamp has no shared workspace, so there it opens a new tile.
+ * Switches this ISL to the worktree, leaving VS Code's workspace folders alone;
+ * right-click offers a new window instead. Basecamp has no shared workspace, so
+ * there it opens a new tile.
  */
 function OpenWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
   const appInfo = useAtomValue(applicationinfo);

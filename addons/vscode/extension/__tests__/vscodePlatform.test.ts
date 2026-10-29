@@ -275,7 +275,7 @@ describe('platform/openFileAtRevset', () => {
   });
 });
 
-describe('platform/addToWorkspace and platform/removeFromWorkspace', () => {
+describe('platform/removeFromWorkspace', () => {
   const mockExtensionContext = {
     globalState: {update: jest.fn()},
   } as unknown as vscode.ExtensionContext;
@@ -306,38 +306,6 @@ describe('platform/addToWorkspace and platform/removeFromWorkspace', () => {
     jest.clearAllMocks();
     mockUpdateWorkspaceFolders.mockReturnValue(true);
     setWorkspaceFolders(['/repo/root']);
-  });
-
-  it('appends the worktree to the workspace folders instead of opening it as a folder', async () => {
-    await send({type: 'platform/addToWorkspace', path: worktreePath});
-
-    expect(mockUpdateWorkspaceFolders).toHaveBeenCalledWith(1, 0, {
-      uri: expect.objectContaining({path: worktreePath}),
-      name: undefined,
-    });
-    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith(
-      'vscode.openFolder',
-      expect.anything(),
-      expect.anything(),
-    );
-  });
-
-  it('does not add a worktree that is already a workspace folder', async () => {
-    setWorkspaceFolders(['/repo/root', worktreePath]);
-
-    await send({type: 'platform/addToWorkspace', path: worktreePath});
-
-    expect(mockUpdateWorkspaceFolders).not.toHaveBeenCalled();
-  });
-
-  it('shows an error when VS Code refuses the workspace change', async () => {
-    mockUpdateWorkspaceFolders.mockReturnValue(false);
-
-    await send({type: 'platform/addToWorkspace', path: worktreePath});
-
-    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
-      expect.stringContaining(worktreePath),
-    );
   });
 
   it('removes only the matching workspace folder', async () => {

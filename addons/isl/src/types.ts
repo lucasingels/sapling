@@ -847,7 +847,6 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/openInNewWindow'; path: AbsolutePath}
   | {type: 'platform/openFolder'; path: AbsolutePath}
-  | {type: 'platform/addToWorkspace'; path: AbsolutePath}
   | {type: 'platform/removeFromWorkspace'; path: AbsolutePath}
   | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}

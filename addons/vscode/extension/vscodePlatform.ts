@@ -24,7 +24,6 @@ import {arraysEqual} from 'isl/src/utils';
 import * as pathModule from 'node:path';
 import * as vscode from 'vscode';
 import {
-  addFolderToWorkspace,
   executeVSCodeCommand,
   openFolderInWindowOrTile,
   removeFolderFromWorkspace,
@@ -171,10 +170,6 @@ export const getVSCodePlatform = (context: vscode.ExtensionContext): VSCodeServe
         case 'platform/openFolder': {
           const folderUri = vscode.Uri.file(message.path);
           vscode.commands.executeCommand('vscode.openFolder', folderUri, {forceNewWindow: false});
-          break;
-        }
-        case 'platform/addToWorkspace': {
-          addFolderToWorkspace(message.path);
           break;
         }
         case 'platform/removeFromWorkspace': {
