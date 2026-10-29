@@ -77,6 +77,7 @@ export function simulateWorktreeInfo(
     node?: string;
     stale?: boolean;
     staleReason?: string;
+    hiddenBase?: string;
   }>,
   supportsMutation = true,
 ) {

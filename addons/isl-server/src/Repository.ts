@@ -74,6 +74,7 @@ import {
   computeNewConflicts,
   extractRepoInfoFromUrl,
   findDotDir,
+  findHiddenCheckouts,
   findRoot,
   findRoots,
   findSharedRoot,
@@ -745,6 +746,14 @@ export class Repository {
             }
             args.push('--config', `${arg.key}=${arg.value}`);
             continue;
+          case 'worktree-cwd':
+            if (
+              !(this.worktreeInfo?.worktrees ?? []).some(wt => pathsAreIdentical(wt.path, arg.path))
+            ) {
+              throw new Error(`${arg.path} is not a worktree of this repo`);
+            }
+            args.push('--cwd', arg.path);
+            continue;
           case 'repo-relative-file':
             args.push(path.normalize(path.relative(cwd, path.join(repoRoot, arg.path))));
             continue;
@@ -1002,14 +1011,18 @@ export class Repository {
     return this.worktreeInfo;
   }
 
-  /** Hashes checked out (`.`) in sibling worktrees, excluding this worktree, deduped. */
+  /**
+   * Hashes checked out (`.`) in sibling worktrees, excluding this worktree, deduped.
+   * For a worktree on a hidden stack, the commit the stack was built on instead, so
+   * the hidden stack stays out of the graph but the worktree's label has a commit.
+   */
   getOtherWorktreeDotHashes(): Hash[] {
     const repoRoot = this.info.repoRoot;
     const hashes = (this.worktreeInfo?.worktrees ?? []).flatMap(entry => {
       if (pathsAreIdentical(entry.path, repoRoot) || entry.node == null) {
         return [];
       }
-      const trimmed = entry.node.trim();
+      const trimmed = (entry.hiddenBase ?? entry.node).trim();
       if (trimmed === '' || !isHexHash(trimmed)) {
         return [];
       }
@@ -1052,11 +1065,23 @@ export class Repository {
           return node == null ? entry : {...entry, node};
         }),
       );
+      // A worktree on a stack that was hidden without a newer version (e.g. Clean up
+      // ran before the stack landed) is drawn at the commit the stack was built on,
+      // so the hidden stack itself stays out of the graph.
+      const hiddenCheckouts = await findHiddenCheckouts(
+        ctx,
+        worktreeEntriesWithNodes.flatMap(entry =>
+          entry.node != null && !pathsAreIdentical(entry.path, repoRoot) ? [entry.node] : [],
+        ),
+      );
       const worktreeInfo: WorktreeInfo | undefined =
         sharedRoot != null
           ? {
               sharedRoot,
-              worktrees: worktreeEntriesWithNodes,
+              worktrees: worktreeEntriesWithNodes.map(entry => {
+                const hiddenBase = entry.node == null ? undefined : hiddenCheckouts.get(entry.node);
+                return hiddenBase == null ? entry : {...entry, hiddenBase};
+              }),
               // This fork's `sl worktree` can also add, label, and remove git worktrees.
               supportsMutation: this.info.isEdenFs || isDotGitDotDir(this.info.dotdir),
             }

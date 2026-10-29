@@ -504,6 +504,44 @@ describe('Repository', () => {
       );
     });
 
+    it('runs in another worktree of the repo, and only in one', async () => {
+      const repo = new Repository(repoInfo, ctx);
+      (repo as unknown as {worktreeInfo: WorktreeInfo}).worktreeInfo = {
+        sharedRoot: repoInfo.repoRoot,
+        worktrees: [
+          {path: repoInfo.repoRoot, role: 'main'},
+          {path: '/path/to/wt', role: 'linked'},
+        ],
+        supportsMutation: true,
+      };
+      const run = (path: string) =>
+        repo.runOrQueueOperation(
+          ctx,
+          {
+            id: path,
+            trackEventName: 'GotoInWorktreeOperation',
+            runner: CommandRunner.Sapling,
+            args: [{type: 'worktree-cwd', path}, 'goto', '--check', 'aaa'],
+          },
+          jest.fn(),
+        );
+
+      await run('/path/to/wt');
+      expect(ejecaSpy).toHaveBeenCalledWith(
+        'sl',
+        ['--cwd', '/path/to/wt', 'goto', '--check', 'aaa', '--noninteractive'],
+        expect.anything(),
+      );
+
+      ejecaSpy.mockClear();
+      await run('/somewhere/else');
+      expect(ejecaSpy).not.toHaveBeenCalledWith(
+        'sl',
+        expect.arrayContaining(['--cwd', '/somewhere/else']),
+        expect.anything(),
+      );
+    });
+
     it('disallows unknown configs', async () => {
       await runOperation({
         args: ['commit', {type: 'config', key: 'foo.bar', value: '1'}],
@@ -740,6 +778,20 @@ www/flib/intern/entity/diff/EntPhabricatorDiffSchema.php                        
       };
 
       expect(repo.getOtherWorktreeDotHashes()).toEqual(['def456']);
+    });
+
+    it('getOtherWorktreeDotHashes gives the base of a hidden stack, not the hidden commit', () => {
+      const repo = new Repository(repoInfo, ctx);
+      (repo as unknown as {worktreeInfo: WorktreeInfo}).worktreeInfo = {
+        sharedRoot: repoInfo.repoRoot,
+        worktrees: [
+          {path: repoInfo.repoRoot, role: 'main', node: 'abc123'},
+          {path: '/path/to/other', role: 'linked', node: 'def456', hiddenBase: 'aaa111'},
+        ],
+        supportsMutation: false,
+      };
+
+      expect(repo.getOtherWorktreeDotHashes()).toEqual(['aaa111']);
     });
   });
 
@@ -1528,6 +1580,36 @@ describe('fetchSubmoduleMap', () => {
         },
       ]);
       expect(ejeca.mock.calls.filter(([, args]) => args?.includes('whereami'))).toEqual([]);
+    });
+
+    it('marks worktrees on hidden stacks with the commit the stack was built on', async () => {
+      const ejeca = mockEjeca([
+        [/^sl root --dotdir/, {stdout: '/repo/main/.sl'}],
+        [/^sl root --shared/, {stdout: '/repo/main'}],
+        [/^sl root/, {stdout: '/repo/main'}],
+        [/^sl debugroots/, {stdout: '/repo/main'}],
+        [
+          /^sl --config worktree\.enabled=true worktree list/,
+          {
+            stdout: JSON.stringify([
+              {path: '/repo/main', role: 'main', node: 'aaa'},
+              {path: '/repo/gone', role: 'linked', node: 'bbb'},
+              {path: '/repo/fine', role: 'linked', node: 'ccc'},
+            ]),
+          },
+        ],
+        [/^sl log --rev \(present\(bbb\) \+ present\(ccc\)\) & hidden\(\)/, {stdout: 'bbb base\n'}],
+      ]);
+
+      const info = (await Repository.getRepoInfo(ctx)) as ValidatedRepoInfo;
+      const repo = new Repository(info, ctx);
+      ejeca.mockClear();
+      await repo.refreshWorktreeInfo();
+      expect(repo.getWorktreeInfo()?.worktrees).toEqual([
+        {path: '/repo/main', role: 'main', node: 'aaa'},
+        {path: '/repo/gone', role: 'linked', node: 'bbb', hiddenBase: 'base'},
+        {path: '/repo/fine', role: 'linked', node: 'ccc'},
+      ]);
     });
 
     it('populates worktreeInfo for solo repos with sharedRoot', async () => {

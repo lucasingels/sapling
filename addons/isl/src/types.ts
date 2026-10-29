@@ -353,6 +353,12 @@ export type WorktreeEntry = {
   shelved?: number;
   /** Whether the worktree has uncommitted changes; only from `list --status`. */
   dirty?: boolean;
+  /**
+   * When the worktree is on a hidden commit with no newer version (its stack was
+   * hidden, e.g. by Clean up, but never landed): the visible commit the stack was
+   * built on, where ISL shows the worktree instead.
+   */
+  hiddenBase?: Hash;
 };
 
 export type ApplicationInfo = {
@@ -571,6 +577,8 @@ export type CommandArg =
   | {type: 'repo-relative-file'; path: RepoRelativePath}
   | {type: 'repo-relative-file-list'; paths: Array<RepoRelativePath>}
   | {type: 'config'; key: string; value: string}
+  /** Runs the command in another worktree of this repo; the server checks the path is one. */
+  | {type: 'worktree-cwd'; path: AbsolutePath}
   | ExactRevset
   | SucceedableRevset
   | OptimisticRevset;

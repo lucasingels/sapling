@@ -65,6 +65,17 @@
   color: var(--signal-medium-fg, var(--warning-foreground));
 }
 
+.checkedOutElsewhereAbandonedCount {
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.abandonedWorktreeBadge {
+  background-color: var(--subtle-hover-darken);
+  color: var(--foreground);
+  opacity: 0.85;
+}
+
 .checkedOutElsewhereList {
   display: flex;
   flex-direction: column;

@@ -14,6 +14,7 @@ import type {DagCommitInfo} from './dag/dag';
 import type {CommitInfo, Hash, MergeConflicts, SuccessorInfo, WorktreeEntry} from './types';
 import {succeedableRevset, WarningCheckResult} from './types';
 
+import {Badge} from 'isl-components/Badge';
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
@@ -80,6 +81,7 @@ import {
 import {CONFLICT_SIDE_LABELS} from './mergeConflicts/consts';
 import {getAmendToOperation, isAmendToAllowedForCommit} from './operationUtils';
 import {CommitCloudMoveCommitsOperation} from './operations/CommitCloudMoveCommitsOperation';
+import {GotoInWorktreeOperation} from './operations/GotoInWorktreeOperation';
 import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
 import {RebaseOperation} from './operations/RebaseOperation';
@@ -889,8 +891,12 @@ export function CheckedOutElsewhereBadge({
         </Tag>
       </Tooltip>
       {wt.stale === true && <StaleWorktreeBadge wt={wt} />}
+      {wt.hiddenBase != null && <AbandonedWorktreeBadge />}
       <span className={css.checkedOutElsewhereActions}>
         <OpenWorktreeButton wt={wt} name={name} />
+        {wt.hiddenBase != null && (
+          <GotoInWorktreeButton wt={wt} name={name} destination={wt.hiddenBase} />
+        )}
         {canMutate && <RenameWorktreeButton wt={wt} name={name} />}
         {canMutate && wt.role !== 'main' && <RemoveWorktreeButton wt={wt} name={name} />}
       </span>
@@ -907,6 +913,7 @@ export function CheckedOutElsewhereGroupBadge({worktrees}: {worktrees: Array<Wor
   const count = worktrees.length;
   const title = t('Checked out in $count worktrees', {replace: {$count: String(count)}});
   const stale = worktrees.filter(wt => wt.stale === true).length;
+  const abandoned = worktrees.filter(wt => wt.hiddenBase != null).length;
   return (
     <Tooltip
       trigger="click"
@@ -934,6 +941,11 @@ export function CheckedOutElsewhereGroupBadge({worktrees}: {worktrees: Array<Wor
         {stale > 0 && (
           <span className={css.checkedOutElsewhereStaleCount}>
             <T replace={{$count: String(stale)}}>$count stale</T>
+          </span>
+        )}
+        {abandoned > 0 && (
+          <span className={css.checkedOutElsewhereAbandonedCount}>
+            <T replace={{$count: String(abandoned)}}>$count abandoned</T>
           </span>
         )}
         <Icon icon="chevron-down" size="XS" aria-hidden="true" />
@@ -992,6 +1004,49 @@ function OpenWorktreeButton({wt, name}: {wt: WorktreeEntry; name: string}) {
         }}
         onContextMenu={openMenu}>
         <Icon icon="arrow-swap" />
+      </Button>
+    </Tooltip>
+  );
+}
+
+/** Marks a worktree whose stack was hidden without landing, shown where the stack started. */
+function AbandonedWorktreeBadge() {
+  return (
+    <Tooltip
+      title={t(
+        'This worktree is on commits that were hidden and have no newer version. It is shown on the commit they were built on. Its files are untouched until you move or remove it.',
+      )}>
+      <Badge className={css.abandonedWorktreeBadge} data-testid="worktree-abandoned-badge">
+        <T>abandoned</T>
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/** Moves a worktree off its hidden stack onto the commit its label is shown on. */
+function GotoInWorktreeButton({
+  wt,
+  name,
+  destination,
+}: {
+  wt: WorktreeEntry;
+  name: string;
+  destination: Hash;
+}) {
+  const runOperation = useRunOperation();
+  const title = t('Move worktree $name onto this commit', {replace: {$name: name}});
+  return (
+    <Tooltip title={title} delayMs={250}>
+      <Button
+        icon
+        aria-label={title}
+        data-testid="checked-out-elsewhere-goto-button"
+        onClick={e => {
+          e.stopPropagation();
+          e.preventDefault();
+          runOperation(new GotoInWorktreeOperation(wt.path, destination));
+        }}>
+        <Icon icon="arrow-down" />
       </Button>
     </Tooltip>
   );

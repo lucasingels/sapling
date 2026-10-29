@@ -267,6 +267,42 @@ export async function whereami(
 }
 
 /**
+ * Of the given checked-out hashes, those whose commit is hidden and has no visible
+ * newer version, e.g. after Clean up hid a stack another worktree sits on. Maps each
+ * to the latest visible commit below it, which the hidden stack was built on.
+ */
+export async function findHiddenCheckouts(
+  ctx: RepositoryContext,
+  hashes: ReadonlyArray<Hash>,
+): Promise<Map<Hash, Hash>> {
+  const result = new Map<Hash, Hash>();
+  if (hashes.length === 0) {
+    return result;
+  }
+  const dots = hashes.map(hash => `present(${hash})`).join(' + ');
+  try {
+    const stdout = (
+      await runCommand(ctx, [
+        'log',
+        '--rev',
+        `(${dots}) & hidden() - predecessors(all())`,
+        '--template',
+        '{node} {revset("max(::%s - hidden())", node) % "{node}"}\n',
+      ])
+    ).stdout;
+    for (const line of stdout.split('\n')) {
+      const [node, base] = line.trim().split(' ');
+      if (node && base) {
+        result.set(node as Hash, base as Hash);
+      }
+    }
+  } catch (error) {
+    ctx.logger.error('Failed to find worktrees on hidden commits', error);
+  }
+  return result;
+}
+
+/**
  * Read multiple configs.
  * Return a Map from config name to config value for present configs.
  * Missing configs will not be returned.

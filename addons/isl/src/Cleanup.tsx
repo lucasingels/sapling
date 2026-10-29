@@ -6,20 +6,22 @@
  */
 
 import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
+import type {Operation} from './operations/Operation';
 import type {CommitInfo, DiffSummary, Hash} from './types';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
 import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {nullthrows} from 'shared/utils';
 import {OperationDisabledButton} from './OperationDisabledButton';
 import {allDiffSummaries, codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import {HideOperation} from './operations/HideOperation';
+import {PullOperation} from './operations/PullOperation';
 import {useRunOperation} from './operationsState';
 import {type Dag, dagWithPreviews} from './previews';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
+import {exactRevset} from './types';
 
 export function isStackEligibleForCleanup(
   hash: Hash,
@@ -52,8 +54,63 @@ export function isStackEligibleForCleanup(
     });
 }
 
+/** Stack roots that Clean up already pulled for; see `cleanupOperations`. */
+const pulledForCleanup = new Set<Hash>();
+
+/**
+ * The operations that clean up the stacks starting at `hashes`.
+ *
+ * Commits whose diffs landed but that a pull has not yet marked as landed are pulled
+ * instead of hidden: pulling marks them landed, which hides them and moves worktrees
+ * on them onto the landed versions, while hiding them would leave such worktrees on
+ * hidden commits. A stack with other commits too is hidden after the pull, by its
+ * exact hash, since its root's successor is then the landed, public commit.
+ *
+ * The pull leaves a draft alone when it may hold work that did not land, so a stack
+ * that is still there after its pull is hidden the next time it is cleaned up.
+ */
+export function cleanupOperations(
+  hashes: ReadonlyArray<Hash>,
+  dag: Dag,
+  diffMap: Map<string, DiffSummary>,
+  provider: UICodeReviewProvider,
+): Array<Operation> {
+  const isUnpulledLanding = (h: Hash): boolean => {
+    const info = dag.get(h);
+    if (info == null || info.successorInfo != null || info.diffId == null) {
+      return false;
+    }
+    const diffInfo = diffMap.get(info.diffId);
+    return diffInfo != null && provider.isDiffLanded?.(diffInfo) === true;
+  };
+
+  let pull = false;
+  const hides: Array<Operation> = [];
+  for (const hash of hashes) {
+    const info = dag.get(hash);
+    if (info == null) {
+      continue;
+    }
+    const stack = dag.descendants(hash).toArray();
+    const landed = stack.filter(isUnpulledLanding);
+    if (landed.length === 0 || pulledForCleanup.has(hash)) {
+      hides.push(new HideOperation(latestSuccessorUnlessExplicitlyObsolete(info)));
+      continue;
+    }
+    pulledForCleanup.add(hash);
+    pull = true;
+    if (landed.length < stack.length) {
+      hides.push(new HideOperation(exactRevset(hash)));
+    }
+  }
+  return pull ? [new PullOperation(), ...hides] : hides;
+}
+
 export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChildren: boolean}) {
   const runOperation = useRunOperation();
+  const dag = useAtomValue(dagWithPreviews);
+  const reviewProvider = useAtomValue(codeReviewProvider);
+  const diffMap = useAtomValue(allDiffSummaries)?.value;
   return (
     <Tooltip
       title={
@@ -65,7 +122,13 @@ export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChi
       <Button
         icon
         onClick={() => {
-          runOperation(new HideOperation(latestSuccessorUnlessExplicitlyObsolete(commit)));
+          const operations =
+            diffMap == null || reviewProvider == null
+              ? [new HideOperation(latestSuccessorUnlessExplicitlyObsolete(commit))]
+              : cleanupOperations([commit.hash], dag, diffMap, reviewProvider);
+          for (const operation of operations) {
+            runOperation(operation);
+          }
         }}>
         <Icon icon="eye-closed" slot="start" />
         {hasChildren ? <T>Clean up stack</T> : <T>Clean up</T>}
@@ -97,12 +160,7 @@ export function CleanupAllButton() {
       }>
       <OperationDisabledButton
         contextKey="cleanup-all"
-        runOperation={() => {
-          return cleanableStacks.map(hash => {
-            const info = nullthrows(dag.get(hash));
-            return new HideOperation(latestSuccessorUnlessExplicitlyObsolete(info));
-          });
-        }}
+        runOperation={() => cleanupOperations(cleanableStacks, dag, diffMap, reviewProvider)}
         icon={<Icon icon="eye-closed" slot="start" />}
         disabled={disabled}>
         <T>Clean up all</T>

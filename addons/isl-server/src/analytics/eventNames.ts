@@ -136,6 +136,7 @@ export type TrackEventName =
   | 'UnshelveOperation'
   | 'AddWorktreeOperation'
   | 'RemoveWorktreeOperation'
+  | 'GotoInWorktreeOperation'
   | 'RenameWorktreeOperation'
   | 'RunCommand'
   | 'StatusCommand'

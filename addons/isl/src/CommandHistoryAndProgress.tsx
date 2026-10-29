@@ -17,7 +17,7 @@ import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {notEmpty, truncate} from 'shared/utils';
+import {basename, notEmpty, truncate} from 'shared/utils';
 import {LogRenderExposures} from './analytics/LogRenderExposures';
 import serverAPI from './ClientToServerAPI';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
@@ -79,6 +79,8 @@ function OperationDescription(props: {
                   return undefined;
                 case 'repo-relative-file':
                   return arg.path;
+                case 'worktree-cwd':
+                  return `--cwd ${props.long ? arg.path : basename(arg.path)}`;
                 case 'repo-relative-file-list':
                   return truncate(arg.paths.join(' '), 200);
                 case 'exact-revset':

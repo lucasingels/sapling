@@ -298,6 +298,10 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return s.state === 'MERGED' || s.state === 'ABANDONED';
   }
 
+  isDiffLanded(summary: DiffSummary): boolean {
+    return (summary as GerritDiffSummary).state === 'MERGED';
+  }
+
   getUpdateDiffActions(_summary: DiffSummary) {
     return [];
   }

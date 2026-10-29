@@ -101,6 +101,12 @@ export interface UICodeReviewProvider {
 
   isDiffEligibleForCleanup(summary: DiffSummary): boolean;
 
+  /**
+   * Whether the diff landed on the server, so that pulling marks its commits as
+   * landed (and moves worktrees on them along) rather than Clean up hiding them.
+   */
+  isDiffLanded?(summary: DiffSummary): boolean;
+
   getSyncStatuses(
     commits: Array<CommitInfo>,
     allDiffSummaries: Map<string, DiffSummary>,

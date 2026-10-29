@@ -87,7 +87,8 @@ export const allOtherWorktreeCheckoutsByHash = atom(get => {
     if (trimmed === '' || !isHexHash(trimmed)) {
       continue;
     }
-    const key = trimmed as Hash;
+    // A worktree on a hidden stack is shown where the stack was built on.
+    const key = worktree.hiddenBase ?? (trimmed as Hash);
     // Store normalized trimmed node so key and entry stay in sync
     const normalized: WorktreeEntry = {...worktree, node: trimmed as Hash};
     const existing = map.get(key);
