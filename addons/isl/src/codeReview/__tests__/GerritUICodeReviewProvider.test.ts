@@ -139,7 +139,7 @@ describe('GerritUICodeReviewProvider', () => {
       expect(hashes(actions.submittableStack)).toEqual(['a', 'b']);
     });
 
-    it('counts a not-yet-pushed commit on top of an open change as submittable only', () => {
+    it('publishes the whole stack when a not-yet-pushed commit sits on top of an open change', () => {
       const dag = stackDag([
         {hash: 'a', diffId: 'Ia' as DiffId},
         {hash: 'b', diffId: 'Ib' as DiffId},
@@ -149,7 +149,22 @@ describe('GerritUICodeReviewProvider', () => {
         dag,
         summaries([['Ia' as DiffId, 'NEW']]),
       );
-      expect(hashes(actions.resubmittableStack)).toEqual(['a']);
+      // Republishing would push only up to a and leave b behind.
+      expect(hashes(actions.resubmittableStack)).toEqual([]);
+      expect(hashes(actions.submittableStack)).toEqual(['a', 'b']);
+    });
+
+    it('publishes the whole stack when an unpublished commit sits below an open change', () => {
+      const dag = stackDag([
+        {hash: 'a', diffId: 'Ia' as DiffId},
+        {hash: 'b', diffId: 'Ib' as DiffId},
+      ]);
+      const actions = provider.getSupportedStackActions(
+        'a',
+        dag,
+        summaries([['Ib' as DiffId, 'NEW']]),
+      );
+      expect(hashes(actions.resubmittableStack)).toEqual([]);
       expect(hashes(actions.submittableStack)).toEqual(['a', 'b']);
     });
 

@@ -265,10 +265,13 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     }
 
     // Republishing pushes up to the top of `resubmittableStack`, which would send nothing
-    // when none of those commits changed, and skip any new commit above them. Offering
-    // only `submittableStack` then shows Publish stack, which pushes to the real top.
+    // when none of those commits changed, and leaves behind any unpublished commit above
+    // them. So a stack with an unpublished commit only offers `submittableStack`, which
+    // shows Publish stack and pushes to the real top, sending the new patchsets below it.
+    const hasUnpublished = submittableStack.length > resubmittableStack.length;
     return {
-      resubmittableStack: resubmittableStack.some(hasNewVersion) ? resubmittableStack : [],
+      resubmittableStack:
+        !hasUnpublished && resubmittableStack.some(hasNewVersion) ? resubmittableStack : [],
       submittableStack,
     };
   }
