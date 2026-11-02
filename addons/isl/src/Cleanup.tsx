@@ -7,7 +7,7 @@
 
 import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
 import type {Operation} from './operations/Operation';
-import type {CommitInfo, DiffSummary, Hash} from './types';
+import type {CommitInfo, DiffSummary, ExactRevset, Hash, SucceedableRevset} from './types';
 
 import {Button} from 'isl-components/Button';
 import {Icon} from 'isl-components/Icon';
@@ -16,12 +16,13 @@ import {useAtomValue} from 'jotai';
 import {OperationDisabledButton} from './OperationDisabledButton';
 import {allDiffSummaries, codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
+import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
 import {PullOperation} from './operations/PullOperation';
 import {useRunOperation} from './operationsState';
 import {type Dag, dagWithPreviews} from './previews';
 import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
-import {exactRevset} from './types';
+import {exactRevset, succeedableRevset} from './types';
 
 export function isStackEligibleForCleanup(
   hash: Hash,
@@ -34,8 +35,8 @@ export function isStackEligibleForCleanup(
     .toSeq()
     .every(h => {
       const info = dag.get(h);
-      // don't allow hiding a stack you're checked out on
-      if (info == null || info.isDot) {
+      // a stack you're checked out on is still eligible: cleaning it up moves you off it first
+      if (info == null) {
         return false;
       }
       // allow clean up obsoleted commits regardless of review state
@@ -68,6 +69,9 @@ const pulledForCleanup = new Set<Hash>();
  *
  * The pull leaves a draft alone when it may hold work that did not land, so a stack
  * that is still there after its pull is hidden the next time it is cleaned up.
+ *
+ * A stack you are checked out on is cleaned up after moving you to its base; see
+ * `moveOffStackDestination`.
  */
 export function cleanupOperations(
   hashes: ReadonlyArray<Hash>,
@@ -85,6 +89,7 @@ export function cleanupOperations(
   };
 
   let pull = false;
+  let moveOff: Operation | undefined;
   const hides: Array<Operation> = [];
   for (const hash of hashes) {
     const info = dag.get(hash);
@@ -92,6 +97,9 @@ export function cleanupOperations(
       continue;
     }
     const stack = dag.descendants(hash).toArray();
+    if (stack.some(h => dag.get(h)?.isDot === true)) {
+      moveOff = new GotoOperation(moveOffStackDestination(info, dag));
+    }
     const landed = stack.filter(isUnpulledLanding);
     if (landed.length === 0 || pulledForCleanup.has(hash)) {
       hides.push(new HideOperation(latestSuccessorUnlessExplicitlyObsolete(info)));
@@ -103,7 +111,24 @@ export function cleanupOperations(
       hides.push(new HideOperation(exactRevset(hash)));
     }
   }
-  return pull ? [new PullOperation(), ...hides] : hides;
+  return [...(pull ? [new PullOperation()] : []), ...(moveOff ? [moveOff] : []), ...hides];
+}
+
+/**
+ * Where Clean up moves you before hiding a stack you are checked out on: the stack's
+ * base, by its remote bookmark if it has one, so that after the pull you land on the
+ * bookmark's latest commit, which has the stack's landed commits in it.
+ */
+export function moveOffStackDestination(
+  root: CommitInfo,
+  dag: Dag,
+): SucceedableRevset | ExactRevset {
+  const baseHash = root.parents[0];
+  const base = baseHash == null ? undefined : dag.get(baseHash);
+  if (base != null && base.remoteBookmarks.length > 0) {
+    return succeedableRevset(base.remoteBookmarks[0]);
+  }
+  return exactRevset(baseHash ?? `${root.hash}^`);
 }
 
 export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChildren: boolean}) {
@@ -111,12 +136,18 @@ export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChi
   const dag = useAtomValue(dagWithPreviews);
   const reviewProvider = useAtomValue(codeReviewProvider);
   const diffMap = useAtomValue(allDiffSummaries)?.value;
+  const isCheckedOut = dag
+    .descendants(commit.hash)
+    .toSeq()
+    .some(h => dag.get(h)?.isDot === true);
   return (
     <Tooltip
       title={
-        hasChildren
-          ? t('You can safely "clean up" by hiding this stack of commits.')
-          : t('You can safely "clean up" by hiding this commit.')
+        isCheckedOut
+          ? t('You can safely "clean up" by moving to its base and hiding this stack of commits.')
+          : hasChildren
+            ? t('You can safely "clean up" by hiding this stack of commits.')
+            : t('You can safely "clean up" by hiding this commit.')
       }
       placement="bottom">
       <Button

@@ -7,20 +7,27 @@
 
 import type {DiffId, DiffSummary, Hash} from '../types';
 
-import {cleanupOperations} from '../Cleanup';
+import {cleanupOperations, isStackEligibleForCleanup} from '../Cleanup';
 import {GerritUICodeReviewProvider} from '../codeReview/GerritUICodeReviewProvider';
 import {Dag, DagCommitInfo} from '../dag/dag';
 
-/** A linear stack on a public root: each commit's hash, diffId and whether it is obsolete. */
-function stackDag(commits: Array<{hash: Hash; diffId?: DiffId; obsolete?: boolean}>): Dag {
+/**
+ * A linear stack on a public root: each commit's hash, diffId, whether it is obsolete and
+ * whether it is checked out. The public root may carry remote bookmarks.
+ */
+function stackDag(
+  commits: Array<{hash: Hash; diffId?: DiffId; obsolete?: boolean; isDot?: boolean}>,
+  remoteBookmarks: Array<string> = [],
+): Dag {
   return new Dag().add([
-    DagCommitInfo.fromCommitInfo({hash: 'public', parents: [], phase: 'public'}),
-    ...commits.map(({hash, diffId, obsolete}, i) =>
+    DagCommitInfo.fromCommitInfo({hash: 'public', parents: [], phase: 'public', remoteBookmarks}),
+    ...commits.map(({hash, diffId, obsolete, isDot}, i) =>
       DagCommitInfo.fromCommitInfo({
         hash,
         parents: [i === 0 ? 'public' : commits[i - 1].hash],
         phase: 'draft',
         diffId,
+        isDot,
         successorInfo: obsolete ? {hash: `${hash}-succ`, type: 'amend'} : undefined,
       }),
     ),
@@ -98,5 +105,44 @@ describe('cleanupOperations', () => {
     expect(argsOf(dag, ['marked1'], summaries({I1: 'MERGED'}))).toEqual([
       ['hide', '--rev', {type: 'exact-revset', revset: 'marked1'}],
     ]);
+  });
+
+  it('pulls, then moves to the base bookmark, for a landed stack you are checked out on', () => {
+    const dag = stackDag(
+      [
+        {hash: 'onLanded1', diffId: 'I1'},
+        {hash: 'onLanded2', diffId: 'I2', isDot: true},
+      ],
+      ['remote/main'],
+    );
+    expect(argsOf(dag, ['onLanded1'], summaries({I1: 'MERGED', I2: 'MERGED'}))).toEqual([
+      ['pull'],
+      ['goto', '--rev', {type: 'succeedable-revset', revset: 'remote/main'}],
+    ]);
+  });
+
+  it('moves to the base, then hides, an abandoned stack you are checked out on', () => {
+    const dag = stackDag([{hash: 'onAbandoned1', diffId: 'I1', isDot: true}]);
+    expect(argsOf(dag, ['onAbandoned1'], summaries({I1: 'ABANDONED'}))).toEqual([
+      ['goto', '--rev', {type: 'exact-revset', revset: 'public'}],
+      ['hide', '--rev', {type: 'succeedable-revset', revset: 'onAbandoned1'}],
+    ]);
+  });
+});
+
+describe('isStackEligibleForCleanup', () => {
+  it('allows a landed stack you are checked out on', () => {
+    const dag = stackDag([{hash: 'dot1', diffId: 'I1', isDot: true}]);
+    expect(isStackEligibleForCleanup('dot1', dag, summaries({I1: 'MERGED'}), provider)).toBe(true);
+  });
+
+  it('refuses a stack with an open diff', () => {
+    const dag = stackDag([
+      {hash: 'open1', diffId: 'I1'},
+      {hash: 'open2', diffId: 'I2'},
+    ]);
+    expect(
+      isStackEligibleForCleanup('open1', dag, summaries({I1: 'MERGED', I2: 'NEW'}), provider),
+    ).toBe(false);
   });
 });
