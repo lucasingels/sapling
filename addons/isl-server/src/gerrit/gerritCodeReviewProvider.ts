@@ -12,18 +12,17 @@ import type {
   DiffComment,
   DiffId,
   DiffSignalSummary,
+  DiffSummariesResult,
   Disposable,
-  Result,
   ServerToClientMessage,
 } from 'isl/src/types';
-import type {CodeReviewProvider, DiffSummaries} from '../CodeReviewProvider';
+import type {CodeReviewProvider} from '../CodeReviewProvider';
 import type {Logger} from '../logger';
 import type {RebasedRevisionFinder} from './rebasedRevisions';
 
 import http from 'node:http';
 import https from 'node:https';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
-import {debounce} from 'shared/debounce';
 import {ejeca} from 'shared/ejeca';
 import rejectAfterTimeout from 'shared/rejectAfterTimeout';
 import {tryJsonParse} from 'shared/utils';
@@ -168,6 +167,13 @@ function fetchUrl(
   return rejectAfterTimeout(requestPromise, timeoutMs, 'Gerrit REST request timed out');
 }
 
+/** Minimum gap between change-status fetches; calls in between are coalesced. */
+const FETCH_INTERVAL_MS = 2000;
+/** Change-Ids per REST query, keeping each URL around 2KB. */
+const CHANGE_IDS_PER_QUERY = 40;
+/** A Change-Id is "I" plus hex; alphanumeric is enough to keep the query well-formed. */
+const CHANGE_ID_RE = /^I[0-9A-Za-z]+$/;
+
 /** Parse a Gerrit REST API JSON response, stripping the ")]}'" XSSI prefix. */
 function parseGerritJson(raw: string): unknown {
   return tryJsonParse(raw.replace(/^\)\]}'\n/, ''));
@@ -187,7 +193,9 @@ type LabelInfo = {
 /**
  * Returns Gerrit's precedence-resolved decision for a label.
  */
-function labelDecision(label: LabelInfo | undefined): 'approved' | 'rejected' | 'recommended' | 'disliked' | null {
+function labelDecision(
+  label: LabelInfo | undefined,
+): 'approved' | 'rejected' | 'recommended' | 'disliked' | null {
   if (label?.rejected != null) {
     return 'rejected';
   }
@@ -258,13 +266,17 @@ export function parseGerritRemote(remoteUrl: string): {
  * Fetches change status and comments via the Gerrit REST API, authenticated
  * with credentials from the Git credential helper. The web URL is always
  * derived from the remote URL (SSH remotes have their "ssh." prefix stripped).
- * Follows the same TypedEventEmitter + debounce pattern as the GitHub provider.
+ * Fetches only the Change-Ids on screen, coalescing calls that arrive close together.
  *
  * diffIds passed to triggerDiffSummariesFetch are Gerrit Change-Ids (e.g. "Iabc123…"),
  * extracted from commit descriptions by parseCommitInfoOutput in templates.ts.
  */
 export class GerritCodeReviewProvider implements CodeReviewProvider {
-  private diffSummaries = new TypedEventEmitter<'data', Map<DiffId, GerritDiffSummary>>();
+  private diffSummaries = new TypedEventEmitter<'result', DiffSummariesResult<GerritDiffSummary>>();
+  /** Change-Ids asked about since the last fetch started, fetched together by the next one. */
+  private pendingDiffIds = new Set<DiffId>();
+  private fetchTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastFetchStart = 0;
 
   constructor(
     private codeReviewSystem: GerritCodeReviewSystem,
@@ -272,145 +284,169 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
     private rebasedRevisionFinder?: RebasedRevisionFinder,
   ) {}
 
-  onChangeDiffSummaries(callback: (result: Result<DiffSummaries>) => unknown): Disposable {
-    const handleData = (data: Map<DiffId, GerritDiffSummary>) => callback({value: data});
-    const handleError = (error: Error) => callback({error});
-    this.diffSummaries.on('data', handleData);
-    this.diffSummaries.on('error', handleError);
+  onChangeDiffSummaries(callback: (result: DiffSummariesResult) => unknown): Disposable {
+    this.diffSummaries.on('result', callback);
     return {
       dispose: () => {
-        this.diffSummaries.off('data', handleData);
-        this.diffSummaries.off('error', handleError);
+        this.diffSummaries.off('result', callback);
       },
     };
   }
 
   /**
-   * Query the Gerrit REST API for the current user's changes and emit updated
-   * summaries. Like the GitHub provider, this ignores the diffs argument and
-   * fetches all owned changes so it works even before smartlog commits arrive.
+   * Fetch the status of the given Change-Ids — the commits on screen — and emit their summaries.
+   * Calls arriving within FETCH_INTERVAL_MS of the last fetch are coalesced into one trailing
+   * fetch of every Change-Id asked about, so none is dropped. `force` skips the wait.
    */
-  triggerDiffSummariesFetch = debounce(
-    async (_diffs: Array<DiffId>) => {
-      try {
-        const {project} = parseGerritRemote(this.codeReviewSystem.remoteUrl);
-        const webUrl = this.getWebUrl();
+  triggerDiffSummariesFetch(diffs: Array<DiffId>, force?: boolean): void {
+    for (const diffId of diffs) {
+      this.pendingDiffIds.add(diffId);
+    }
+    if (force && this.fetchTimer != null) {
+      clearTimeout(this.fetchTimer);
+      this.fetchTimer = undefined;
+    }
+    if (this.fetchTimer != null) {
+      return;
+    }
+    const wait = force ? 0 : Math.max(0, this.lastFetchStart + FETCH_INTERVAL_MS - Date.now());
+    this.fetchTimer = setTimeout(() => {
+      this.fetchTimer = undefined;
+      this.lastFetchStart = Date.now();
+      const changeIds = [...this.pendingDiffIds];
+      this.pendingDiffIds.clear();
+      void this.fetchDiffSummaries(changeIds);
+    }, wait);
+  }
 
-        const credentials = await getCredentials(webUrl);
+  private async fetchDiffSummaries(diffIds: Array<DiffId>): Promise<void> {
+    // Only well-formed Change-Ids go into the query; anything else could not match one anyway.
+    const changeIds = diffIds.filter(id => CHANGE_ID_RE.test(id));
+    if (changeIds.length === 0) {
+      this.diffSummaries.emit('result', {value: new Map()});
+      return;
+    }
+    const fail = (error: Error) =>
+      this.diffSummaries.emit('result', {error, failures: [{error, diffIds: changeIds}]});
+    try {
+      const {project} = parseGerritRemote(this.codeReviewSystem.remoteUrl);
+      const webUrl = this.getWebUrl();
 
-        // Fetch all changes owned by the authenticated user for this project (any
-        // status), matching the GitHub provider's approach of fetching all author:@me
-        // PRs rather than just open ones — otherwise a change that merges or is
-        // abandoned would simply drop out of `summaries` instead of updating to
-        // reflect its new state.
-        const query = credentials
-          ? `owner:self+project:${encodeURIComponent(project)}`
-          : `project:${encodeURIComponent(project)}`;
-        // Use /a/ prefix when credentials are available — Gerrit authenticates Basic auth
-        // only on the /a/ path; requests to /changes/ are treated as anonymous even with
-        // an Authorization header.
-        const changesBase = credentials ? `${webUrl}/a/changes/` : `${webUrl}/changes/`;
-        const url = `${changesBase}?q=${query}&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION`;
-        this.logger.info(`Gerrit: fetching changes for project ${project} from REST API`);
-        const raw = await fetchUrl(url, credentials);
-        const results = parseGerritJson(raw);
+      const credentials = await getCredentials(webUrl);
 
-        if (!Array.isArray(results)) {
-          this.diffSummaries.emit(
-            'error',
-            new Error(
-              'Gerrit: failed to parse REST API response — ' +
-                `check that ${webUrl} is reachable and returns valid JSON`,
-            ),
-          );
-          return;
+      // Ask only about the Change-Ids on screen, in any status, so a change that merges or is
+      // abandoned updates rather than dropping out. Scoped to the project since a Change-Id is
+      // only unique per project and branch. Chunked to keep each URL a sane length.
+      // Use /a/ prefix when credentials are available — Gerrit authenticates Basic auth
+      // only on the /a/ path; requests to /changes/ are treated as anonymous even with
+      // an Authorization header.
+      const changesBase = credentials ? `${webUrl}/a/changes/` : `${webUrl}/changes/`;
+      const chunks: Array<Array<DiffId>> = [];
+      for (let i = 0; i < changeIds.length; i += CHANGE_IDS_PER_QUERY) {
+        chunks.push(changeIds.slice(i, i + CHANGE_IDS_PER_QUERY));
+      }
+      this.logger.info(
+        `Gerrit: fetching ${changeIds.length} change(s) for project ${project} from REST API`,
+      );
+      const responses = await Promise.all(
+        chunks.map(chunk => {
+          const query = `project:${project} (${chunk.map(id => `change:${id}`).join(' OR ')})`;
+          const url = `${changesBase}?q=${encodeURIComponent(query)}&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION`;
+          return fetchUrl(url, credentials).then(parseGerritJson);
+        }),
+      );
+
+      if (!responses.every(Array.isArray)) {
+        fail(
+          new Error(
+            'Gerrit: failed to parse REST API response — ' +
+              `check that ${webUrl} is reachable and returns valid JSON`,
+          ),
+        );
+        return;
+      }
+      const results = (responses as Array<Array<Record<string, unknown>>>).flat();
+
+      // If we got no results back without credentials, Gerrit may be silently
+      // filtering changes due to missing authentication (some instances return []
+      // instead of 401 for unauthenticated requests).
+      if (results.length === 0 && credentials == null) {
+        fail(
+          new Error(
+            `Gerrit authentication required. ` +
+              `Generate an HTTP password at ${webUrl}/settings/#HTTPCredentials ` +
+              `and configure your credentials in ISL.`,
+          ),
+        );
+        return;
+      }
+
+      const summaries = new Map<DiffId, GerritDiffSummary>();
+      for (const change of results) {
+        // The key is the Change-Id so the map matches the diffIds on commits.
+        const changeId = change.change_id as string | undefined;
+        if (!changeId) {
+          continue;
         }
+        const number = String(change._number ?? '');
+        const status = (change.status as string | undefined) ?? 'NEW';
+        const state: GerritDiffSummary['state'] =
+          status === 'MERGED' ? 'MERGED' : status === 'ABANDONED' ? 'ABANDONED' : 'NEW';
 
-        // If we got no results back without credentials, Gerrit may be silently
-        // filtering changes due to missing authentication (some instances return []
-        // instead of 401 for unauthenticated requests).
-        if (results.length === 0 && credentials == null) {
-          this.diffSummaries.emit(
-            'error',
-            new Error(
-              `Gerrit authentication required. ` +
-                `Generate an HTTP password at ${webUrl}/settings/#HTTPCredentials ` +
-                `and configure your credentials in ISL.`,
-            ),
-          );
-          return;
-        }
+        type LabelMap = Record<string, LabelInfo>;
+        const rawLabels = (change.labels ?? {}) as LabelMap;
+        const codeReview = labelDecision(rawLabels['Code-Review']);
+        const codeReviewAttribution = labelAttribution(rawLabels['Code-Review']);
 
-        const summaries = new Map<DiffId, GerritDiffSummary>();
-        for (const change of results) {
-          // The key is the Change-Id so the map matches the diffIds on commits.
-          const changeId = change.change_id as string | undefined;
-          if (!changeId) {
-            continue;
-          }
-          const number = String(change._number ?? '');
-          const status = (change.status as string | undefined) ?? 'NEW';
-          const state: GerritDiffSummary['state'] =
-            status === 'MERGED' ? 'MERGED' : status === 'ABANDONED' ? 'ABANDONED' : 'NEW';
-
-          type LabelMap = Record<string, LabelInfo>;
-          const rawLabels = (change.labels ?? {}) as LabelMap;
-          const codeReview = labelDecision(rawLabels['Code-Review']);
-          const codeReviewAttribution = labelAttribution(rawLabels['Code-Review']);
-
-          let signalSummary: DiffSignalSummary | undefined;
-          if (rawLabels['Verified'] != null) {
-            const verified = labelDecision(rawLabels['Verified']);
-            signalSummary = verified === 'approved' || verified === 'recommended'
+        let signalSummary: DiffSignalSummary | undefined;
+        if (rawLabels['Verified'] != null) {
+          const verified = labelDecision(rawLabels['Verified']);
+          signalSummary =
+            verified === 'approved' || verified === 'recommended'
               ? 'pass'
               : verified === 'rejected' || verified === 'disliked'
-              ? 'failed'
-              : 'no-signal';
-          }
-
-          const commentCount =
-            typeof change.total_comment_count === 'number' ? change.total_comment_count : 0;
-          const unresolvedCount =
-            typeof change.unresolved_comment_count === 'number'
-              ? change.unresolved_comment_count
-              : 0;
-          const branchName = typeof change.branch === 'string' ? change.branch : undefined;
-          const isWorkInProgress = Boolean(change.work_in_progress);
-          const isPrivate = Boolean(change.is_private);
-
-          summaries.set(changeId, {
-            type: 'gerrit',
-            title: (change.subject as string | undefined) ?? '',
-            commitMessage: '',
-            state,
-            number,
-            url: this.changeUrl(Number(number), project),
-            branchName,
-            isWorkInProgress,
-            isPrivate,
-            currentRevision:
-              typeof change.current_revision === 'string' ? change.current_revision : undefined,
-            codeReview,
-            codeReviewAttribution,
-            signalSummary,
-            commentCount,
-            anyUnresolvedComments: unresolvedCount > 0,
-            submittable: Boolean(change.submittable),
-          });
+                ? 'failed'
+                : 'no-signal';
         }
 
-        this.logger.info(`Gerrit: fetched ${summaries.size} change(s)`);
-        await this.addRebasedRevisions(summaries);
-        this.diffSummaries.emit('data', summaries);
-      } catch (err) {
-        this.logger.warn(`Gerrit: failed to fetch changes: ${err}`);
-        this.diffSummaries.emit('error', err instanceof Error ? err : new Error(String(err)));
+        const commentCount =
+          typeof change.total_comment_count === 'number' ? change.total_comment_count : 0;
+        const unresolvedCount =
+          typeof change.unresolved_comment_count === 'number' ? change.unresolved_comment_count : 0;
+        const branchName = typeof change.branch === 'string' ? change.branch : undefined;
+        const isWorkInProgress = Boolean(change.work_in_progress);
+        const isPrivate = Boolean(change.is_private);
+
+        summaries.set(changeId, {
+          type: 'gerrit',
+          title: (change.subject as string | undefined) ?? '',
+          commitMessage: '',
+          state,
+          number,
+          url: this.changeUrl(Number(number), project),
+          branchName,
+          isWorkInProgress,
+          isPrivate,
+          currentRevision:
+            typeof change.current_revision === 'string' ? change.current_revision : undefined,
+          codeReview,
+          codeReviewAttribution,
+          signalSummary,
+          commentCount,
+          anyUnresolvedComments: unresolvedCount > 0,
+          submittable: Boolean(change.submittable),
+        });
       }
-    },
-    2000,
-    undefined,
-    /* leading */ true,
-  );
+
+      this.logger.info(`Gerrit: fetched ${summaries.size} change(s)`);
+      await this.addRebasedRevisions(summaries);
+      // `failures: []` clears any earlier failure while merging into what the client knows.
+      this.diffSummaries.emit('result', {value: summaries, failures: []});
+    } catch (err) {
+      this.logger.warn(`Gerrit: failed to fetch changes: ${err}`);
+      fail(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
 
   private async addRebasedRevisions(summaries: Map<DiffId, GerritDiffSummary>): Promise<void> {
     if (this.rebasedRevisionFinder == null) {
@@ -527,7 +563,8 @@ export class GerritCodeReviewProvider implements CodeReviewProvider {
 
   dispose(): void {
     this.diffSummaries.removeAllListeners();
-    this.triggerDiffSummariesFetch.dispose();
+    clearTimeout(this.fetchTimer);
+    this.fetchTimer = undefined;
   }
 
   getSummaryName(): string {

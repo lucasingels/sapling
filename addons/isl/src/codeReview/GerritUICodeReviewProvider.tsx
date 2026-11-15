@@ -26,8 +26,8 @@ import {t, T} from '../i18n';
 import {succeedableRevset} from '../types';
 import {showModal} from '../useModal';
 import {allDiffSummaries, codeReviewProvider} from './CodeReviewInfo';
-import {SyncStatus} from './syncStatus';
 import './GerritBadge.css';
+import {SyncStatus} from './syncStatus';
 
 /**
  * Effective display status for a Gerrit change. `state` (MERGED/ABANDONED) is a
@@ -121,7 +121,9 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
       return null;
     }
     const summary = diff as GerritDiffSummary | undefined;
-    const className = summary ? badgeClass(displayStatusForSummary(summary)) : 'gerrit-diff-status-NEW';
+    const className = summary
+      ? badgeClass(displayStatusForSummary(summary))
+      : 'gerrit-diff-status-NEW';
     const tooltip = summary ? tooltipForSummary(summary) : t('Click to open change in Gerrit');
     return (
       <div className="gerrit-diff-info">
@@ -214,10 +216,7 @@ export class GerritUICodeReviewProvider implements UICodeReviewProvider {
     return 'Republish';
   }
 
-  hasSubmittedDiff(
-    diffId: DiffId | undefined,
-    summary: DiffSummary | null | undefined,
-  ): boolean {
+  hasSubmittedDiff(diffId: DiffId | undefined, summary: DiffSummary | null | undefined): boolean {
     // Gerrit stamps a Change-Id (our diffId) onto every commit at creation time
     // via the commit-msg hook, so a diffId alone does NOT mean the change has
     // been pushed for review. Only treat it as submitted once the change is
@@ -368,6 +367,15 @@ function GerritStateLabel({summary}: {summary: GerritDiffSummary}) {
 }
 
 /**
+ * Whether a diff-fetch error is Gerrit asking for credentials, as opposed to a timeout or a
+ * network blip, which setting up credentials would not fix. Matches the server's messages for a
+ * 401/403 and for an empty anonymous result.
+ */
+export function isGerritAuthError(error: Error | undefined): boolean {
+  return error?.message.includes('Gerrit authentication') ?? false;
+}
+
+/**
  * Top-bar button that appears when Gerrit has an auth error and disappears
  * once diffs load successfully. Completely self-contained — reads its own atoms.
  */
@@ -375,14 +383,16 @@ export function GerritSetupButton() {
   const provider = useAtomValue(codeReviewProvider);
   const summaries = useAtomValue(allDiffSummaries);
 
-  if (provider?.name !== 'gerrit' || summaries.error == null) {
+  if (provider?.name !== 'gerrit' || !isGerritAuthError(summaries.error)) {
     return null;
   }
 
   const webUrl = provider.system.type === 'gerrit' ? (provider.system.webUrl ?? '') : '';
 
   return (
-    <Tooltip title={t('Gerrit authentication required. Click to configure credentials.')} placement="bottom">
+    <Tooltip
+      title={t('Gerrit authentication required. Click to configure credentials.')}
+      placement="bottom">
       <Button className="gerrit-setup-button" onClick={() => showCredentialsModal(webUrl)}>
         <Icon icon="warning" slot="start" />
         <T>Gerrit</T>
@@ -469,14 +479,10 @@ function GerritCredentialForm({
         <Button onClick={() => onDismiss(false)} disabled={loading}>
           <T>Cancel</T>
         </Button>
-        <Button
-          kind="primary"
-          onClick={handleSubmit}
-          disabled={loading || !username || !password}>
+        <Button kind="primary" onClick={handleSubmit} disabled={loading || !username || !password}>
           {loading ? <T>Verifying...</T> : <T>Save</T>}
         </Button>
       </div>
     </div>
   );
 }
-

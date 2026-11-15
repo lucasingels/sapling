@@ -84,12 +84,7 @@ describe('GerritCodeReviewProvider', () => {
     provider.dispose();
   });
 
-  it('still fetches when no diffs are provided, since it fetches all owned changes regardless', async () => {
-    // Matches the GitHub provider's approach: fetch all of the user's changes so
-    // badges populate even before any smartlog commit has a known Change-Id.
-    const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';
-    mockHttpsResponse(GERRIT_CHANGE_RESPONSE(changeId, 142));
-
+  it('skips the request and emits an empty map when no Change-Ids are on screen', async () => {
     const results: Array<Map<string, unknown>> = [];
     provider.onChangeDiffSummaries(r => {
       if (r.value) {
@@ -98,11 +93,10 @@ describe('GerritCodeReviewProvider', () => {
     });
 
     provider.triggerDiffSummariesFetch([]);
-
-    // Wait for async debounce
     await new Promise(r => setTimeout(r, 50));
-    expect(https.get).toHaveBeenCalledTimes(1);
-    expect(results[0]?.has(changeId)).toBe(true);
+
+    expect(https.get).not.toHaveBeenCalled();
+    expect(results).toEqual([new Map()]);
   });
 
   it('fetches from REST API and emits summaries keyed by Change-Id', async () => {
@@ -116,8 +110,6 @@ describe('GerritCodeReviewProvider', () => {
       }
     });
 
-    // The diffs argument is intentionally ignored (see triggerDiffSummariesFetch's
-    // docstring) — the query is scoped by owner+project, not by Change-Id.
     provider.triggerDiffSummariesFetch([changeId]);
     await new Promise(r => setTimeout(r, 50));
 
@@ -125,7 +117,10 @@ describe('GerritCodeReviewProvider', () => {
     const [[url]] = (https.get as jest.Mock).mock.calls;
     expect(url).toMatchObject({
       hostname: 'code.example.com',
-      path: '/changes/?q=project:my-repo&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION',
+      path:
+        '/changes/?q=' +
+        encodeURIComponent(`project:my-repo (change:${changeId})`) +
+        '&o=DETAILED_LABELS&o=SUBMIT_REQUIREMENTS&o=CURRENT_REVISION',
     });
 
     expect(results).toHaveLength(1);
@@ -191,11 +186,29 @@ describe('GerritCodeReviewProvider', () => {
     expect(errors[0].message).toMatch(/failed to parse REST API response/);
   });
 
+  it('reports a failed fetch per Change-Id, so the client keeps what it already shows', async () => {
+    mockHttpsResponse('', 500);
+
+    const results: Array<unknown> = [];
+    provider.onChangeDiffSummaries(r => results.push(r));
+
+    provider.triggerDiffSummariesFetch(['Iabc123', 'Idef456']);
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(results).toEqual([
+      {
+        error: expect.any(Error),
+        failures: [{error: expect.any(Error), diffIds: ['Iabc123', 'Idef456']}],
+      },
+    ]);
+  });
+
   describe('fetchComments', () => {
     const changeId = 'Iabc1234567890abcdef1234567890abcdef12345';
 
     /** Gerrit REST /comments response */
-    const COMMENTS_RESPONSE = `)]}'\n` +
+    const COMMENTS_RESPONSE =
+      `)]}'\n` +
       JSON.stringify({
         'src/foo.ts': [
           {
@@ -332,7 +345,11 @@ describe('GerritCodeReviewProvider', () => {
 
     it('uses gerrit.url as the web URL when set', async () => {
       const providerWithWebUrl = new GerritCodeReviewProvider(
-        {type: 'gerrit', remoteUrl: 'ssh://user@ssh.code.example.com:29418/my-repo', webUrl: 'https://code.example.com'},
+        {
+          type: 'gerrit',
+          remoteUrl: 'ssh://user@ssh.code.example.com:29418/my-repo',
+          webUrl: 'https://code.example.com',
+        },
         mockLogger,
       );
       mockHttpsResponse(COMMENTS_RESPONSE);
@@ -369,13 +386,43 @@ describe('GerritCodeReviewProvider', () => {
     expect((results[0].get(abandoned) as {state: string}).state).toBe('ABANDONED');
   });
 
-  it('does not restrict the changes query to status:open, so merged/abandoned changes keep updating', async () => {
+  it('queries only the Change-Ids asked about, in any status, chunked', async () => {
     mockHttpsResponse(`)]}'\n` + JSON.stringify([]));
-    provider.triggerDiffSummariesFetch(['Iabc123']);
+    const ids = Array.from({length: 45}, (_, i) => `I${String(i).padStart(40, '0')}`);
+    provider.triggerDiffSummariesFetch([...ids, 'not a change id']);
     await new Promise(r => setTimeout(r, 50));
 
-    const [[url]] = (https.get as jest.Mock).mock.calls;
-    expect(url.path).not.toContain('status:open');
+    const paths = (https.get as jest.Mock).mock.calls.map(([opts]) =>
+      decodeURIComponent(opts.path as string),
+    );
+    expect(paths).toHaveLength(2);
+    expect(paths.join()).not.toContain('status:open');
+    expect(paths.join()).not.toContain('owner:');
+    expect(paths.join()).not.toContain('not a change id');
+    const queried = paths.flatMap(p => [...p.matchAll(/change:(I\w+)/g)].map(m => m[1]));
+    expect(queried).toEqual(ids);
+  });
+
+  it('coalesces calls during the wait into one trailing fetch of every Change-Id', async () => {
+    jest.useFakeTimers();
+    try {
+      mockHttpsResponse(`)]}'\n` + JSON.stringify([]));
+      provider.triggerDiffSummariesFetch(['Ione']);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(https.get).toHaveBeenCalledTimes(1);
+
+      provider.triggerDiffSummariesFetch(['Itwo']);
+      provider.triggerDiffSummariesFetch(['Ithree']);
+      await jest.advanceTimersByTimeAsync(500);
+      expect(https.get).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(https.get).toHaveBeenCalledTimes(2);
+      const path = decodeURIComponent((https.get as jest.Mock).mock.calls[1][0].path);
+      expect(path).toContain('change:Itwo OR change:Ithree');
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('parses work_in_progress and is_private flags off the Gerrit change', async () => {
@@ -385,7 +432,14 @@ describe('GerritCodeReviewProvider', () => {
     mockHttpsResponse(
       `)]}'\n` +
         JSON.stringify([
-          {change_id: wip, _number: 1, subject: 'W', status: 'NEW', labels: {}, work_in_progress: true},
+          {
+            change_id: wip,
+            _number: 1,
+            subject: 'W',
+            status: 'NEW',
+            labels: {},
+            work_in_progress: true,
+          },
           {change_id: priv, _number: 2, subject: 'P', status: 'NEW', labels: {}, is_private: true},
           {change_id: plain, _number: 3, subject: 'N', status: 'NEW', labels: {}},
         ]),

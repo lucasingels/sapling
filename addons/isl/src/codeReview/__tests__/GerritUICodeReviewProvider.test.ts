@@ -8,7 +8,7 @@
 import type {CommitInfo, DiffId, DiffSummary, Hash} from '../../types';
 
 import {Dag, DagCommitInfo} from '../../dag/dag';
-import {GerritUICodeReviewProvider} from '../GerritUICodeReviewProvider';
+import {GerritUICodeReviewProvider, isGerritAuthError} from '../GerritUICodeReviewProvider';
 
 function commit(diffId?: DiffId): CommitInfo {
   return {diffId} as CommitInfo;
@@ -303,5 +303,19 @@ describe('GerritUICodeReviewProvider', () => {
     it('falls back to the current stack when given no commits', () => {
       expect(provider.submitOperation([]).getArgs()).toEqual(['gerrit', 'publish']);
     });
+  });
+});
+
+describe('isGerritAuthError', () => {
+  it('is true only for the errors that configuring credentials fixes', () => {
+    expect(
+      isGerritAuthError(
+        new Error('Gerrit authentication failed (HTTP 401). Generate an HTTP password at …'),
+      ),
+    ).toBe(true);
+    expect(isGerritAuthError(new Error('Gerrit authentication required. Generate …'))).toBe(true);
+    expect(isGerritAuthError(new Error('Gerrit REST request timed out'))).toBe(false);
+    expect(isGerritAuthError(new Error('getaddrinfo ENOTFOUND code.example.com'))).toBe(false);
+    expect(isGerritAuthError(undefined)).toBe(false);
   });
 });
