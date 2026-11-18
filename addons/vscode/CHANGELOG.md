@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.7
+
+### 18 November 2026
+
+- Gerrit status is fetched only for the changes on screen, rather than every change you own in the project. Polls that were timing out against Gerrit's 500-change cap now take a second or two
+- A failed Gerrit status poll keeps the badges already shown, and the Gerrit setup button and "Gerrit Authentication Required" banner appear only when Gerrit rejects your credentials, not on timeouts or network errors
+- Clean up is offered on a landed or abandoned stack you are checked out on. Cleaning it up first moves you to the stack's base, keeping uncommitted changes unless they conflict
+
 ## 0.3.6
 
 ### 29 October 2026
